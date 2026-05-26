@@ -1,153 +1,106 @@
-# Lite Causal EventRAG
+# Query-Conditioned Local Causal Graph
 
-Lite Causal EventRAG is a small, solo-research-friendly prototype for event forecasting.
+This repository is now a research scaffold for one direction:
 
-This project is intentionally narrow:
+**build a local causal graph from a query and time-bounded news evidence, then use that graph to support future event prediction.**
 
-- small event memory
-- query-centric causal retrieval
-- lightweight reranking
-- forecast or abstain
+The previous `MIND -> memory -> forecast` prototype has been removed on purpose. It no longer matched the current research target and was blocking clean iteration.
 
-It does not try to be a full benchmark system.
+## Current Focus
 
-## What It Does
+The repository now centers on four questions:
 
-Given a small news collection, the prototype:
+1. What should the forecasting input look like?
+2. How should a query-conditioned local causal graph be constructed?
+3. How should bridge events and conflicting explanations be represented?
+4. How should graph quality and downstream forecasting quality be evaluated together?
 
-1. extracts lightweight event instances
-2. builds a small causal event memory
-3. retrieves local support paths for a query
-4. predicts likely next events or consequences
-5. abstains when support is weak
-
-## Project Layout
+## Repository Layout
 
 ```text
 lite_causal_eventrag/
   README.md
   requirements.txt
-  datasets/
-    MINDlarge_*.zip
-  data/
-    lite_news_demo.jsonl
-    mind_dev_news_100.jsonl
-  src/
-    lite_cerf.py
-    example_lite_cerf.py
-    mind_adapter.py
-    mind_query_builder.py
-    batch_forecast.py
-    evaluate_forecast.py
-    run_mind_pipeline.py
   docs/
-    method_overview.md
-    dataset_notes.md
-    使用说明.md
-    流程示例.md
+    query_graph_method.md
+    当前创新点.md
+    当前项目功能书.md
+    创新点变动书.md
+  src/
+    causal_graph.py
+    query_causal_graph.py
+    example_query_graph.py
+    mirai_dataset.py
+    local_llm.py
+    query_forecast.py
+  TODO.md
 ```
 
-## Installation
+## Current Code Scope
 
-```bash
-pip install -r requirements.txt
-```
+The current code is intentionally small.
 
-Optional:
+- `src/causal_graph.py`
+  Defines the research data structures for query, evidence documents, event nodes, causal edges, and local graphs.
+- `src/query_causal_graph.py`
+  Provides a lightweight baseline builder for `query -> retrieved evidence -> local causal graph`.
+- `src/example_query_graph.py`
+  Runs an in-memory demo and prints the resulting graph.
 
-- set `OPENAI_API_KEY`
-- set `OPENAI_API_BASE`
-- set `LITECERF_MODEL_NAME`
-
-These are only needed if you want to use the optional LLM reranker.
+This is a starting point, not the final method.
 
 ## Quick Start
 
 Run the demo:
 
 ```bash
-python lite_causal_eventrag/src/example_lite_cerf.py
+python src/example_query_graph.py
 ```
 
-Build a memory file:
+Run the CLI on a JSONL file:
 
 ```bash
-python lite_causal_eventrag/src/lite_cerf.py build-memory --input lite_causal_eventrag/data/lite_news_demo.jsonl --output lite_causal_eventrag/data/lite_memory.json
+python src/query_causal_graph.py --input news.jsonl --query "What may happen after the central bank raises rates?" --cutoff 2025-05-25
 ```
 
-Run forecasting:
+Run a MIRAI-based local validation:
 
 ```bash
-python lite_causal_eventrag/src/lite_cerf.py forecast --memory lite_causal_eventrag/data/lite_memory.json --query "central bank raised interest rates"
+python src/query_forecast.py --query-id 1 --skip-model
 ```
 
-Optional LLM reranking:
+Run the same path with the local Qwen model:
 
 ```bash
-python lite_causal_eventrag/src/lite_cerf.py forecast --memory lite_causal_eventrag/data/lite_memory.json --query "battery recall announced" --use-llm
+python src/query_forecast.py --query-id 1 --model-path models/Qwen2.5-0.5B
 ```
 
-In the current workspace setup, the most reliable way to run commands is from the repository root using the explicit `lite_causal_eventrag/...` paths above.
-
-## End-to-End MIND Pipeline
-
-You can also run a small end-to-end MIND pipeline:
-
-```bash
-python lite_causal_eventrag/src/run_mind_pipeline.py --mind-zip lite_causal_eventrag/datasets/MINDlarge_dev.zip --category news --news-limit 100 --query-limit 30 --prefix mind_dev_small
-```
-
-This pipeline will:
-
-1. convert MIND `news.tsv` into JSONL
-2. build a small memory
-3. build simple forecast queries from `behaviors.tsv`
-4. run batch forecasting
-5. print a small evaluation summary
-
-## Input Format
-
-The input document file is `jsonl`.
-
-Each line should look like:
+Each JSONL row should contain:
 
 ```json
 {
-  "document_id": "econ_001",
-  "title": "Central bank raises interest rates",
-  "text": "The central bank raised interest rates on Tuesday. Borrowing costs increased shortly afterward.",
+  "document_id": "news_001",
+  "title": "Central bank raises rates",
+  "text": "The central bank raised rates. Borrowing costs climbed for manufacturers.",
   "publish_time": "2025-05-25",
   "source": "demo"
 }
 ```
 
-You may also provide an optional `events` list if you already have extracted events.
+## Planned Benchmark Setup
 
-## Current Scope
+- Main downstream benchmark: `MIRAI`
+- Auxiliary graph-quality evaluation: `MAVEN-ERE`, `Event StoryLine Corpus`, `Causal News Corpus`
 
-This version is designed for:
+Those choices and later changes are tracked in [docs/创新点变动书.md](/E:/project/EventDetection/lite_causal_eventrag/docs/创新点变动书.md).
 
-- single-domain news
-- small datasets
-- prototype experiments
+## What Was Intentionally Removed
 
-It does not include:
+The following old direction has been removed:
 
-- large-scale data engineering
-- multi-agent debate
-- complex graph databases
-- full branch forecasting
+- `MIND` conversion scripts
+- offline memory construction
+- heuristic batch forecasting
+- legacy evaluation scripts tied to the old prototype
 
-## Core Documents
-
-If you are new to this project, read these in order:
-
-1. `docs/使用说明.md`
-2. `docs/流程示例.md`
-3. `docs/dataset_notes.md`
-4. `docs/method_overview.md`
-5. `TODO.md`
-
-## Recommended Next Step
-
-Download a small, time-ordered news dataset and convert it into the JSONL format above.
+If an old file is gone, it was removed because it no longer served the query-conditioned causal-graph direction.
