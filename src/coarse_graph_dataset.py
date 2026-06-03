@@ -47,6 +47,30 @@ class CoarseGraphPairSample:
             "metadata": self.metadata,
         }
 
+    def to_instruction_example(self) -> dict[str, Any]:
+        prompt = (
+            "You are given a query and two structured events.\n"
+            "Predict the relation from event A to event B and a confidence score between 0 and 1.\n"
+            "Allowed relations: none, precedes, causes, escalates, mitigates.\n\n"
+            f"Query: {self.query_text}\n"
+            f"Event A: {self.event_a_text}\n"
+            f"Event B: {self.event_b_text}\n"
+            "Return strict JSON with keys relation and score."
+        )
+        target = json.dumps(
+            {
+                "relation": ID_TO_RELATION.get(self.relation_label, "none"),
+                "score": round(float(self.edge_score), 4),
+            },
+            ensure_ascii=False,
+        )
+        return {
+            "sample_id": self.sample_id,
+            "prompt": prompt,
+            "target": target,
+            "metadata": self.metadata,
+        }
+
 
 class CoarseGraphPairDataset(Dataset):
     def __init__(self, samples: list[CoarseGraphPairSample]) -> None:
@@ -262,7 +286,10 @@ def main() -> None:
         limit=args.limit,
         negative_ratio=args.negative_ratio,
     )
-    payload = {"samples": [sample.to_dict() for sample in samples]}
+    payload = {
+        "samples": [sample.to_dict() for sample in samples],
+        "instruction_samples": [sample.to_instruction_example() for sample in samples[:16]],
+    }
     output_text = json.dumps(payload, ensure_ascii=False, indent=2)
     if args.output:
         Path(args.output).write_text(output_text, encoding="utf-8")

@@ -48,6 +48,9 @@ lite_causal_eventrag/
     coarse_graph_model.py
     train_coarse_graph.py
     run_coarse_graph_model.py
+    local_qwen_lora.py
+    train_coarse_graph_qwen.py
+    run_coarse_graph_qwen.py
     refinement_dataset.py
     refinement_model.py
     train_refinement.py
@@ -99,10 +102,22 @@ Train the coarse graph proposer:
 python src/train_coarse_graph.py --split train --limit 128
 ```
 
+Train a Qwen LoRA coarse graph proposer:
+
+```bash
+python src/train_coarse_graph_qwen.py --split train --limit 128 --model-path models/Qwen2.5-0.5B
+```
+
 Run coarse graph proposer inference:
 
 ```bash
 python src/run_coarse_graph_model.py --split valid --limit 1
+```
+
+Run Qwen LoRA coarse graph proposer inference:
+
+```bash
+python src/run_coarse_graph_qwen.py --split valid --limit 1 --model-path outputs/coarse_graph_qwen_lora
 ```
 
 Generate synthetic refinement samples:
