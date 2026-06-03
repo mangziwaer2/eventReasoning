@@ -120,6 +120,48 @@ class LocalCausalGraph:
 
 
 @dataclass(slots=True)
+class CoarseCausalEdge:
+    edge_id: str
+    source_event_id: str
+    target_event_id: str
+    relation_type: str
+    score: float
+    evidence: list[EvidenceSpan] = field(default_factory=list)
+    feature_scores: dict[str, float] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "edge_id": self.edge_id,
+            "source_event_id": self.source_event_id,
+            "target_event_id": self.target_event_id,
+            "relation_type": self.relation_type,
+            "score": self.score,
+            "evidence": [item.to_dict() for item in self.evidence],
+            "feature_scores": self.feature_scores,
+            "metadata": self.metadata,
+        }
+
+
+@dataclass(slots=True)
+class CoarseCausalGraph:
+    query: QuerySpec
+    documents: list[NewsDocument]
+    events: list[EventNode]
+    edges: list[CoarseCausalEdge]
+    trace: GraphBuildTrace = field(default_factory=GraphBuildTrace)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "query": self.query.to_dict(),
+            "documents": [item.to_dict() for item in self.documents],
+            "events": [item.to_dict() for item in self.events],
+            "edges": [item.to_dict() for item in self.edges],
+            "trace": self.trace.to_dict(),
+        }
+
+
+@dataclass(slots=True)
 class ForecastCandidate:
     text: str
     confidence: float = 0.0

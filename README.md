@@ -1,19 +1,27 @@
-# Query-Conditioned Local Causal Graph
+# Query-Conditioned Causal Graph for Event Forecasting
 
-This repository is now a research scaffold for one direction:
+This repository studies one main problem:
 
-**build a local causal graph from a query and time-bounded news evidence, then use that graph to support future event prediction.**
+**use query-conditioned local causal graphs to improve future event forecasting from news.**
 
-The previous `MIND -> memory -> forecast` prototype has been removed on purpose. It no longer matched the current research target and was blocking clean iteration.
+The project is organized around the following pipeline:
 
-## Current Focus
+`query + cutoff time + candidate news -> retrieved evidence -> extracted events -> coarse causal graph -> refined causal graph -> future event hypotheses`
 
-The repository now centers on four questions:
+At the current stage, the implemented code reaches:
 
-1. What should the forecasting input look like?
-2. How should a query-conditioned local causal graph be constructed?
-3. How should bridge events and conflicting explanations be represented?
-4. How should graph quality and downstream forecasting quality be evaluated together?
+`query + cutoff time + candidate news -> retrieved evidence -> extracted events -> coarse causal graph`
+
+## Current Scope
+
+The repository does not treat event extraction as the main research contribution.
+Event extraction is implemented as an upstream, replaceable module.
+
+The current research focus is:
+
+1. How to build a useful coarse causal graph from extracted events
+2. How to refine that coarse graph with graph learning
+3. How to use the refined graph for event forecasting
 
 ## Repository Layout
 
@@ -26,81 +34,119 @@ lite_causal_eventrag/
     当前创新点.md
     当前项目功能书.md
     创新点变动书.md
+    项目方法书.md
+    refinement设计书.md
   src/
     causal_graph.py
-    query_causal_graph.py
-    example_query_graph.py
+    event_extraction.py
+    event_extractor.py
     mirai_dataset.py
-    local_llm.py
+    query_to_events.py
+    query_causal_graph.py
+    coarse_graph_builder.py
+    coarse_graph_dataset.py
+    coarse_graph_model.py
+    train_coarse_graph.py
+    run_coarse_graph_model.py
+    refinement_dataset.py
+    refinement_model.py
+    train_refinement.py
+    run_refinement.py
     query_forecast.py
+    local_llm.py
+  temp/
+    export_dataset_readable_samples.py
+    log_event_extraction_samples.py
   TODO.md
 ```
 
-## Current Code Scope
+## Current Code
 
-The current code is intentionally small.
-
-- `src/causal_graph.py`
-  Defines the research data structures for query, evidence documents, event nodes, causal edges, and local graphs.
+- `src/event_extractor.py`
+  Pluggable event extraction interface. The default backend is `rule`.
+- `src/query_to_events.py`
+  Converts a `MIRAI` query into retrieved evidence and extracted atomic events.
 - `src/query_causal_graph.py`
-  Provides a lightweight baseline builder for `query -> retrieved evidence -> local causal graph`.
-- `src/example_query_graph.py`
-  Runs an in-memory demo and prints the resulting graph.
-
-This is a starting point, not the final method.
+  Builds the current local graph baseline from retrieved evidence and extracted events.
+- `src/coarse_graph_builder.py`
+  Builds the current coarse causal graph from extracted events.
+- `src/query_forecast.py`
+  Keeps the graph-conditioned forecasting entrypoint scaffold.
 
 ## Quick Start
 
-Run the demo:
+Inspect extracted events:
 
 ```bash
-python src/example_query_graph.py
+python src/query_to_events.py --query-id 1 --event-extractor rule
 ```
 
-Run the CLI on a JSONL file:
+Build a coarse causal graph:
 
 ```bash
-python src/query_causal_graph.py --input news.jsonl --query "What may happen after the central bank raises rates?" --cutoff 2025-05-25
+python src/coarse_graph_builder.py --query-id 1 --event-extractor rule
 ```
 
-Run a MIRAI-based local validation:
+Export MAVEN-ERE event-pair samples for coarse graph training:
 
 ```bash
-python src/query_forecast.py --query-id 1 --skip-model
+python src/coarse_graph_dataset.py --split train --limit 2
 ```
 
-Run the same path with the local Qwen model:
+Train the coarse graph proposer:
 
 ```bash
-python src/query_forecast.py --query-id 1 --model-path models/Qwen2.5-0.5B
+python src/train_coarse_graph.py --split train --limit 128
 ```
 
-Each JSONL row should contain:
+Run coarse graph proposer inference:
 
-```json
-{
-  "document_id": "news_001",
-  "title": "Central bank raises rates",
-  "text": "The central bank raised rates. Borrowing costs climbed for manufacturers.",
-  "publish_time": "2025-05-25",
-  "source": "demo"
-}
+```bash
+python src/run_coarse_graph_model.py --split valid --limit 1
 ```
 
-## Planned Benchmark Setup
+Generate synthetic refinement samples:
+
+```bash
+python src/refinement_dataset.py --mode synthetic --num-samples 8
+```
+
+Train the refinement baseline on synthetic data:
+
+```bash
+python src/train_refinement.py --epochs 5 --num-samples 64
+```
+
+Run refinement inference on a MIRAI-derived coarse graph:
+
+```bash
+python src/run_refinement.py --query-id 1
+```
+
+Generate a readable event extraction log:
+
+```bash
+python temp/log_event_extraction_samples.py --query-ids 1 2 3 --event-extractor rule
+```
+
+## Current Benchmarks
 
 - Main downstream benchmark: `MIRAI`
-- Auxiliary graph-quality evaluation: `MAVEN-ERE`, `Event StoryLine Corpus`, `Causal News Corpus`
+- Auxiliary graph supervision / evaluation:
+  - `MAVEN-ERE`
+  - `Event StoryLine Corpus`
+  - `Causal News Corpus`
+  - optional `MATRES`
 
-Those choices and later changes are tracked in [docs/创新点变动书.md](/E:/project/EventDetection/lite_causal_eventrag/docs/创新点变动书.md).
+## Current Position
 
-## What Was Intentionally Removed
+The project has already implemented:
 
-The following old direction has been removed:
+1. `MIRAI` query ingestion
+2. query-conditioned evidence retrieval
+3. replaceable event extraction
+4. coarse causal graph construction
 
-- `MIND` conversion scripts
-- offline memory construction
-- heuristic batch forecasting
-- legacy evaluation scripts tied to the old prototype
+The next research step is:
 
-If an old file is gone, it was removed because it no longer served the query-conditioned causal-graph direction.
+**train and refine the coarse graph, rather than keep extending extraction heuristics.**

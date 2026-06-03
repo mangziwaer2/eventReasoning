@@ -94,5 +94,7 @@ def main() -> None:
         Path(args.output).write_text(output_text, encoding="utf-8")
     else:
         print(output_text)
+
+
 if __name__ == "__main__":
     main()
