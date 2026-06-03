@@ -9,15 +9,17 @@ import torch
 from coarse_graph_dataset import ID_TO_RELATION
 from coarse_graph_dataset import load_maven_pair_samples
 from coarse_graph_model import CoarseEdgeProposer
+from path_utils import REPO_ROOT
+from path_utils import resolve_repo_path
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run coarse graph proposer inference on MAVEN-ERE event-pair samples.")
-    parser.add_argument("--dataset", default="datasets/MAVEN_ERE.zip", help="Path to MAVEN-ERE zip file.")
+    parser.add_argument("--dataset", default=str(REPO_ROOT / "datasets" / "MAVEN_ERE.zip"), help="Path to MAVEN-ERE zip file.")
     parser.add_argument("--split", default="valid", help="MAVEN split name.")
     parser.add_argument("--limit", type=int, default=1, help="Maximum number of MAVEN rows.")
     parser.add_argument("--negative-ratio", type=float, default=1.0, help="Negative to positive pair ratio.")
-    parser.add_argument("--model-path", default="outputs/coarse_graph_maven/coarse_graph_model.pt", help="Trained model path.")
+    parser.add_argument("--model-path", default=str(REPO_ROOT / "outputs" / "coarse_graph_maven" / "coarse_graph_model.pt"), help="Trained model path.")
     parser.add_argument("--output", default=None, help="Optional output JSON path.")
     return parser.parse_args()
 
@@ -25,7 +27,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     samples = load_maven_pair_samples(
-        dataset_path=Path(args.dataset),
+        dataset_path=resolve_repo_path(args.dataset),
         split=args.split,
         limit=args.limit,
         negative_ratio=args.negative_ratio,
@@ -34,7 +36,7 @@ def main() -> None:
         raise RuntimeError("No coarse graph samples were loaded for inference.")
 
     model = CoarseEdgeProposer()
-    model.load_state_dict(torch.load(args.model_path, map_location="cpu"))
+    model.load_state_dict(torch.load(resolve_repo_path(args.model_path), map_location="cpu"))
     model.eval()
 
     preview = []

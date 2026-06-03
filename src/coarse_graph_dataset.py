@@ -12,6 +12,9 @@ from typing import Any
 import torch
 from torch.utils.data import Dataset
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+from path_utils import resolve_repo_path
+
 
 RELATION_TO_ID = {
     "none": 0,
@@ -270,7 +273,7 @@ def load_maven_pair_samples(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Export MAVEN-ERE event-pair samples for coarse graph training.")
-    parser.add_argument("--dataset", default="datasets/MAVEN_ERE.zip", help="Path to MAVEN-ERE zip file.")
+    parser.add_argument("--dataset", default=str(REPO_ROOT / "datasets" / "MAVEN_ERE.zip"), help="Path to MAVEN-ERE zip file.")
     parser.add_argument("--split", default="train", help="MAVEN split name.")
     parser.add_argument("--limit", type=int, default=2, help="Maximum number of MAVEN rows.")
     parser.add_argument("--negative-ratio", type=float, default=1.0, help="Negative to positive pair ratio.")
@@ -281,7 +284,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     samples = load_maven_pair_samples(
-        dataset_path=Path(args.dataset),
+        dataset_path=resolve_repo_path(args.dataset),
         split=args.split,
         limit=args.limit,
         negative_ratio=args.negative_ratio,
@@ -292,7 +295,7 @@ def main() -> None:
     }
     output_text = json.dumps(payload, ensure_ascii=False, indent=2)
     if args.output:
-        Path(args.output).write_text(output_text, encoding="utf-8")
+        resolve_repo_path(args.output).write_text(output_text, encoding="utf-8")
     else:
         print(output_text)
 

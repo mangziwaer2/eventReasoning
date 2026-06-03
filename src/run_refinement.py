@@ -9,6 +9,7 @@ import torch
 from refinement_dataset import coarse_graph_to_refinement_sample
 from refinement_dataset import export_mirai_refinement_sample
 from refinement_model import TemporalRelationalEdgeRefiner
+from path_utils import resolve_repo_path
 
 
 def parse_args() -> argparse.Namespace:
@@ -25,7 +26,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     payload = export_mirai_refinement_sample(
-        dataset_path=Path(args.dataset),
+        dataset_path=resolve_repo_path(args.dataset),
         query_id=args.query_id,
         split=args.split,
         event_extractor_name=args.event_extractor,
@@ -37,7 +38,7 @@ def main() -> None:
     query_features = torch.tensor(sample_dict["query_features"], dtype=torch.float32)
 
     model = TemporalRelationalEdgeRefiner()
-    model.load_state_dict(torch.load(args.model_path, map_location="cpu"))
+    model.load_state_dict(torch.load(resolve_repo_path(args.model_path), map_location="cpu"))
     model.eval()
 
     with torch.no_grad():

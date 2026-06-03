@@ -11,6 +11,8 @@ from torch.utils.data import DataLoader
 from coarse_graph_dataset import CoarseGraphPairDataset
 from coarse_graph_dataset import load_maven_pair_samples
 from coarse_graph_model import CoarseEdgeProposer
+from path_utils import REPO_ROOT
+from path_utils import resolve_repo_path
 
 
 def collate_batch(batch):
@@ -23,24 +25,24 @@ def collate_batch(batch):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train the coarse graph proposer on MAVEN-ERE event-pair samples.")
-    parser.add_argument("--dataset", default="datasets/MAVEN_ERE.zip", help="Path to MAVEN-ERE zip file.")
+    parser.add_argument("--dataset", default=str(REPO_ROOT / "datasets" / "MAVEN_ERE.zip"), help="Path to MAVEN-ERE zip file.")
     parser.add_argument("--split", default="train", help="MAVEN split name.")
     parser.add_argument("--limit", type=int, default=128, help="Maximum number of MAVEN rows.")
     parser.add_argument("--negative-ratio", type=float, default=1.0, help="Negative to positive pair ratio.")
     parser.add_argument("--epochs", type=int, default=5, help="Number of training epochs.")
     parser.add_argument("--batch-size", type=int, default=32, help="Batch size.")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate.")
-    parser.add_argument("--output-dir", default="outputs/coarse_graph_maven", help="Training output directory.")
+    parser.add_argument("--output-dir", default=str(REPO_ROOT / "outputs" / "coarse_graph_maven"), help="Training output directory.")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    output_dir = Path(args.output_dir)
+    output_dir = resolve_repo_path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     samples = load_maven_pair_samples(
-        dataset_path=Path(args.dataset),
+        dataset_path=resolve_repo_path(args.dataset),
         split=args.split,
         limit=args.limit,
         negative_ratio=args.negative_ratio,

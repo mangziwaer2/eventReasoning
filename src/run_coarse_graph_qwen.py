@@ -7,12 +7,14 @@ from pathlib import Path
 from coarse_graph_dataset import load_maven_pair_samples
 from local_qwen_lora import LoraUnavailable
 from local_qwen_lora import load_qwen_with_lora
+from path_utils import REPO_ROOT
+from path_utils import resolve_repo_path
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run Qwen LoRA coarse-graph proposer inference on MAVEN-ERE event-pair samples.")
-    parser.add_argument("--dataset", default="datasets/MAVEN_ERE.zip", help="Path to MAVEN-ERE zip file.")
-    parser.add_argument("--model-path", default="outputs/coarse_graph_qwen_lora", help="LoRA model directory.")
+    parser.add_argument("--dataset", default=str(REPO_ROOT / "datasets" / "MAVEN_ERE.zip"), help="Path to MAVEN-ERE zip file.")
+    parser.add_argument("--model-path", default=str(REPO_ROOT / "outputs" / "coarse_graph_qwen_lora"), help="LoRA model directory.")
     parser.add_argument("--split", default="valid", help="MAVEN split name.")
     parser.add_argument("--limit", type=int, default=1, help="Maximum number of MAVEN rows.")
     parser.add_argument("--negative-ratio", type=float, default=1.0, help="Negative to positive pair ratio.")
@@ -32,7 +34,7 @@ def _format_prompt(prompt: str) -> str:
 def main() -> None:
     args = parse_args()
     samples = load_maven_pair_samples(
-        dataset_path=Path(args.dataset),
+        dataset_path=resolve_repo_path(args.dataset),
         split=args.split,
         limit=args.limit,
         negative_ratio=args.negative_ratio,
@@ -40,7 +42,7 @@ def main() -> None:
     instruction_samples = [sample.to_instruction_example() for sample in samples[:8]]
 
     try:
-        model, tokenizer, torch = load_qwen_with_lora(Path(args.model_path))
+        model, tokenizer, torch = load_qwen_with_lora(resolve_repo_path(args.model_path))
     except LoraUnavailable as exc:
         error_payload = {"error": str(exc)}
         print(json.dumps(error_payload, ensure_ascii=False))

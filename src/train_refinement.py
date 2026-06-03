@@ -13,6 +13,8 @@ from refinement_dataset import RefinementSample
 from refinement_dataset import generate_synthetic_refinement_samples
 from refinement_dataset import load_maven_refinement_samples
 from refinement_model import TemporalRelationalEdgeRefiner
+from path_utils import REPO_ROOT
+from path_utils import resolve_repo_path
 
 
 def collate_single(batch):
@@ -21,27 +23,27 @@ def collate_single(batch):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train the refinement baseline on synthetic coarse-graph samples.")
-    parser.add_argument("--dataset-mode", choices=["synthetic", "maven"], default="synthetic", help="Training dataset mode.")
-    parser.add_argument("--maven-dataset", default="datasets/MAVEN_ERE.zip", help="Path to MAVEN-ERE zip file.")
+    parser.add_argument("--dataset-mode", choices=["synthetic", "maven"], default="maven", help="Training dataset mode.")
+    parser.add_argument("--maven-dataset", default=str(REPO_ROOT / "datasets" / "MAVEN_ERE.zip"), help="Path to MAVEN-ERE zip file.")
     parser.add_argument("--split", default="train", help="MAVEN split when dataset-mode=maven.")
     parser.add_argument("--epochs", type=int, default=5, help="Number of training epochs.")
     parser.add_argument("--num-samples", type=int, default=64, help="Number of synthetic training samples.")
     parser.add_argument("--limit", type=int, default=128, help="Maximum number of MAVEN samples when dataset-mode=maven.")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate.")
-    parser.add_argument("--output-dir", default="outputs/refinement_synthetic", help="Training output directory.")
+    parser.add_argument("--output-dir", default=str(REPO_ROOT / "outputs" / "refinement"), help="Training output directory.")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    output_dir = Path(args.output_dir)
+    output_dir = resolve_repo_path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if args.dataset_mode == "synthetic":
         train_samples = generate_synthetic_refinement_samples(num_samples=args.num_samples)
     else:
         train_samples = load_maven_refinement_samples(
-            dataset_path=Path(args.maven_dataset),
+            dataset_path=resolve_repo_path(args.maven_dataset),
             split=args.split,
             limit=args.limit,
         )

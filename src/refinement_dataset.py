@@ -23,6 +23,8 @@ from coarse_graph_builder import CoarseCausalGraphBuilder
 from mirai_dataset import export_mirai_query_snapshot
 from mirai_dataset import get_mirai_query_by_id
 from mirai_dataset import load_mirai_news_for_docids
+from path_utils import REPO_ROOT
+from path_utils import resolve_repo_path
 from query_causal_graph import QueryCausalGraphBuilder
 
 
@@ -592,14 +594,14 @@ def main() -> None:
         payload = {"mode": "synthetic", "samples": [sample.to_dict() for sample in samples]}
     elif args.mode == "mirai":
         payload = export_mirai_refinement_sample(
-            dataset_path=Path(args.dataset),
+            dataset_path=resolve_repo_path(args.dataset),
             query_id=args.query_id,
             split=args.split,
             event_extractor_name=args.event_extractor,
         )
     else:
         samples = load_maven_refinement_samples(
-            dataset_path=Path(args.maven_dataset),
+            dataset_path=resolve_repo_path(args.maven_dataset),
             split=args.split,
             limit=args.limit,
         )
@@ -607,7 +609,7 @@ def main() -> None:
 
     output_text = json.dumps(payload, ensure_ascii=False, indent=2)
     if args.output:
-        Path(args.output).write_text(output_text, encoding="utf-8")
+        resolve_repo_path(args.output).write_text(output_text, encoding="utf-8")
     else:
         print(output_text)
 
