@@ -105,6 +105,7 @@ def coarse_graph_to_refinement_sample(sample_id: str, graph: CoarseCausalGraph) 
     edge_labels: list[int] = []
     edge_type_labels: list[int] = []
     edge_strengths: list[float] = []
+    edge_descriptions: list[dict[str, Any]] = []
 
     for edge in graph.edges:
         if edge.source_event_id not in node_id_to_index or edge.target_event_id not in node_id_to_index:
@@ -114,6 +115,18 @@ def coarse_graph_to_refinement_sample(sample_id: str, graph: CoarseCausalGraph) 
         edge_labels.append(int(edge.score >= 0.65))
         edge_type_labels.append(RELATION_TO_ID.get(edge.relation_type, 0))
         edge_strengths.append(float(edge.score))
+        source_event = next(item for item in graph.events if item.event_id == edge.source_event_id)
+        target_event = next(item for item in graph.events if item.event_id == edge.target_event_id)
+        edge_descriptions.append(
+            {
+                "source_event_id": edge.source_event_id,
+                "target_event_id": edge.target_event_id,
+                "source_text": source_event.text,
+                "target_text": target_event.text,
+                "coarse_relation_type": edge.relation_type,
+                "coarse_score": edge.score,
+            }
+        )
 
     query_features = [
         float(len(graph.query.focus_entities)),
@@ -134,6 +147,9 @@ def coarse_graph_to_refinement_sample(sample_id: str, graph: CoarseCausalGraph) 
         metadata={
             "query_id": graph.query.query_id,
             "cutoff_time": graph.query.cutoff_time,
+            "query_text": graph.query.text,
+            "event_texts": [event.text for event in graph.events],
+            "edge_descriptions": edge_descriptions,
         },
     )
 
@@ -233,7 +249,22 @@ def generate_synthetic_refinement_samples(num_samples: int = 32, seed: int = 7) 
                     float(node_count),
                     float(edge_count),
                 ],
-                metadata={"synthetic": True},
+                metadata={
+                    "synthetic": True,
+                    "query_text": "synthetic query",
+                    "event_texts": [f"synthetic_event_{i}" for i in range(node_count)],
+                    "edge_descriptions": [
+                        {
+                            "source_event_id": f"n{src}",
+                            "target_event_id": f"n{tgt}",
+                            "source_text": f"synthetic_event_{src}",
+                            "target_text": f"synthetic_event_{tgt}",
+                            "coarse_relation_type": ["precedes", "causes", "escalates", "mitigates"][int(edge_features[idx][1])],
+                            "coarse_score": edge_strengths[idx],
+                        }
+                        for idx, (src, tgt) in enumerate(edge_index)
+                    ],
+                },
             )
         )
 
@@ -505,6 +536,7 @@ def gold_and_coarse_graph_to_refinement_sample(
     edge_labels: list[int] = []
     edge_type_labels: list[int] = []
     edge_strengths: list[float] = []
+    edge_descriptions: list[dict[str, Any]] = []
 
     for edge in coarse_graph.edges:
         pair = (edge.source_event_id, edge.target_event_id)
@@ -516,10 +548,25 @@ def gold_and_coarse_graph_to_refinement_sample(
             edge_labels.append(1)
             edge_type_labels.append(RELATION_TO_ID.get(gold_edge_map[pair].relation_type, 0))
             edge_strengths.append(float(gold_edge_map[pair].score))
+            gold_relation = gold_edge_map[pair].relation_type
         else:
             edge_labels.append(0)
             edge_type_labels.append(0)
             edge_strengths.append(0.0)
+            gold_relation = "none"
+        source_event = next(item for item in gold_graph.events if item.event_id == edge.source_event_id)
+        target_event = next(item for item in gold_graph.events if item.event_id == edge.target_event_id)
+        edge_descriptions.append(
+            {
+                "source_event_id": edge.source_event_id,
+                "target_event_id": edge.target_event_id,
+                "source_text": source_event.text,
+                "target_text": target_event.text,
+                "coarse_relation_type": edge.relation_type,
+                "gold_relation_type": gold_relation,
+                "coarse_score": edge.score,
+            }
+        )
 
     query_features = [
         float(len(gold_graph.query.focus_entities)),
@@ -540,6 +587,9 @@ def gold_and_coarse_graph_to_refinement_sample(
         metadata={
             "query_id": gold_graph.query.query_id,
             "dataset": gold_graph.query.metadata.get("dataset", "unknown"),
+            "query_text": gold_graph.query.text,
+            "event_texts": [event.text for event in gold_graph.events],
+            "edge_descriptions": edge_descriptions,
         },
     )
 

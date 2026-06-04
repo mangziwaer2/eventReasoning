@@ -172,7 +172,7 @@ def load_maven_pair_samples(
 ) -> list[CoarseGraphPairSample]:
     random.seed(seed)
     rows = _read_maven_rows(dataset_path, split=split)
-    if limit is not None:
+    if limit > 0:
         rows = rows[:limit]
 
     samples: list[CoarseGraphPairSample] = []
@@ -275,7 +275,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Export MAVEN-ERE event-pair samples for coarse graph training.")
     parser.add_argument("--dataset", default=str(REPO_ROOT / "datasets" / "MAVEN_ERE.zip"), help="Path to MAVEN-ERE zip file.")
     parser.add_argument("--split", default="train", help="MAVEN split name.")
-    parser.add_argument("--limit", type=int, default=2, help="Maximum number of MAVEN rows.")
+    parser.add_argument("--limit", type=int, default=0, help="Maximum number of MAVEN rows.")
     parser.add_argument("--negative-ratio", type=float, default=1.0, help="Negative to positive pair ratio.")
     parser.add_argument("--output", default=None, help="Optional JSON output path.")
     return parser.parse_args()

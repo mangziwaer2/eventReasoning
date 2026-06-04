@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 from pathlib import Path
 
 from coarse_graph_dataset import load_maven_pair_samples
@@ -21,6 +22,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=1, help="Number of epochs.")
     parser.add_argument("--max-length", type=int, default=512, help="Maximum token length.")
     parser.add_argument("--lr", type=float, default=2e-4, help="Learning rate.")
+    parser.add_argument("--validation-ratio", type=float, default=0.1, help="Validation split ratio.")
+    parser.add_argument("--debug-samples", type=int, default=2, help="Number of validation samples printed each epoch.")
+    parser.add_argument("--seed", type=int, default=7, help="Random seed for splits and debug sampling.")
     parser.add_argument("--output-dir", default=str(REPO_ROOT / "outputs" / "coarse_graph_qwen_lora"), help="Training output directory.")
     return parser.parse_args()
 
@@ -33,6 +37,98 @@ def _format_text(prompt: str, target: str) -> str:
     )
 
 
+def _format_prompt_only(prompt: str) -> str:
+    return (
+        "<|im_start|>system\nYou infer causal relations between structured events.<|im_end|>\n"
+        f"<|im_start|>user\n{prompt}<|im_end|>\n"
+        "<|im_start|>assistant\n"
+    )
+
+
+def split_instruction_samples(samples: list[dict[str, object]], validation_ratio: float, seed: int) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    if validation_ratio <= 0 or len(samples) < 2:
+        return samples, []
+    rng = random.Random(seed)
+    shuffled = list(samples)
+    rng.shuffle(shuffled)
+    validation_size = max(1, int(len(shuffled) * validation_ratio))
+    if validation_size >= len(shuffled):
+        validation_size = len(shuffled) - 1
+    return shuffled[validation_size:], shuffled[:validation_size]
+
+
+def compute_text_loss(model, tokenizer, device, text: str, max_length: int):
+    encoded = tokenizer(
+        text,
+        return_tensors="pt",
+        truncation=True,
+        max_length=max_length,
+    )
+    input_ids = encoded["input_ids"].to(device)
+    attention_mask = encoded["attention_mask"].to(device)
+    outputs = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        labels=input_ids,
+    )
+    return outputs.loss
+
+
+def evaluate(model, tokenizer, device, validation_samples, max_length: int):
+    if not validation_samples:
+        return None
+    model.eval()
+    total_loss = 0.0
+    sample_count = 0
+    with torch.no_grad():
+        for item in validation_samples:
+            text = _format_text(item["prompt"], item["target"])
+            loss = compute_text_loss(model, tokenizer, device, text, max_length)
+            total_loss += float(loss.item())
+            sample_count += 1
+    return {"val_loss": total_loss / max(sample_count, 1)}
+
+
+def print_debug_samples(model, tokenizer, device, validation_samples, max_length: int, debug_samples: int, seed: int) -> None:
+    if not validation_samples or debug_samples <= 0:
+        return
+    rng = random.Random(seed)
+    chosen = rng.sample(validation_samples, min(debug_samples, len(validation_samples)))
+    model.eval()
+    with torch.no_grad():
+        for item in chosen:
+            prompt_only = _format_prompt_only(item["prompt"])
+            encoded = tokenizer(
+                prompt_only,
+                return_tensors="pt",
+                truncation=True,
+                max_length=max_length,
+            )
+            input_ids = encoded["input_ids"].to(device)
+            attention_mask = encoded["attention_mask"].to(device)
+            outputs = model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=80,
+                do_sample=False,
+                pad_token_id=tokenizer.eos_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+            )
+            prediction = tokenizer.decode(outputs[0][input_ids.shape[-1] :], skip_special_tokens=True).strip()
+            print(
+                json.dumps(
+                    {
+                        "debug_stage": "coarse_qwen_validation_sample",
+                        "sample_id": item["sample_id"],
+                        "prompt": item["prompt"],
+                        "target": item["target"],
+                        "prediction": prediction,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+
+
 def main() -> None:
     args = parse_args()
     output_dir = resolve_repo_path(args.output_dir)
@@ -43,8 +139,14 @@ def main() -> None:
         split=args.split,
         limit=args.limit,
         negative_ratio=args.negative_ratio,
+        seed=args.seed,
     )
     instruction_samples = [sample.to_instruction_example() for sample in samples]
+    train_samples, validation_samples = split_instruction_samples(
+        instruction_samples,
+        args.validation_ratio,
+        args.seed,
+    )
 
     try:
         model, tokenizer, torch = load_qwen_with_lora(resolve_repo_path(args.model_path))
@@ -59,25 +161,12 @@ def main() -> None:
     history: list[dict[str, float]] = []
 
     for epoch in range(args.epochs):
+        model.train()
         total_loss = 0.0
         sample_count = 0
-        for item in instruction_samples:
+        for item in train_samples:
             text = _format_text(item["prompt"], item["target"])
-            encoded = tokenizer(
-                text,
-                return_tensors="pt",
-                truncation=True,
-                max_length=args.max_length,
-            )
-            input_ids = encoded["input_ids"].to(device)
-            attention_mask = encoded["attention_mask"].to(device)
-
-            outputs = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                labels=input_ids,
-            )
-            loss = outputs.loss
+            loss = compute_text_loss(model, tokenizer, device, text, args.max_length)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -89,8 +178,20 @@ def main() -> None:
             "epoch": float(epoch + 1),
             "loss": total_loss / max(sample_count, 1),
         }
+        validation_record = evaluate(model, tokenizer, device, validation_samples, args.max_length)
+        if validation_record is not None:
+            record.update(validation_record)
         history.append(record)
         print(json.dumps(record))
+        print_debug_samples(
+            model,
+            tokenizer,
+            device,
+            validation_samples,
+            args.max_length,
+            args.debug_samples,
+            args.seed + epoch,
+        )
 
     model.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
@@ -102,6 +203,8 @@ def main() -> None:
                 "limit": args.limit,
                 "negative_ratio": args.negative_ratio,
                 "model_path": args.model_path,
+                "validation_ratio": args.validation_ratio,
+                "debug_samples": args.debug_samples,
             },
             indent=2,
         ),
