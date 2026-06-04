@@ -5,10 +5,6 @@ import json
 import random
 from pathlib import Path
 
-import torch
-from torch import nn
-from torch.utils.data import DataLoader
-
 from refinement_dataset import RefinementTensorDataset
 from refinement_dataset import RefinementSample
 from refinement_dataset import generate_synthetic_refinement_samples
@@ -121,6 +117,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=5, help="Number of training epochs.")
     parser.add_argument("--num-samples", type=int, default=64, help="Number of synthetic training samples.")
     parser.add_argument("--limit", type=int, default=128, help="Maximum number of MAVEN samples when dataset-mode=maven.")
+    parser.add_argument("--max-events", type=int, default=12, help="Maximum events kept in each MAVEN graph sample.")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate.")
     parser.add_argument("--validation-ratio", type=float, default=0.1, help="Validation split ratio.")
     parser.add_argument("--debug-samples", type=int, default=2, help="Number of validation samples printed each epoch.")
@@ -130,6 +127,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    import torch
+    from torch import nn
+    from torch.utils.data import DataLoader
+
     args = parse_args()
     output_dir = resolve_repo_path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -141,6 +142,7 @@ def main() -> None:
             dataset_path=resolve_repo_path(args.maven_dataset),
             split=args.split,
             limit=args.limit,
+            max_events=args.max_events,
             seed=args.seed,
         )
     train_samples, validation_samples = split_samples(all_samples, args.validation_ratio, args.seed)
@@ -211,6 +213,7 @@ def main() -> None:
                 "dataset_mode": args.dataset_mode,
                 "num_samples": args.num_samples,
                 "limit": args.limit,
+                "max_events": args.max_events,
                 "split": args.split,
                 "validation_ratio": args.validation_ratio,
                 "debug_samples": args.debug_samples,

@@ -3,9 +3,10 @@ from __future__ import annotations
 import argparse
 import json
 import random
-from pathlib import Path
 
-from coarse_graph_dataset import load_maven_pair_samples
+from coarse_graph_dataset import DocumentGraphSample
+from coarse_graph_dataset import load_maven_document_graph_samples
+from coarse_graph_dataset import sample_graph_from_model_output
 from local_qwen_lora import LoraUnavailable
 from local_qwen_lora import load_qwen_with_lora
 from path_utils import REPO_ROOT
@@ -13,14 +14,14 @@ from path_utils import resolve_repo_path
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train a Qwen LoRA coarse-graph proposer on MAVEN-ERE event-pair samples.")
+    parser = argparse.ArgumentParser(description="Train a Qwen LoRA coarse-graph generator on document-level graph samples.")
     parser.add_argument("--dataset", default=str(REPO_ROOT / "datasets" / "MAVEN_ERE.zip"), help="Path to MAVEN-ERE zip file.")
     parser.add_argument("--model-path", default=str(REPO_ROOT / "models" / "Qwen2.5-0.5B"), help="Local Qwen model directory.")
     parser.add_argument("--split", default="train", help="MAVEN split name.")
     parser.add_argument("--limit", type=int, default=128, help="Maximum number of MAVEN rows.")
-    parser.add_argument("--negative-ratio", type=float, default=1.0, help="Negative to positive pair ratio.")
+    parser.add_argument("--max-events", type=int, default=12, help="Maximum events kept per training sample.")
     parser.add_argument("--epochs", type=int, default=1, help="Number of epochs.")
-    parser.add_argument("--max-length", type=int, default=512, help="Maximum token length.")
+    parser.add_argument("--max-length", type=int, default=1536, help="Maximum token length.")
     parser.add_argument("--lr", type=float, default=2e-4, help="Learning rate.")
     parser.add_argument("--validation-ratio", type=float, default=0.1, help="Validation split ratio.")
     parser.add_argument("--debug-samples", type=int, default=2, help="Number of validation samples printed each epoch.")
@@ -31,7 +32,7 @@ def parse_args() -> argparse.Namespace:
 
 def _format_text(prompt: str, target: str) -> str:
     return (
-        "<|im_start|>system\nYou infer causal relations between structured events.<|im_end|>\n"
+        "<|im_start|>system\nYou build coarse causal graphs from retrieved news evidence.<|im_end|>\n"
         f"<|im_start|>user\n{prompt}<|im_end|>\n"
         f"<|im_start|>assistant\n{target}<|im_end|>"
     )
@@ -39,13 +40,17 @@ def _format_text(prompt: str, target: str) -> str:
 
 def _format_prompt_only(prompt: str) -> str:
     return (
-        "<|im_start|>system\nYou infer causal relations between structured events.<|im_end|>\n"
+        "<|im_start|>system\nYou build coarse causal graphs from retrieved news evidence.<|im_end|>\n"
         f"<|im_start|>user\n{prompt}<|im_end|>\n"
         "<|im_start|>assistant\n"
     )
 
 
-def split_instruction_samples(samples: list[dict[str, object]], validation_ratio: float, seed: int) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+def split_samples(
+    samples: list[DocumentGraphSample],
+    validation_ratio: float,
+    seed: int,
+) -> tuple[list[DocumentGraphSample], list[DocumentGraphSample]]:
     if validation_ratio <= 0 or len(samples) < 2:
         return samples, []
     rng = random.Random(seed)
@@ -74,14 +79,15 @@ def compute_text_loss(model, tokenizer, device, text: str, max_length: int):
     return outputs.loss
 
 
-def evaluate(model, tokenizer, device, validation_samples, max_length: int):
+def evaluate(model, tokenizer, device, validation_samples: list[DocumentGraphSample], max_length: int):
     if not validation_samples:
         return None
     model.eval()
     total_loss = 0.0
     sample_count = 0
     with torch.no_grad():
-        for item in validation_samples:
+        for sample in validation_samples:
+            item = sample.to_instruction_example()
             text = _format_text(item["prompt"], item["target"])
             loss = compute_text_loss(model, tokenizer, device, text, max_length)
             total_loss += float(loss.item())
@@ -89,14 +95,15 @@ def evaluate(model, tokenizer, device, validation_samples, max_length: int):
     return {"val_loss": total_loss / max(sample_count, 1)}
 
 
-def print_debug_samples(model, tokenizer, device, validation_samples, max_length: int, debug_samples: int, seed: int) -> None:
+def print_debug_samples(model, tokenizer, device, validation_samples: list[DocumentGraphSample], max_length: int, debug_samples: int, seed: int) -> None:
     if not validation_samples or debug_samples <= 0:
         return
     rng = random.Random(seed)
     chosen = rng.sample(validation_samples, min(debug_samples, len(validation_samples)))
     model.eval()
     with torch.no_grad():
-        for item in chosen:
+        for sample in chosen:
+            item = sample.to_instruction_example()
             prompt_only = _format_prompt_only(item["prompt"])
             encoded = tokenizer(
                 prompt_only,
@@ -109,18 +116,22 @@ def print_debug_samples(model, tokenizer, device, validation_samples, max_length
             outputs = model.generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                max_new_tokens=80,
+                max_new_tokens=256,
                 do_sample=False,
                 pad_token_id=tokenizer.eos_token_id,
                 eos_token_id=tokenizer.eos_token_id,
             )
             prediction = tokenizer.decode(outputs[0][input_ids.shape[-1] :], skip_special_tokens=True).strip()
+            pred_graph = sample_graph_from_model_output(sample, prediction)
             print(
                 json.dumps(
                     {
                         "debug_stage": "coarse_qwen_validation_sample",
-                        "sample_id": item["sample_id"],
-                        "prompt": item["prompt"],
+                        "sample_id": sample.sample_id,
+                        "query": sample.query.text,
+                        "event_count": len(sample.events),
+                        "gold_edge_count": len(sample.gold_graph.edges) if sample.gold_graph else 0,
+                        "pred_edge_count": len(pred_graph.edges),
                         "target": item["target"],
                         "prediction": prediction,
                     },
@@ -134,25 +145,18 @@ def main() -> None:
     output_dir = resolve_repo_path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    samples = load_maven_pair_samples(
+    samples = load_maven_document_graph_samples(
         dataset_path=resolve_repo_path(args.dataset),
         split=args.split,
         limit=args.limit,
-        negative_ratio=args.negative_ratio,
-        seed=args.seed,
+        max_events=args.max_events,
     )
-    instruction_samples = [sample.to_instruction_example() for sample in samples]
-    train_samples, validation_samples = split_instruction_samples(
-        instruction_samples,
-        args.validation_ratio,
-        args.seed,
-    )
+    train_samples, validation_samples = split_samples(samples, args.validation_ratio, args.seed)
 
     try:
         model, tokenizer, torch = load_qwen_with_lora(resolve_repo_path(args.model_path))
     except LoraUnavailable as exc:
-        error_payload = {"error": str(exc)}
-        print(json.dumps(error_payload, ensure_ascii=False))
+        print(json.dumps({"error": str(exc)}, ensure_ascii=False))
         return
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
@@ -164,7 +168,8 @@ def main() -> None:
         model.train()
         total_loss = 0.0
         sample_count = 0
-        for item in train_samples:
+        for sample in train_samples:
+            item = sample.to_instruction_example()
             text = _format_text(item["prompt"], item["target"])
             loss = compute_text_loss(model, tokenizer, device, text, args.max_length)
             optimizer.zero_grad()
@@ -201,10 +206,11 @@ def main() -> None:
             {
                 "split": args.split,
                 "limit": args.limit,
-                "negative_ratio": args.negative_ratio,
+                "max_events": args.max_events,
                 "model_path": args.model_path,
                 "validation_ratio": args.validation_ratio,
                 "debug_samples": args.debug_samples,
+                "task": "document_to_coarse_graph",
             },
             indent=2,
         ),

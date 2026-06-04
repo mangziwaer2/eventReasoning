@@ -4,38 +4,124 @@ import argparse
 import json
 from pathlib import Path
 
-import torch
-
-from refinement_dataset import coarse_graph_to_refinement_sample
-from refinement_dataset import export_mirai_refinement_sample
+from causal_graph import CoarseCausalEdge
+from causal_graph import CoarseCausalGraph
+from coarse_graph_dataset import load_coarse_graph
+from refinement_dataset import ID_TO_RELATION
+from refinement_dataset import load_refinement_sample_from_coarse_graph
 from refinement_model import TemporalRelationalEdgeRefiner
+from path_utils import REPO_ROOT
 from path_utils import resolve_repo_path
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run refinement inference on a MIRAI-derived coarse graph sample.")
-    parser.add_argument("--dataset", default="datasets/MIRAI_data.zip", help="Path to MIRAI zip file.")
-    parser.add_argument("--query-id", default="1", help="MIRAI QueryId.")
-    parser.add_argument("--split", default="test", help="MIRAI split name.")
-    parser.add_argument("--event-extractor", default="rule", help="Event extractor backend name.")
-    parser.add_argument("--model-path", default="outputs/refinement_synthetic/refinement_model.pt", help="Trained refinement model path.")
+    parser = argparse.ArgumentParser(description="Run refinement inference on a coarse graph JSON file.")
+    parser.add_argument("--coarse-graph", required=True, help="Path to a coarse graph JSON file.")
+    parser.add_argument("--model-path", default=str(REPO_ROOT / "outputs" / "refinement" / "refinement_model.pt"), help="Trained refinement model path.")
+    parser.add_argument("--keep-threshold", type=float, default=0.5, help="Minimum keep probability for refined edges.")
     parser.add_argument("--output", default=None, help="Optional output JSON path.")
     return parser.parse_args()
 
 
-def main() -> None:
-    args = parse_args()
-    payload = export_mirai_refinement_sample(
-        dataset_path=resolve_repo_path(args.dataset),
-        query_id=args.query_id,
-        split=args.split,
-        event_extractor_name=args.event_extractor,
+def build_refined_graph(
+    coarse_graph: CoarseCausalGraph,
+    keep_probs: list[float],
+    type_predictions: list[int],
+    strength_predictions: list[float],
+    keep_threshold: float,
+) -> CoarseCausalGraph:
+    refined_edges: list[CoarseCausalEdge] = []
+    for edge, keep_prob, type_prediction, strength_prediction in zip(
+        coarse_graph.edges,
+        keep_probs,
+        type_predictions,
+        strength_predictions,
+    ):
+        if keep_prob < keep_threshold:
+            continue
+        refined_edges.append(
+            CoarseCausalEdge(
+                edge_id=edge.edge_id,
+                source_event_id=edge.source_event_id,
+                target_event_id=edge.target_event_id,
+                relation_type=ID_TO_RELATION.get(int(type_prediction), edge.relation_type),
+                score=round(float(strength_prediction), 4),
+                evidence=edge.evidence,
+                feature_scores=edge.feature_scores,
+                metadata={
+                    **edge.metadata,
+                    "refined_keep_probability": round(float(keep_prob), 4),
+                    "refined_from_model": True,
+                },
+            )
+        )
+    return CoarseCausalGraph(
+        query=coarse_graph.query,
+        documents=coarse_graph.documents,
+        events=coarse_graph.events,
+        edges=refined_edges,
+        trace=coarse_graph.trace,
     )
-    sample_dict = payload["refinement_sample"]
-    node_features = torch.tensor(sample_dict["node_features"], dtype=torch.float32)
-    edge_index = torch.tensor(sample_dict["edge_index"], dtype=torch.long)
-    edge_features = torch.tensor(sample_dict["edge_features"], dtype=torch.float32)
-    query_features = torch.tensor(sample_dict["query_features"], dtype=torch.float32)
+
+
+def summarize_edges(
+    coarse_graph: CoarseCausalGraph,
+    keep_probs: list[float],
+    type_predictions: list[int],
+    strength_predictions: list[float],
+) -> list[dict[str, object]]:
+    event_lookup = {event.event_id: event for event in coarse_graph.events}
+    preview: list[dict[str, object]] = []
+    for edge, keep_prob, type_prediction, strength_prediction in zip(
+        coarse_graph.edges,
+        keep_probs,
+        type_predictions,
+        strength_predictions,
+    ):
+        preview.append(
+            {
+                "edge_id": edge.edge_id,
+                "source_event_id": edge.source_event_id,
+                "target_event_id": edge.target_event_id,
+                "source_text": event_lookup.get(edge.source_event_id).text if edge.source_event_id in event_lookup else "",
+                "target_text": event_lookup.get(edge.target_event_id).text if edge.target_event_id in event_lookup else "",
+                "coarse_relation_type": edge.relation_type,
+                "pred_relation_type": ID_TO_RELATION.get(int(type_prediction), edge.relation_type),
+                "coarse_score": edge.score,
+                "pred_strength": round(float(strength_prediction), 4),
+                "keep_probability": round(float(keep_prob), 4),
+            }
+        )
+    return preview
+
+
+def summarize_frontier_nodes(coarse_graph: CoarseCausalGraph, frontier_scores: list[float]) -> list[dict[str, object]]:
+    ranked = []
+    for event, score in zip(coarse_graph.events, frontier_scores):
+        ranked.append(
+            {
+                "event_id": event.event_id,
+                "text": event.text,
+                "frontier_score": round(float(score), 4),
+            }
+        )
+    ranked.sort(key=lambda item: item["frontier_score"], reverse=True)
+    return ranked
+
+
+def main() -> None:
+    import torch
+
+    args = parse_args()
+    coarse_graph_path = resolve_repo_path(args.coarse_graph)
+    payload = json.loads(coarse_graph_path.read_text(encoding="utf-8"))
+    coarse_graph_dict = payload.get("coarse_graph", payload)
+    sample = load_refinement_sample_from_coarse_graph(coarse_graph_path)
+
+    node_features = torch.tensor(sample.node_features, dtype=torch.float32)
+    edge_index = torch.tensor(sample.edge_index, dtype=torch.long)
+    edge_features = torch.tensor(sample.edge_features, dtype=torch.float32)
+    query_features = torch.tensor(sample.query_features, dtype=torch.float32)
 
     model = TemporalRelationalEdgeRefiner()
     model.load_state_dict(torch.load(resolve_repo_path(args.model_path), map_location="cpu"))
@@ -49,15 +135,39 @@ def main() -> None:
             query_features=query_features,
         )
 
+    keep_probs = torch.sigmoid(outputs["edge_keep_logits"]).tolist()
+    type_predictions = outputs["edge_type_logits"].argmax(dim=-1).tolist()
+    strength_predictions = outputs["edge_strengths"].tolist()
+    frontier_scores = outputs["frontier_scores"].tolist()
+
+    coarse_graph = load_coarse_graph(resolve_repo_path(args.coarse_graph))
+    refined_graph = build_refined_graph(
+        coarse_graph=coarse_graph,
+        keep_probs=keep_probs,
+        type_predictions=type_predictions,
+        strength_predictions=strength_predictions,
+        keep_threshold=args.keep_threshold,
+    )
+    refined_edges_preview = summarize_edges(
+        coarse_graph=coarse_graph,
+        keep_probs=keep_probs,
+        type_predictions=type_predictions,
+        strength_predictions=strength_predictions,
+    )
+    frontier_nodes = summarize_frontier_nodes(coarse_graph, frontier_scores)
+
     result = {
-        "mirai_query": payload["mirai_query"],
-        "refinement_sample": sample_dict,
+        "sample_id": sample.sample_id,
+        "coarse_graph": coarse_graph_dict,
         "refinement_output": {
-            "edge_keep_probabilities": torch.sigmoid(outputs["edge_keep_logits"]).tolist(),
-            "edge_type_predictions": outputs["edge_type_logits"].argmax(dim=-1).tolist(),
-            "edge_strengths": outputs["edge_strengths"].tolist(),
-            "frontier_scores": outputs["frontier_scores"].tolist(),
+            "edge_keep_probabilities": keep_probs,
+            "edge_type_predictions": type_predictions,
+            "edge_strengths": strength_predictions,
+            "frontier_scores": frontier_scores,
         },
+        "refined_edges_preview": refined_edges_preview,
+        "frontier_nodes": frontier_nodes,
+        "refined_graph": refined_graph.to_dict(),
     }
 
     output_text = json.dumps(result, ensure_ascii=False, indent=2)
