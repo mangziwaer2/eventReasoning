@@ -4,6 +4,8 @@ import argparse
 import json
 import random
 from dataclasses import dataclass
+from datetime import datetime
+from datetime import timezone
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +35,8 @@ RELATION_TO_ID = {
     "mitigates": 3,
 }
 ID_TO_RELATION = {value: key for key, value in RELATION_TO_ID.items()}
+TIME_NORMALIZATION_DAYS = 30.0
+MAX_RELATIVE_TIME_VALUE = 365.0
 
 
 @dataclass(slots=True)
@@ -89,13 +93,112 @@ def _safe_feature(edge: CoarseCausalEdge, key: str) -> float:
     return float(edge.feature_scores.get(key, 0.0))
 
 
-def _event_node_feature(event: EventNode, query_text: str) -> list[float]:
+def _clip_feature(value: float, minimum: float = -MAX_RELATIVE_TIME_VALUE, maximum: float = MAX_RELATIVE_TIME_VALUE) -> float:
+    return max(min(float(value), maximum), minimum)
+
+
+def _parse_time_value(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    normalized = text.replace("/", "-")
+    candidates = (
+        normalized,
+        normalized.replace(" ", "T"),
+    )
+    for candidate in candidates:
+        try:
+            parsed = datetime.fromisoformat(candidate)
+        except ValueError:
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp() / 86400.0
+
+    for pattern in ("%Y-%m-%d", "%Y-%m", "%Y"):
+        try:
+            parsed = datetime.strptime(normalized, pattern).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+        return parsed.timestamp() / 86400.0
+    return None
+
+
+def _resolve_raw_event_time(
+    event: EventNode,
+    document_time_lookup: dict[str, float | None],
+) -> tuple[float, float]:
+    publish_time = _parse_time_value(event.metadata.get("publish_time"))
+    if publish_time is not None:
+        return publish_time, 1.0
+
+    document_time = document_time_lookup.get(event.document_id)
+    if document_time is not None:
+        return document_time, 1.0
+
+    return float(event.sentence_index), 0.0
+
+
+def _build_temporal_context(
+    query,
+    documents: list[Any],
+    events: list[EventNode],
+) -> tuple[dict[str, float], dict[str, float], float, float]:
+    document_time_lookup = {document.document_id: _parse_time_value(document.publish_time) for document in documents}
+
+    raw_event_times: dict[str, float] = {}
+    event_time_validity: dict[str, float] = {}
+    for event in events:
+        raw_time, observed = _resolve_raw_event_time(event, document_time_lookup)
+        raw_event_times[event.event_id] = raw_time
+        event_time_validity[event.event_id] = observed
+
+    observed_times = [value for event_id, value in raw_event_times.items() if event_time_validity[event_id] > 0.5]
+    cutoff_raw = _parse_time_value(query.cutoff_time)
+
+    if observed_times:
+        anchor_time = min(observed_times)
+    elif cutoff_raw is not None:
+        anchor_time = cutoff_raw
+    else:
+        anchor_time = 0.0
+
+    if cutoff_raw is not None:
+        anchor_time = min(anchor_time, cutoff_raw)
+
+    event_time_values = {
+        event_id: _clip_feature((raw_time - anchor_time) / TIME_NORMALIZATION_DAYS)
+        for event_id, raw_time in raw_event_times.items()
+    }
+    cutoff_value = 0.0
+    if cutoff_raw is not None:
+        cutoff_value = _clip_feature((cutoff_raw - anchor_time) / TIME_NORMALIZATION_DAYS)
+    cutoff_present = 1.0 if cutoff_raw is not None else 0.0
+    return event_time_values, event_time_validity, cutoff_value, cutoff_present
+
+
+def _event_node_feature(
+    event: EventNode,
+    query_text: str,
+    event_time_value: float,
+    time_validity: float,
+) -> list[float]:
     participants_count = float(len(event.participants))
     token_count = float(len(event.normalized_text.split()))
     sentence_index = float(event.sentence_index)
     confidence = float(event.confidence)
     query_overlap = 1.0 if any(token in event.normalized_text for token in query_text.lower().split()) else 0.0
     trigger_length = float(len(str(event.metadata.get("trigger", ""))))
+    is_bridge_hypothesis = 1.0 if event.node_type != "observed" else 0.0
+    is_title_event = 1.0 if event.metadata.get("is_title") else 0.0
     return [
         participants_count,
         token_count,
@@ -103,11 +206,26 @@ def _event_node_feature(event: EventNode, query_text: str) -> list[float]:
         confidence,
         query_overlap,
         trigger_length,
+        event_time_value,
+        time_validity,
+        is_bridge_hypothesis,
+        is_title_event,
     ]
 
 
-def _edge_feature(edge: CoarseCausalEdge) -> list[float]:
+def _edge_feature(
+    edge: CoarseCausalEdge,
+    source_event: EventNode,
+    target_event: EventNode,
+    event_time_values: dict[str, float],
+) -> list[float]:
     relation_id = float(RELATION_TO_ID.get(edge.relation_type, 0))
+    source_time_value = float(event_time_values.get(edge.source_event_id, 0.0))
+    target_time_value = float(event_time_values.get(edge.target_event_id, 0.0))
+    delta_time_value = _clip_feature(target_time_value - source_time_value)
+    abs_delta_time_value = min(abs(delta_time_value), MAX_RELATIVE_TIME_VALUE)
+    sentence_gap = _clip_feature((float(target_event.sentence_index) - float(source_event.sentence_index)) / 8.0, minimum=-32.0, maximum=32.0)
+    is_cross_document = 1.0 if source_event.document_id != target_event.document_id else 0.0
     return [
         float(edge.score),
         relation_id,
@@ -116,6 +234,28 @@ def _edge_feature(edge: CoarseCausalEdge) -> list[float]:
         _safe_feature(edge, "lexical_support_score"),
         _safe_feature(edge, "marker_score"),
         _safe_feature(edge, "query_alignment_score"),
+        source_time_value,
+        target_time_value,
+        delta_time_value,
+        abs_delta_time_value,
+        sentence_gap,
+        is_cross_document,
+    ]
+
+
+def _query_features(
+    graph: CoarseCausalGraph,
+    edge_count: int,
+    cutoff_value: float,
+    cutoff_present: float,
+) -> list[float]:
+    return [
+        float(len(graph.query.focus_entities)),
+        float(len(graph.documents)),
+        float(len(graph.events)),
+        float(edge_count),
+        cutoff_value,
+        cutoff_present,
     ]
 
 
@@ -217,7 +357,20 @@ def gold_and_coarse_graph_to_refinement_sample(
 ) -> RefinementSample:
     node_id_to_index = {event.event_id: index for index, event in enumerate(gold_graph.events)}
     event_lookup = {event.event_id: event for event in gold_graph.events}
-    node_features = [_event_node_feature(event, gold_graph.query.text) for event in gold_graph.events]
+    event_time_values, event_time_validity, cutoff_value, cutoff_present = _build_temporal_context(
+        query=gold_graph.query,
+        documents=gold_graph.documents,
+        events=gold_graph.events,
+    )
+    node_features = [
+        _event_node_feature(
+            event,
+            gold_graph.query.text,
+            event_time_values.get(event.event_id, 0.0),
+            event_time_validity.get(event.event_id, 0.0),
+        )
+        for event in gold_graph.events
+    ]
 
     gold_edge_map = {(edge.source_event_id, edge.target_event_id): edge for edge in gold_graph.edges}
     edge_index: list[list[int]] = []
@@ -231,8 +384,10 @@ def gold_and_coarse_graph_to_refinement_sample(
         pair = (edge.source_event_id, edge.target_event_id)
         if edge.source_event_id not in node_id_to_index or edge.target_event_id not in node_id_to_index:
             continue
+        source_event = event_lookup[edge.source_event_id]
+        target_event = event_lookup[edge.target_event_id]
         edge_index.append([node_id_to_index[edge.source_event_id], node_id_to_index[edge.target_event_id]])
-        edge_features.append(_edge_feature(edge))
+        edge_features.append(_edge_feature(edge, source_event, target_event, event_time_values))
         gold_edge = gold_edge_map.get(pair)
         if gold_edge is not None:
             edge_labels.append(1)
@@ -244,8 +399,6 @@ def gold_and_coarse_graph_to_refinement_sample(
             edge_type_labels.append(0)
             edge_strengths.append(0.0)
             gold_relation = "none"
-        source_event = event_lookup[edge.source_event_id]
-        target_event = event_lookup[edge.target_event_id]
         edge_descriptions.append(
             {
                 "source_event_id": edge.source_event_id,
@@ -255,15 +408,9 @@ def gold_and_coarse_graph_to_refinement_sample(
                 "coarse_relation_type": edge.relation_type,
                 "gold_relation_type": gold_relation,
                 "coarse_score": edge.score,
+                "delta_time": round(event_time_values.get(edge.target_event_id, 0.0) - event_time_values.get(edge.source_event_id, 0.0), 4),
             }
         )
-
-    query_features = [
-        float(len(gold_graph.query.focus_entities)),
-        float(len(gold_graph.documents)),
-        float(len(gold_graph.events)),
-        float(len(coarse_graph.edges)),
-    ]
 
     return RefinementSample(
         sample_id=sample_id,
@@ -273,7 +420,12 @@ def gold_and_coarse_graph_to_refinement_sample(
         edge_labels=edge_labels,
         edge_type_labels=edge_type_labels,
         edge_strengths=edge_strengths,
-        query_features=query_features,
+        query_features=_query_features(
+            graph=gold_graph,
+            edge_count=len(edge_index),
+            cutoff_value=cutoff_value,
+            cutoff_present=cutoff_present,
+        ),
         metadata={
             "query_id": gold_graph.query.query_id,
             "dataset": gold_graph.query.metadata.get("dataset", "unknown"),
@@ -321,6 +473,11 @@ def load_refinement_sample_from_coarse_graph(
     inferred_sample_id = sample_id or coarse_graph_path.stem
     node_id_to_index = {event.event_id: index for index, event in enumerate(graph.events)}
     event_lookup = {event.event_id: event for event in graph.events}
+    event_time_values, event_time_validity, cutoff_value, cutoff_present = _build_temporal_context(
+        query=graph.query,
+        documents=graph.documents,
+        events=graph.events,
+    )
 
     edge_index: list[list[int]] = []
     edge_features: list[list[float]] = []
@@ -332,13 +489,13 @@ def load_refinement_sample_from_coarse_graph(
     for edge in graph.edges:
         if edge.source_event_id not in node_id_to_index or edge.target_event_id not in node_id_to_index:
             continue
+        source_event = event_lookup[edge.source_event_id]
+        target_event = event_lookup[edge.target_event_id]
         edge_index.append([node_id_to_index[edge.source_event_id], node_id_to_index[edge.target_event_id]])
-        edge_features.append(_edge_feature(edge))
+        edge_features.append(_edge_feature(edge, source_event, target_event, event_time_values))
         edge_labels.append(0)
         edge_type_labels.append(RELATION_TO_ID.get(edge.relation_type, 0))
         edge_strengths.append(float(edge.score))
-        source_event = event_lookup[edge.source_event_id]
-        target_event = event_lookup[edge.target_event_id]
         edge_descriptions.append(
             {
                 "source_event_id": edge.source_event_id,
@@ -347,23 +504,32 @@ def load_refinement_sample_from_coarse_graph(
                 "target_text": target_event.text,
                 "coarse_relation_type": edge.relation_type,
                 "coarse_score": edge.score,
+                "delta_time": round(event_time_values.get(edge.target_event_id, 0.0) - event_time_values.get(edge.source_event_id, 0.0), 4),
             }
         )
 
     return RefinementSample(
         sample_id=inferred_sample_id,
-        node_features=[_event_node_feature(event, graph.query.text) for event in graph.events],
+        node_features=[
+            _event_node_feature(
+                event,
+                graph.query.text,
+                event_time_values.get(event.event_id, 0.0),
+                event_time_validity.get(event.event_id, 0.0),
+            )
+            for event in graph.events
+        ],
         edge_index=edge_index,
         edge_features=edge_features,
         edge_labels=edge_labels,
         edge_type_labels=edge_type_labels,
         edge_strengths=edge_strengths,
-        query_features=[
-            float(len(graph.query.focus_entities)),
-            float(len(graph.documents)),
-            float(len(graph.events)),
-            float(len(graph.edges)),
-        ],
+        query_features=_query_features(
+            graph=graph,
+            edge_count=len(edge_index),
+            cutoff_value=cutoff_value,
+            cutoff_present=cutoff_present,
+        ),
         metadata={
             "query_id": graph.query.query_id,
             "dataset": graph.query.metadata.get("dataset", "unknown"),
@@ -393,6 +559,10 @@ def generate_synthetic_refinement_samples(num_samples: int = 32, seed: int = 7) 
                     rng.uniform(0.3, 0.95),
                     rng.choice([0.0, 1.0]),
                     rng.uniform(3, 10),
+                    rng.uniform(0.0, 8.0),
+                    rng.choice([0.0, 1.0]),
+                    rng.choice([0.0, 1.0]),
+                    rng.choice([0.0, 1.0]),
                 ]
             )
 
@@ -427,6 +597,12 @@ def generate_synthetic_refinement_samples(num_samples: int = 32, seed: int = 7) 
                     lexical_score,
                     marker_score,
                     query_score,
+                    float(source),
+                    float(target),
+                    float(target - source),
+                    float(abs(target - source)),
+                    float(target - source) / 4.0,
+                    0.0,
                 ]
             )
             edge_labels.append(int(coarse_score >= 0.62))
@@ -447,6 +623,8 @@ def generate_synthetic_refinement_samples(num_samples: int = 32, seed: int = 7) 
                     rng.uniform(2, 6),
                     float(node_count),
                     float(edge_count),
+                    rng.uniform(0.0, 8.0),
+                    rng.choice([0.0, 1.0]),
                 ],
                 metadata={
                     "synthetic": True,

@@ -9,7 +9,6 @@ from causal_graph import CoarseCausalGraph
 from coarse_graph_dataset import load_coarse_graph
 from refinement_dataset import ID_TO_RELATION
 from refinement_dataset import load_refinement_sample_from_coarse_graph
-from refinement_model import TemporalRelationalEdgeRefiner
 from path_utils import REPO_ROOT
 from path_utils import resolve_repo_path
 
@@ -111,6 +110,7 @@ def summarize_frontier_nodes(coarse_graph: CoarseCausalGraph, frontier_scores: l
 
 def main() -> None:
     import torch
+    from refinement_model import TemporalRelationalEdgeRefiner
 
     args = parse_args()
     coarse_graph_path = resolve_repo_path(args.coarse_graph)

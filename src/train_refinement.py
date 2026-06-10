@@ -9,7 +9,6 @@ from refinement_dataset import RefinementTensorDataset
 from refinement_dataset import RefinementSample
 from refinement_dataset import generate_synthetic_refinement_samples
 from refinement_dataset import load_maven_refinement_samples
-from refinement_model import TemporalRelationalEdgeRefiner
 from path_utils import REPO_ROOT
 from path_utils import resolve_repo_path
 
@@ -30,7 +29,7 @@ def split_samples(samples: list[RefinementSample], validation_ratio: float, seed
     return shuffled[validation_size:], shuffled[:validation_size]
 
 
-def evaluate(model, dataloader, keep_loss_fn, type_loss_fn, strength_loss_fn):
+def evaluate(model, dataloader, keep_loss_fn, type_loss_fn, strength_loss_fn, torch):
     model.eval()
     total_loss = 0.0
     total_keep_loss = 0.0
@@ -46,8 +45,20 @@ def evaluate(model, dataloader, keep_loss_fn, type_loss_fn, strength_loss_fn):
                 query_features=batch["query_features"],
             )
             keep_loss = keep_loss_fn(outputs["edge_keep_logits"], batch["edge_labels"])
-            type_loss = type_loss_fn(outputs["edge_type_logits"], batch["edge_type_labels"])
-            strength_loss = strength_loss_fn(outputs["edge_strengths"], batch["edge_strengths"])
+            positive_mask = batch["edge_labels"] > 0.5
+            if positive_mask.any():
+                type_loss = type_loss_fn(
+                    outputs["edge_type_logits"][positive_mask],
+                    batch["edge_type_labels"][positive_mask],
+                )
+                strength_loss = strength_loss_fn(
+                    outputs["edge_strengths"][positive_mask],
+                    batch["edge_strengths"][positive_mask],
+                )
+            else:
+                zero = keep_loss.new_zeros(())
+                type_loss = zero
+                strength_loss = zero
             loss = keep_loss + type_loss + strength_loss
             total_loss += float(loss.item())
             total_keep_loss += float(keep_loss.item())
@@ -64,7 +75,7 @@ def evaluate(model, dataloader, keep_loss_fn, type_loss_fn, strength_loss_fn):
     }
 
 
-def print_debug_samples(model, samples: list[RefinementSample], debug_samples: int, seed: int) -> None:
+def print_debug_samples(model, samples: list[RefinementSample], debug_samples: int, seed: int, torch) -> None:
     if not samples or debug_samples <= 0:
         return
     rng = random.Random(seed)
@@ -130,6 +141,7 @@ def main() -> None:
     import torch
     from torch import nn
     from torch.utils.data import DataLoader
+    from refinement_model import TemporalRelationalEdgeRefiner
 
     args = parse_args()
     output_dir = resolve_repo_path(args.output_dir)
@@ -179,8 +191,20 @@ def main() -> None:
             strength_preds = outputs["edge_strengths"]
 
             keep_loss = keep_loss_fn(keep_logits, batch["edge_labels"])
-            type_loss = type_loss_fn(type_logits, batch["edge_type_labels"])
-            strength_loss = strength_loss_fn(strength_preds, batch["edge_strengths"])
+            positive_mask = batch["edge_labels"] > 0.5
+            if positive_mask.any():
+                type_loss = type_loss_fn(
+                    type_logits[positive_mask],
+                    batch["edge_type_labels"][positive_mask],
+                )
+                strength_loss = strength_loss_fn(
+                    strength_preds[positive_mask],
+                    batch["edge_strengths"][positive_mask],
+                )
+            else:
+                zero = keep_loss.new_zeros(())
+                type_loss = zero
+                strength_loss = zero
             loss = keep_loss + type_loss + strength_loss
             loss.backward()
             optimizer.step()
@@ -198,12 +222,12 @@ def main() -> None:
             "type_loss": total_type_loss / max(batch_count, 1),
             "strength_loss": total_strength_loss / max(batch_count, 1),
         }
-        validation_record = evaluate(model, validation_dataloader, keep_loss_fn, type_loss_fn, strength_loss_fn)
+        validation_record = evaluate(model, validation_dataloader, keep_loss_fn, type_loss_fn, strength_loss_fn, torch)
         if validation_record is not None:
             record.update(validation_record)
         history.append(record)
         print(json.dumps(record))
-        print_debug_samples(model, validation_samples, args.debug_samples, args.seed + epoch)
+        print_debug_samples(model, validation_samples, args.debug_samples, args.seed + epoch, torch)
 
     torch.save(model.state_dict(), output_dir / "refinement_model.pt")
     (output_dir / "train_history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")

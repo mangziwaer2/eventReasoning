@@ -9,17 +9,14 @@ class LoraUnavailable(RuntimeError):
 
 
 def import_qwen_lora_stack() -> tuple[Any, Any, Any, Any, Any, Any]:
-    try:
-        import torch
-        from peft import LoraConfig
-        from peft import PeftModel
-        from peft import get_peft_model
-        from transformers import AutoModelForCausalLM
-        from transformers import AutoTokenizer
-    except ImportError as exc:
-        raise LoraUnavailable(
-            "Qwen LoRA training requires `peft`, `transformers`, and `torch` in the active environment."
-        ) from exc
+
+    import torch
+    from peft import LoraConfig
+    from peft import PeftModel
+    from peft import get_peft_model
+    from transformers import AutoModelForCausalLM
+    from transformers import AutoTokenizer
+
     return torch, AutoModelForCausalLM, AutoTokenizer, LoraConfig, get_peft_model, PeftModel
 
 

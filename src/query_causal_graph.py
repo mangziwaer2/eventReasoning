@@ -169,7 +169,12 @@ class QueryCausalGraphBuilder:
                             text=sentence,
                         )
                     ],
-                    metadata={"trigger": trigger},
+                    metadata={
+                        "trigger": trigger,
+                        "publish_time": document.publish_time,
+                        "is_title": sentence_index == 0,
+                        "document_source": document.source,
+                    },
                 )
             )
         return sorted(events, key=lambda item: item.sentence_index)
