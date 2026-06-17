@@ -174,7 +174,7 @@ class TemporalRelationalEdgeRefiner(nn.Module):
         for relation_id, linear in enumerate(linears):
             mask = relation_ids == relation_id
             if torch.any(mask):
-                transformed[mask] = linear(states[mask])
+                transformed[mask] = linear(states[mask]).to(dtype=transformed.dtype)
         return transformed
 
     def _segment_softmax(
@@ -187,7 +187,7 @@ class TemporalRelationalEdgeRefiner(nn.Module):
         for node_id in range(num_nodes):
             mask = target_index == node_id
             if torch.any(mask):
-                weights[mask] = torch.softmax(logits[mask], dim=0)
+                weights[mask] = torch.softmax(logits[mask].float(), dim=0).to(dtype=weights.dtype)
         return weights
 
     def _graph_context(self, node_states: torch.Tensor, edge_states: torch.Tensor, query_state: torch.Tensor) -> torch.Tensor:
