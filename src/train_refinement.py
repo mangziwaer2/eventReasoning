@@ -306,6 +306,189 @@ def collect_debug_samples(model, samples: list[RefinementSample], debug_samples:
     return debug_rows
 
 
+def shorten_text(text: Any, max_chars: int = 120) -> str:
+    compact = " ".join(str(text).split())
+    if len(compact) <= max_chars:
+        return compact
+    return compact[: max(0, max_chars - 3)].rstrip() + "..."
+
+
+def relation_name(relation_id: int | None) -> str:
+    if relation_id is None:
+        return "none"
+    return ID_TO_RELATION.get(int(relation_id), str(relation_id))
+
+
+def edge_debug_row(
+    idx: int,
+    edge_desc: dict[str, Any],
+    keep_prob: float,
+    pred_type: int,
+    pred_strength: float,
+    gold_keep: int | float | None,
+    gold_type: int | None,
+    gold_strength: float | None,
+    keep_threshold: float,
+) -> dict[str, Any]:
+    candidate_source = str(edge_desc.get("candidate_source", "coarse"))
+    pred_relation = relation_name(pred_type)
+    gold_relation = edge_desc.get("gold_relation_type") or relation_name(gold_type)
+    action = "KEEP" if keep_prob >= keep_threshold else "DROP"
+    if candidate_source == "completion" and keep_prob >= keep_threshold:
+        action = "ADD"
+    elif candidate_source == "completion":
+        action = "REJECT"
+    gold_action = "KEEP" if gold_keep and float(gold_keep) > 0.5 else "DROP"
+    return {
+        "idx": idx,
+        "action": action,
+        "gold_action": gold_action,
+        "candidate_source": candidate_source,
+        "keep_prob": float(keep_prob),
+        "pred_relation": pred_relation,
+        "pred_strength": float(pred_strength),
+        "gold_relation": str(gold_relation),
+        "gold_strength": gold_strength,
+        "coarse_relation": edge_desc.get("coarse_relation_type", ""),
+        "coarse_score": edge_desc.get("coarse_score", 0.0),
+        "source_text": edge_desc.get("source_text", ""),
+        "target_text": edge_desc.get("target_text", ""),
+    }
+
+
+def select_debug_edges(rows: list[dict[str, Any]], max_edges: int) -> list[dict[str, Any]]:
+    if max_edges <= 0 or len(rows) <= max_edges:
+        return rows
+    priority: list[dict[str, Any]] = []
+    priority.extend([row for row in rows if row["action"] == "ADD"])
+    priority.extend([row for row in rows if row["action"] == "DROP" and row["candidate_source"] == "coarse"])
+    priority.extend([row for row in rows if row["gold_action"] == "KEEP" and row["action"] not in {"KEEP", "ADD"}])
+    priority.extend(sorted(rows, key=lambda row: row["keep_prob"], reverse=True))
+
+    selected: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for row in priority:
+        row_id = int(row["idx"])
+        if row_id in seen:
+            continue
+        selected.append(row)
+        seen.add(row_id)
+        if len(selected) >= max_edges:
+            break
+    selected.sort(key=lambda row: int(row["idx"]))
+    return selected
+
+
+def format_readable_debug_sample(
+    sample: RefinementSample,
+    keep_probs: list[float],
+    pred_types: list[int],
+    pred_strengths: list[float],
+    epoch: int,
+    keep_threshold: float,
+    max_edges: int,
+) -> str:
+    edge_descriptions = list(sample.metadata.get("edge_descriptions", []))
+    rows = [
+        edge_debug_row(
+            idx=idx,
+            edge_desc=edge_desc,
+            keep_prob=keep_probs[idx] if idx < len(keep_probs) else 0.0,
+            pred_type=pred_types[idx] if idx < len(pred_types) else 0,
+            pred_strength=pred_strengths[idx] if idx < len(pred_strengths) else 0.0,
+            gold_keep=sample.edge_labels[idx] if idx < len(sample.edge_labels) else None,
+            gold_type=sample.edge_type_labels[idx] if idx < len(sample.edge_type_labels) else None,
+            gold_strength=sample.edge_strengths[idx] if idx < len(sample.edge_strengths) else None,
+            keep_threshold=keep_threshold,
+        )
+        for idx, edge_desc in enumerate(edge_descriptions)
+    ]
+    coarse_count = sum(1 for row in rows if row["candidate_source"] == "coarse")
+    completion_count = sum(1 for row in rows if row["candidate_source"] == "completion")
+    kept_count = sum(1 for row in rows if row["action"] == "KEEP")
+    added_count = sum(1 for row in rows if row["action"] == "ADD")
+    dropped_count = sum(1 for row in rows if row["action"] == "DROP")
+    rejected_count = sum(1 for row in rows if row["action"] == "REJECT")
+    gold_kept_count = sum(1 for row in rows if row["gold_action"] == "KEEP")
+
+    lines = [
+        "",
+        f"[epoch {epoch:03d}] refinement debug sample={sample.sample_id}",
+        f"query: {shorten_text(sample.metadata.get('query_text', ''), 180)}",
+        (
+            "graph: "
+            f"events={len(sample.node_features)} "
+            f"coarse_edges={coarse_count} completion_candidates={completion_count} "
+            f"gold_edges={gold_kept_count} -> refined_keep={kept_count} refined_add={added_count} "
+            f"drop={dropped_count} reject={rejected_count}"
+        ),
+        "edges:",
+    ]
+
+    for row in select_debug_edges(rows, max_edges):
+        lines.extend(
+            [
+                (
+                    f"  #{row['idx']:03d} {row['action']} "
+                    f"source={row['candidate_source']} "
+                    f"keep={row['keep_prob']:.3f} "
+                    f"pred={row['pred_relation']}:{row['pred_strength']:.3f} "
+                    f"coarse={row['coarse_relation']}:{float(row['coarse_score']):.3f} "
+                    f"gold={row['gold_action']}:{row['gold_relation']}"
+                ),
+                f"       src: {shorten_text(row['source_text'])}",
+                f"       tgt: {shorten_text(row['target_text'])}",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def collect_readable_debug_samples(
+    model,
+    samples: list[RefinementSample],
+    debug_samples: int,
+    seed: int,
+    torch,
+    device,
+    epoch: int,
+    keep_threshold: float,
+    max_edges: int,
+) -> list[str]:
+    if not samples or debug_samples <= 0:
+        return []
+    rng = random.Random(seed)
+    chosen = rng.sample(samples, min(debug_samples, len(samples)))
+    blocks: list[str] = []
+    model.eval()
+    with torch.no_grad():
+        for sample in chosen:
+            node_features = torch.tensor(sample.node_features, dtype=torch.float32, device=device)
+            edge_index = torch.tensor(sample.edge_index, dtype=torch.long, device=device)
+            edge_features = torch.tensor(sample.edge_features, dtype=torch.float32, device=device)
+            query_features = torch.tensor(sample.query_features, dtype=torch.float32, device=device)
+            outputs = model(
+                node_features=node_features,
+                edge_index=edge_index,
+                edge_features=edge_features,
+                query_features=query_features,
+            )
+            keep_probs = torch.sigmoid(outputs["edge_keep_logits"]).detach().cpu().tolist()
+            pred_types = outputs["edge_type_logits"].argmax(dim=-1).detach().cpu().tolist()
+            pred_strengths = outputs["edge_strengths"].detach().cpu().tolist()
+            blocks.append(
+                format_readable_debug_sample(
+                    sample=sample,
+                    keep_probs=keep_probs,
+                    pred_types=pred_types,
+                    pred_strengths=pred_strengths,
+                    epoch=epoch,
+                    keep_threshold=keep_threshold,
+                    max_edges=max_edges,
+                )
+            )
+    return blocks
+
+
 def save_json(path: Path, payload: Any) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -369,7 +552,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--amp", choices=["auto", "on", "off"], default="auto", help="Use CUDA automatic mixed precision.")
     parser.add_argument("--num-workers", type=int, default=0, help="DataLoader worker count.")
     parser.add_argument("--log-every", type=int, default=25, help="Print one progress line every N train steps. Use 0 to disable.")
-    parser.add_argument("--debug-samples", type=int, default=0, help="Validation samples saved to debug_predictions.jsonl each epoch.")
+    parser.add_argument("--debug-samples", type=int, default=1, help="Validation samples printed and saved each epoch. Use 0 to disable.")
+    parser.add_argument("--debug-max-edges", type=int, default=12, help="Maximum candidate edges shown per readable debug sample.")
+    parser.add_argument("--debug-keep-threshold", type=float, default=0.5, help="Keep threshold used only for readable debug summaries.")
     parser.add_argument("--output-dir", default=str(REPO_ROOT / "outputs" / "refinement"), help="Training output directory.")
     parser.add_argument("--resume-from", default=None, help="Optional training checkpoint created by this script.")
     return parser.parse_args()
@@ -506,8 +691,11 @@ def main() -> None:
     print(f"relation_counts={json.dumps(train_stats['relation_counts'], ensure_ascii=False)}", flush=True)
 
     debug_path = output_dir / "debug_predictions.jsonl"
+    readable_debug_path = output_dir / "debug_readable.log"
     if start_epoch == 0 and debug_path.exists():
         debug_path.unlink()
+    if start_epoch == 0 and readable_debug_path.exists():
+        readable_debug_path.unlink()
 
     autocast_context = make_autocast_context(torch, amp_enabled)
     train_started = time.time()
@@ -633,12 +821,6 @@ def main() -> None:
         )
         save_json(output_dir / "train_history.json", history)
 
-        debug_rows = collect_debug_samples(model, validation_samples, args.debug_samples, args.seed + epoch, torch, device)
-        if debug_rows:
-            with debug_path.open("a", encoding="utf-8") as debug_file:
-                for row in debug_rows:
-                    debug_file.write(json.dumps({"epoch": epoch + 1, **row}, ensure_ascii=False) + "\n")
-
         record["lr"] = float(optimizer.param_groups[0]["lr"])
         suffix = " best" if is_best else ""
         print_metrics(
@@ -646,6 +828,27 @@ def main() -> None:
             record,
             time.time() - epoch_started,
         )
+        debug_rows = collect_debug_samples(model, validation_samples, args.debug_samples, args.seed + epoch, torch, device)
+        if debug_rows:
+            with debug_path.open("a", encoding="utf-8") as debug_file:
+                for row in debug_rows:
+                    debug_file.write(json.dumps({"epoch": epoch + 1, **row}, ensure_ascii=False) + "\n")
+        readable_debug_blocks = collect_readable_debug_samples(
+            model=model,
+            samples=validation_samples,
+            debug_samples=args.debug_samples,
+            seed=args.seed + epoch,
+            torch=torch,
+            device=device,
+            epoch=epoch + 1,
+            keep_threshold=args.debug_keep_threshold,
+            max_edges=args.debug_max_edges,
+        )
+        if readable_debug_blocks:
+            readable_text = "\n".join(readable_debug_blocks)
+            print(readable_text, flush=True)
+            with readable_debug_path.open("a", encoding="utf-8") as readable_debug_file:
+                readable_debug_file.write(readable_text + "\n")
 
     print(f"saved outputs to {output_dir} | total_time={format_seconds(time.time() - train_started)}", flush=True)
 
