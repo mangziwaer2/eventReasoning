@@ -3,9 +3,13 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import time
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
 from coarse_graph_dataset import EventPairSample
+from coarse_graph_dataset import PAIR_RELATION_TYPES
 from coarse_graph_dataset import load_maven_event_pair_samples
 from coarse_graph_dataset import parse_pair_payload
 from local_qwen_lora import LoraUnavailable
@@ -31,13 +35,48 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-batch-size", type=int, default=4, help="Validation batch size.")
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1, help="Gradient accumulation steps.")
     parser.add_argument("--lr", type=float, default=2e-4, help="Learning rate.")
-    parser.add_argument("--debug-samples", type=int, default=2, help="Number of validation samples printed each epoch.")
+    parser.add_argument("--log-every", type=int, default=25, help="Print one progress line every N batches. Use 0 to disable.")
+    parser.add_argument("--debug-samples", type=int, default=2, help="Number of validation samples printed and saved each epoch.")
     parser.add_argument("--seed", type=int, default=7, help="Random seed.")
     parser.add_argument("--include-query", action="store_true", help="Include query text in the training prompt.")
     parser.add_argument("--document-mode", choices=["none", "title", "snippet", "summary", "full"], default="title", help="How much document text to include in the prompt.")
     parser.add_argument("--max-document-chars", type=int, default=240, help="Maximum characters kept per document snippet when document-mode=snippet.")
     parser.add_argument("--output-dir", default=str(REPO_ROOT / "outputs" / "coarse_graph_qwen_lora"), help="Training output directory.")
     return parser.parse_args()
+
+
+def save_json(path, payload: Any) -> None:
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def summarize_pair_samples(samples: list[EventPairSample]) -> dict[str, Any]:
+    relation_counts = {relation: 0 for relation in PAIR_RELATION_TYPES}
+    for sample in samples:
+        relation_counts[sample.relation_type] = relation_counts.get(sample.relation_type, 0) + 1
+    return {
+        "samples": len(samples),
+        "relation_counts": relation_counts,
+        "positive_samples": len(samples) - relation_counts.get("none", 0),
+        "negative_samples": relation_counts.get("none", 0),
+        "positive_ratio": (len(samples) - relation_counts.get("none", 0)) / len(samples) if samples else 0.0,
+    }
+
+
+def format_seconds(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    minutes, rem = divmod(int(seconds), 60)
+    if minutes < 60:
+        return f"{minutes}m{rem:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m"
+
+
+def shorten_text(text: str, max_chars: int = 220) -> str:
+    compact = " ".join(str(text).split())
+    if len(compact) <= max_chars:
+        return compact
+    return compact[: max(0, max_chars - 3)].rstrip() + "..."
 
 
 def _format_prompt_only(prompt: str) -> str:
@@ -160,11 +199,13 @@ def print_debug_samples(
     args: argparse.Namespace,
     debug_samples: int,
     seed: int,
-) -> None:
+) -> tuple[list[dict[str, Any]], list[str]]:
     if not validation_samples or debug_samples <= 0:
-        return
+        return [], []
     rng = random.Random(seed)
     chosen = rng.sample(validation_samples, min(debug_samples, len(validation_samples)))
+    rows: list[dict[str, Any]] = []
+    readable_blocks: list[str] = []
     model.eval()
     with torch.no_grad():
         for sample in chosen:
@@ -187,26 +228,41 @@ def print_debug_samples(
             )
             prediction = tokenizer.decode(outputs[0][input_ids.shape[-1] :], skip_special_tokens=True).strip()
             parsed = parse_pair_payload(prediction)
-            print(
-                json.dumps(
-                    {
-                        "debug_stage": "pair_qwen_validation_sample",
-                        "sample_id": sample.sample_id,
-                        "source_event_id": sample.source_event_id,
-                        "target_event_id": sample.target_event_id,
-                        "gold_target": item["target"],
-                        "prediction": prediction,
-                        "parsed_prediction": parsed,
-                    },
-                    ensure_ascii=False,
+            event_lookup = {event.event_id: event for event in sample.events}
+            source_event = event_lookup.get(sample.source_event_id)
+            target_event = event_lookup.get(sample.target_event_id)
+            row = {
+                "debug_stage": "pair_qwen_validation_sample",
+                "sample_id": sample.sample_id,
+                "source_event_id": sample.source_event_id,
+                "target_event_id": sample.target_event_id,
+                "gold_relation_type": sample.relation_type,
+                "gold_score": sample.score,
+                "prediction": prediction,
+                "parsed_prediction": parsed,
+                "source_event": source_event.text if source_event is not None else "",
+                "target_event": target_event.text if target_event is not None else "",
+            }
+            rows.append(row)
+            readable_blocks.append(
+                "\n".join(
+                    [
+                        f"coarse qwen debug sample={sample.sample_id}",
+                        f"gold={sample.relation_type}:{sample.score:.3f} parsed={parsed}",
+                        f"raw={shorten_text(prediction, 240)}",
+                        f"source_event: {shorten_text(row['source_event'])}",
+                        f"target_event: {shorten_text(row['target_event'])}",
+                    ]
                 )
             )
+    return rows, readable_blocks
 
 
 def main() -> None:
     args = parse_args()
     output_dir = resolve_repo_path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    random.seed(args.seed)
 
     train_samples = load_maven_event_pair_samples(
         dataset_path=resolve_repo_path(args.dataset),
@@ -226,6 +282,8 @@ def main() -> None:
         max_sentence_gap=args.max_sentence_gap,
         seed=args.seed + 1,
     )
+    train_stats = summarize_pair_samples(train_samples)
+    validation_stats = summarize_pair_samples(validation_samples)
 
     try:
         model, tokenizer, torch = load_qwen_with_lora(resolve_repo_path(args.model_path))
@@ -256,12 +314,48 @@ def main() -> None:
     device = next(model.parameters()).device
     history: list[dict[str, float]] = []
     global_step = 0
+    best_val_loss = float("inf")
+    train_started = time.time()
+    debug_jsonl_path = output_dir / "debug_predictions.jsonl"
+    debug_readable_path = output_dir / "debug_readable.log"
+    if debug_jsonl_path.exists():
+        debug_jsonl_path.unlink()
+    if debug_readable_path.exists():
+        debug_readable_path.unlink()
+
+    train_config = {
+        **vars(args),
+        "train_stats": train_stats,
+        "validation_stats": validation_stats,
+        "task": "qwen_event_pair_to_coarse_graph",
+    }
+    save_json(output_dir / "train_config.json", train_config)
+    print(
+        " | ".join(
+            [
+                "coarse qwen training",
+                f"device={device}",
+                f"train_samples={train_stats['samples']}",
+                f"val_samples={validation_stats['samples']}",
+                f"pos_ratio={train_stats['positive_ratio']:.3f}",
+                f"batch_size={args.batch_size}",
+                f"grad_accum={args.gradient_accumulation_steps}",
+                f"lr={args.lr:.2e}",
+            ]
+        ),
+        flush=True,
+    )
+    print(f"train_relation_counts={json.dumps(train_stats['relation_counts'], ensure_ascii=False)}", flush=True)
+    print(f"val_relation_counts={json.dumps(validation_stats['relation_counts'], ensure_ascii=False)}", flush=True)
 
     for epoch in range(args.epochs):
+        epoch_started = time.time()
         model.train()
         optimizer.zero_grad(set_to_none=True)
         total_loss = 0.0
+        window_loss = 0.0
         batch_count = 0
+        window_count = 0
 
         for batch_index, batch in enumerate(train_dataloader, start=1):
             loss = compute_batch_loss(model, batch, device)
@@ -275,7 +369,24 @@ def main() -> None:
                 global_step += 1
 
             total_loss += detached_loss
+            window_loss += detached_loss
             batch_count += 1
+            window_count += 1
+
+            if args.log_every > 0 and (batch_index % args.log_every == 0 or batch_index == len(train_dataloader)):
+                print(
+                    " | ".join(
+                        [
+                            f"epoch {epoch + 1:03d}/{args.epochs:03d} batch {batch_index:04d}/{len(train_dataloader):04d}",
+                            f"loss={window_loss / max(window_count, 1):.4f}",
+                            f"global_step={global_step}",
+                            f"time={format_seconds(time.time() - epoch_started)}",
+                        ]
+                    ),
+                    flush=True,
+                )
+                window_loss = 0.0
+                window_count = 0
 
         if batch_count % max(args.gradient_accumulation_steps, 1) != 0:
             optimizer.step()
@@ -293,8 +404,29 @@ def main() -> None:
         if validation_record is not None:
             record.update(validation_record)
         history.append(record)
-        print(json.dumps(record))
-        print_debug_samples(
+        val_loss = float(record.get("val_loss", record["loss"]))
+        is_best = val_loss < best_val_loss
+        if is_best:
+            best_val_loss = val_loss
+            model.save_pretrained(output_dir / "best_adapter")
+            tokenizer.save_pretrained(output_dir / "best_adapter")
+        model.save_pretrained(output_dir / "latest_adapter")
+        tokenizer.save_pretrained(output_dir / "latest_adapter")
+        save_json(output_dir / "train_history.json", history)
+
+        print(
+            " | ".join(
+                [
+                    f"epoch {epoch + 1:03d}/{args.epochs:03d} done" + (" best" if is_best else ""),
+                    f"loss={record['loss']:.4f}",
+                    f"val_loss={record.get('val_loss', float('nan')):.4f}" if "val_loss" in record else "val_loss=n/a",
+                    f"optimizer_steps={global_step}",
+                    f"time={format_seconds(time.time() - epoch_started)}",
+                ]
+            ),
+            flush=True,
+        )
+        debug_rows, debug_blocks = print_debug_samples(
             model,
             tokenizer,
             device,
@@ -303,34 +435,20 @@ def main() -> None:
             args.debug_samples,
             args.seed + epoch,
         )
+        if debug_rows:
+            with debug_jsonl_path.open("a", encoding="utf-8") as debug_file:
+                for row in debug_rows:
+                    debug_file.write(json.dumps({"epoch": epoch + 1, **row}, ensure_ascii=False) + "\n")
+        if debug_blocks:
+            readable_text = "\n\n".join(f"[epoch {epoch + 1:03d}] {block}" for block in debug_blocks)
+            print(readable_text, flush=True)
+            with debug_readable_path.open("a", encoding="utf-8") as readable_file:
+                readable_file.write(readable_text + "\n\n")
 
     model.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
-    (output_dir / "train_history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
-    (output_dir / "train_config.json").write_text(
-        json.dumps(
-            {
-                "train_split": args.train_split,
-                "validation_split": args.validation_split,
-                "train_limit": args.train_limit,
-                "validation_limit": args.validation_limit,
-                "max_events": args.max_events,
-                "negative_ratio": args.negative_ratio,
-                "max_sentence_gap": args.max_sentence_gap,
-                "model_path": args.model_path,
-                "include_query": args.include_query,
-                "document_mode": args.document_mode,
-                "max_document_chars": args.max_document_chars,
-                "batch_size": args.batch_size,
-                "eval_batch_size": args.eval_batch_size,
-                "gradient_accumulation_steps": args.gradient_accumulation_steps,
-                "task": "event_pair_relation_classification",
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-    print(f"Saved LoRA outputs to {output_dir}")
+    save_json(output_dir / "train_history.json", history)
+    print(f"Saved LoRA outputs to {output_dir} | total_time={format_seconds(time.time() - train_started)}")
 
 
 if __name__ == "__main__":

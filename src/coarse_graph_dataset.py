@@ -17,6 +17,7 @@ from causal_graph import GraphBuildTrace
 from causal_graph import NewsDocument
 from causal_graph import QuerySpec
 from event_extraction import extract_titlecase_entities
+from event_extraction import format_event_mention
 from event_extraction import lexical_overlap
 from mirai_dataset import export_mirai_query_snapshot
 from mirai_dataset import get_mirai_query_by_id
@@ -67,7 +68,7 @@ class DocumentGraphSample:
             trigger = str(event.metadata.get("trigger", "")).strip()
             trigger_text = f" | trigger={trigger}" if trigger else ""
             lines.append(
-                f"- {event.event_id} | doc={event.document_id} | sent={event.sentence_index}{trigger_text} | text={event.text}"
+                f"- {event.event_id} | doc={event.document_id} | sent={event.sentence_index}{trigger_text} | event={event.text}"
             )
         return "\n".join(lines)
 
@@ -187,7 +188,10 @@ class EventPairSample:
             lines.append(f"trigger={trigger}")
         if document is not None and document.title:
             lines.append(f"title={document.title}")
-        lines.append(f"sentence={event.text}")
+        lines.append(f"event={event.text}")
+        context = str(event.metadata.get("event_context") or event.metadata.get("sentence_text") or "").strip()
+        if context and context != event.text:
+            lines.append(f"context={context}")
         return "\n".join(lines)
 
     def _render_document_context(
@@ -287,6 +291,27 @@ def _normalize_sentence(sentence: Any) -> str:
     return str(sentence)
 
 
+def _mention_context(sentence_tokens: list[str] | None, sentence_text: str, offset: Any, trigger_word: str) -> str:
+    if not sentence_tokens or not isinstance(offset, list) or len(offset) != 2:
+        return sentence_text
+    try:
+        start = max(0, int(offset[0]))
+        end = max(start + 1, int(offset[1]))
+    except (TypeError, ValueError):
+        return sentence_text
+    left = max(0, start - 8)
+    right = min(len(sentence_tokens), end + 8)
+    window = sentence_tokens[left:right]
+    if not window:
+        return sentence_text
+    context = " ".join(str(token) for token in window)
+    if left > 0:
+        context = "... " + context
+    if right < len(sentence_tokens):
+        context = context + " ..."
+    return context or trigger_word or sentence_text
+
+
 def _maven_relation_to_type(relation_name: str) -> str:
     if relation_name == "CAUSE":
         return "causes"
@@ -378,6 +403,7 @@ def truncate_events(events: list[EventNode], max_events: int | None = None) -> l
 
 def maven_row_to_gold_graph(row: dict[str, Any]) -> CoarseCausalGraph:
     sentences = [_normalize_sentence(sentence) for sentence in row.get("sentences", [])]
+    token_sentences = row.get("tokens", [])
     query = QuerySpec(
         query_id=str(row["id"]),
         text=row.get("title", "MAVEN-ERE sample"),
@@ -406,12 +432,16 @@ def maven_row_to_gold_graph(row: dict[str, Any]) -> CoarseCausalGraph:
             continue
         sentence_text = sentences[sent_id]
         trigger_word = str(first_mention.get("trigger_word", "")).strip()
+        offset = first_mention.get("offset", [])
+        sentence_tokens = token_sentences[sent_id] if sent_id < len(token_sentences) else None
+        mention_context = _mention_context(sentence_tokens, sentence_text, offset, trigger_word)
+        event_mention = format_event_mention(trigger=trigger_word, context=mention_context)
         node_id = f"maven_e{event_index}"
         source_event_id_to_node_id[str(event.get("id", node_id))] = node_id
         events.append(
             EventNode(
                 event_id=node_id,
-                text=sentence_text,
+                text=event_mention,
                 normalized_text=trigger_word.lower() if trigger_word else sentence_text.lower(),
                 document_id=str(row["id"]),
                 sentence_index=sent_id,
@@ -427,6 +457,11 @@ def maven_row_to_gold_graph(row: dict[str, Any]) -> CoarseCausalGraph:
                 ],
                 metadata={
                     "trigger": trigger_word,
+                    "event_mention": event_mention,
+                    "event_context": mention_context,
+                    "sentence_text": sentence_text,
+                    "mention_id": first_mention.get("id", ""),
+                    "offset": offset,
                     "event_type": event.get("type", ""),
                     "event_type_id": event.get("type_id", -1),
                     "source_event_id": event.get("id", ""),

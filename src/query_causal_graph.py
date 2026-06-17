@@ -15,6 +15,7 @@ from causal_graph import RetrievalHit
 from event_extractor import BaseEventExtractor
 from event_extractor import build_event_extractor
 from event_extraction import extract_titlecase_entities
+from event_extraction import format_event_mention
 from event_extraction import lexical_overlap
 from event_extraction import normalize_text
 from event_extraction import tokenize
@@ -153,10 +154,11 @@ class QueryCausalGraphBuilder:
         events: list[EventNode] = []
         for offset, (score, sentence_index, sentence, normalized_text, participants, trigger) in enumerate(selected):
             event_id = f"e{start_index + offset}"
+            event_text = format_event_mention(trigger=trigger, context=sentence)
             events.append(
                 EventNode(
                     event_id=event_id,
-                    text=sentence,
+                    text=event_text,
                     normalized_text=normalized_text,
                     document_id=document.document_id,
                     sentence_index=sentence_index,
@@ -171,6 +173,8 @@ class QueryCausalGraphBuilder:
                     ],
                     metadata={
                         "trigger": trigger,
+                        "event_mention": event_text,
+                        "event_context": sentence,
                         "publish_time": document.publish_time,
                         "is_title": sentence_index == 0,
                         "document_source": document.source,

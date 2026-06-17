@@ -433,11 +433,11 @@ def format_readable_debug_sample(
                     f"source={row['candidate_source']} "
                     f"keep={row['keep_prob']:.3f} "
                     f"pred={row['pred_relation']}:{row['pred_strength']:.3f} "
-                    f"coarse={row['coarse_relation']}:{float(row['coarse_score']):.3f} "
+                    f"candidate_prior={row['coarse_relation']}:{float(row['coarse_score']):.3f} "
                     f"gold={row['gold_action']}:{row['gold_relation']}"
                 ),
-                f"       src: {shorten_text(row['source_text'])}",
-                f"       tgt: {shorten_text(row['target_text'])}",
+                f"       source_event: {shorten_text(row['source_text'])}",
+                f"       target_event: {shorten_text(row['target_text'])}",
             ]
         )
     return "\n".join(lines)

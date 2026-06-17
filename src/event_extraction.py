@@ -156,6 +156,18 @@ class AtomicEvent:
     score: float
 
 
+def format_event_mention(trigger: str, context: str, max_context_chars: int = 180) -> str:
+    clean_trigger = " ".join(str(trigger).split()).strip()
+    clean_context = " ".join(str(context).split()).strip()
+    if len(clean_context) > max_context_chars:
+        clean_context = clean_context[: max(0, max_context_chars - 3)].rstrip() + "..."
+    if clean_trigger and clean_context:
+        return f"trigger={clean_trigger}; mention={clean_context}"
+    if clean_trigger:
+        return f"trigger={clean_trigger}"
+    return clean_context
+
+
 def tokenize(text: str) -> list[str]:
     return re.findall(r"[A-Za-z0-9']+", text.lower())
 
