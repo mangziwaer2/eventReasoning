@@ -37,6 +37,8 @@ RELATION_TO_ID = {
 ID_TO_RELATION = {value: key for key, value in RELATION_TO_ID.items()}
 TIME_NORMALIZATION_DAYS = 30.0
 MAX_RELATIVE_TIME_VALUE = 365.0
+EDGE_FEATURE_DIM = 20
+DEFAULT_CANDIDATE_RELATION = "precedes"
 
 
 @dataclass(slots=True)
@@ -218,6 +220,8 @@ def _edge_feature(
     source_event: EventNode,
     target_event: EventNode,
     event_time_values: dict[str, float],
+    event_degrees: dict[str, tuple[int, int]] | None = None,
+    candidate_source: str = "coarse",
 ) -> list[float]:
     relation_id = float(RELATION_TO_ID.get(edge.relation_type, 0))
     source_time_value = float(event_time_values.get(edge.source_event_id, 0.0))
@@ -226,6 +230,12 @@ def _edge_feature(
     abs_delta_time_value = min(abs(delta_time_value), MAX_RELATIVE_TIME_VALUE)
     sentence_gap = _clip_feature((float(target_event.sentence_index) - float(source_event.sentence_index)) / 8.0, minimum=-32.0, maximum=32.0)
     is_cross_document = 1.0 if source_event.document_id != target_event.document_id else 0.0
+    source_out_degree, source_in_degree = event_degrees.get(source_event.event_id, (0, 0)) if event_degrees else (0, 0)
+    target_out_degree, target_in_degree = event_degrees.get(target_event.event_id, (0, 0)) if event_degrees else (0, 0)
+    same_sentence = 1.0 if source_event.document_id == target_event.document_id and source_event.sentence_index == target_event.sentence_index else 0.0
+    candidate_source = candidate_source.strip().lower()
+    is_coarse_edge = 1.0 if candidate_source == "coarse" else 0.0
+    is_completion_candidate = 1.0 if candidate_source == "completion" else 0.0
     return [
         float(edge.score),
         relation_id,
@@ -240,6 +250,13 @@ def _edge_feature(
         abs_delta_time_value,
         sentence_gap,
         is_cross_document,
+        float(source_out_degree),
+        float(source_in_degree),
+        float(target_out_degree),
+        float(target_in_degree),
+        same_sentence,
+        is_coarse_edge,
+        is_completion_candidate,
     ]
 
 
@@ -269,6 +286,153 @@ def _dedupe_edges(edges: list[CoarseCausalEdge]) -> list[CoarseCausalEdge]:
         seen.add(key)
         deduped.append(edge)
     return deduped
+
+
+def _event_degrees(edges: list[CoarseCausalEdge], event_ids: set[str]) -> dict[str, tuple[int, int]]:
+    out_degrees = {event_id: 0 for event_id in event_ids}
+    in_degrees = {event_id: 0 for event_id in event_ids}
+    for edge in edges:
+        if edge.source_event_id in out_degrees:
+            out_degrees[edge.source_event_id] += 1
+        if edge.target_event_id in in_degrees:
+            in_degrees[edge.target_event_id] += 1
+    return {
+        event_id: (
+            out_degrees.get(event_id, 0),
+            in_degrees.get(event_id, 0),
+        )
+        for event_id in event_ids
+    }
+
+
+def _pair_candidate_score(source_event: EventNode, target_event: EventNode, query_text: str) -> float:
+    if source_event.event_id == target_event.event_id:
+        return 0.0
+    same_document = 1.0 if source_event.document_id == target_event.document_id else 0.0
+    sentence_gap = abs(target_event.sentence_index - source_event.sentence_index)
+    distance_score = 1.0 / (1.0 + float(sentence_gap))
+    shared_participants = len(set(source_event.participants) & set(target_event.participants))
+    source_tokens = set(source_event.normalized_text.lower().split())
+    target_tokens = set(target_event.normalized_text.lower().split())
+    if source_tokens or target_tokens:
+        lexical_score = len(source_tokens & target_tokens) / max(len(source_tokens | target_tokens), 1)
+    else:
+        lexical_score = 0.0
+    query_tokens = set(query_text.lower().split())
+    source_query_score = len(query_tokens & source_tokens) / max(len(query_tokens), 1) if query_tokens else 0.0
+    target_query_score = len(query_tokens & target_tokens) / max(len(query_tokens), 1) if query_tokens else 0.0
+    forward_time = 1.0 if target_event.sentence_index >= source_event.sentence_index else 0.5
+    return (
+        0.25 * same_document
+        + 0.20 * distance_score
+        + 0.20 * lexical_score
+        + 0.15 * min(shared_participants, 3) / 3.0
+        + 0.10 * ((source_query_score + target_query_score) / 2.0)
+        + 0.10 * forward_time
+    )
+
+
+def _completion_edge(
+    edge_id: str,
+    source_event: EventNode,
+    target_event: EventNode,
+    query_text: str,
+    event_time_values: dict[str, float],
+) -> CoarseCausalEdge:
+    delta_time = event_time_values.get(target_event.event_id, 0.0) - event_time_values.get(source_event.event_id, 0.0)
+    temporal_score = 1.0 / (1.0 + abs(delta_time))
+    candidate_score = _pair_candidate_score(source_event, target_event, query_text)
+    return CoarseCausalEdge(
+        edge_id=edge_id,
+        source_event_id=source_event.event_id,
+        target_event_id=target_event.event_id,
+        relation_type=DEFAULT_CANDIDATE_RELATION,
+        score=round(min(max(candidate_score, 0.0), 0.49), 4),
+        evidence=source_event.evidence + target_event.evidence,
+        feature_scores={
+            "temporal_score": temporal_score,
+            "entity_overlap_score": min(len(set(source_event.participants) & set(target_event.participants)) / 3.0, 1.0),
+            "lexical_support_score": candidate_score,
+            "marker_score": 0.0,
+            "query_alignment_score": candidate_score,
+        },
+        metadata={
+            "candidate_source": "completion",
+            "generated_for_refinement": True,
+        },
+    )
+
+
+def _rank_completion_pairs(
+    events: list[EventNode],
+    query_text: str,
+    forbidden_pairs: set[tuple[str, str]],
+) -> list[tuple[float, EventNode, EventNode]]:
+    candidates: list[tuple[float, EventNode, EventNode]] = []
+    for source_event in events:
+        for target_event in events:
+            pair = (source_event.event_id, target_event.event_id)
+            if pair in forbidden_pairs or source_event.event_id == target_event.event_id:
+                continue
+            if source_event.document_id != target_event.document_id:
+                shared_participants = set(source_event.participants) & set(target_event.participants)
+                if not shared_participants:
+                    continue
+            score = _pair_candidate_score(source_event, target_event, query_text)
+            candidates.append((score, source_event, target_event))
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates
+
+
+def add_completion_candidates(
+    gold_graph: CoarseCausalGraph,
+    coarse_graph: CoarseCausalGraph,
+    event_time_values: dict[str, float],
+    negative_ratio: float = 0.75,
+    max_completion_edges: int | None = None,
+    seed: int = 7,
+) -> list[CoarseCausalEdge]:
+    rng = random.Random(seed)
+    event_lookup = {event.event_id: event for event in gold_graph.events}
+    coarse_edges = list(coarse_graph.edges)
+    coarse_pairs = {(edge.source_event_id, edge.target_event_id) for edge in coarse_edges}
+    gold_pairs = {(edge.source_event_id, edge.target_event_id) for edge in gold_graph.edges}
+
+    completion_edges: list[CoarseCausalEdge] = []
+    missing_gold_pairs = [pair for pair in gold_pairs if pair not in coarse_pairs]
+    rng.shuffle(missing_gold_pairs)
+    for source_id, target_id in missing_gold_pairs:
+        source_event = event_lookup.get(source_id)
+        target_event = event_lookup.get(target_id)
+        if source_event is None or target_event is None:
+            continue
+        completion_edges.append(
+            _completion_edge(
+                edge_id=f"completion_gold_{len(completion_edges)}",
+                source_event=source_event,
+                target_event=target_event,
+                query_text=gold_graph.query.text,
+                event_time_values=event_time_values,
+            )
+        )
+
+    target_negative_count = max(1, int(max(len(gold_pairs), 1) * max(negative_ratio, 0.0)))
+    forbidden_pairs = set(coarse_pairs) | set(gold_pairs)
+    ranked_negatives = _rank_completion_pairs(gold_graph.events, gold_graph.query.text, forbidden_pairs)
+    for _, source_event, target_event in ranked_negatives[:target_negative_count]:
+        completion_edges.append(
+            _completion_edge(
+                edge_id=f"completion_neg_{len(completion_edges)}",
+                source_event=source_event,
+                target_event=target_event,
+                query_text=gold_graph.query.text,
+                event_time_values=event_time_values,
+            )
+        )
+
+    if max_completion_edges is not None and max_completion_edges > 0:
+        completion_edges = completion_edges[:max_completion_edges]
+    return _dedupe_edges(coarse_edges + completion_edges)
 
 
 def perturb_gold_graph_to_coarse(
@@ -354,6 +518,9 @@ def gold_and_coarse_graph_to_refinement_sample(
     sample_id: str,
     gold_graph: CoarseCausalGraph,
     coarse_graph: CoarseCausalGraph,
+    negative_completion_ratio: float = 0.75,
+    max_completion_edges: int | None = None,
+    seed: int = 7,
 ) -> RefinementSample:
     node_id_to_index = {event.event_id: index for index, event in enumerate(gold_graph.events)}
     event_lookup = {event.event_id: event for event in gold_graph.events}
@@ -371,6 +538,18 @@ def gold_and_coarse_graph_to_refinement_sample(
         )
         for event in gold_graph.events
     ]
+    candidate_edges = add_completion_candidates(
+        gold_graph=gold_graph,
+        coarse_graph=coarse_graph,
+        event_time_values=event_time_values,
+        negative_ratio=negative_completion_ratio,
+        max_completion_edges=max_completion_edges,
+        seed=seed,
+    )
+    event_degrees = _event_degrees(
+        coarse_graph.edges,
+        event_ids=set(node_id_to_index.keys()),
+    )
 
     gold_edge_map = {(edge.source_event_id, edge.target_event_id): edge for edge in gold_graph.edges}
     edge_index: list[list[int]] = []
@@ -380,14 +559,24 @@ def gold_and_coarse_graph_to_refinement_sample(
     edge_strengths: list[float] = []
     edge_descriptions: list[dict[str, Any]] = []
 
-    for edge in coarse_graph.edges:
+    for edge in candidate_edges:
         pair = (edge.source_event_id, edge.target_event_id)
         if edge.source_event_id not in node_id_to_index or edge.target_event_id not in node_id_to_index:
             continue
         source_event = event_lookup[edge.source_event_id]
         target_event = event_lookup[edge.target_event_id]
+        candidate_source = str(edge.metadata.get("candidate_source", "coarse"))
         edge_index.append([node_id_to_index[edge.source_event_id], node_id_to_index[edge.target_event_id]])
-        edge_features.append(_edge_feature(edge, source_event, target_event, event_time_values))
+        edge_features.append(
+            _edge_feature(
+                edge,
+                source_event,
+                target_event,
+                event_time_values,
+                event_degrees=event_degrees,
+                candidate_source=candidate_source,
+            )
+        )
         gold_edge = gold_edge_map.get(pair)
         if gold_edge is not None:
             edge_labels.append(1)
@@ -408,10 +597,12 @@ def gold_and_coarse_graph_to_refinement_sample(
                 "coarse_relation_type": edge.relation_type,
                 "gold_relation_type": gold_relation,
                 "coarse_score": edge.score,
+                "candidate_source": candidate_source,
                 "delta_time": round(event_time_values.get(edge.target_event_id, 0.0) - event_time_values.get(edge.source_event_id, 0.0), 4),
             }
         )
 
+    completion_count = sum(1 for edge in candidate_edges if edge.metadata.get("candidate_source") == "completion")
     return RefinementSample(
         sample_id=sample_id,
         node_features=node_features,
@@ -432,6 +623,9 @@ def gold_and_coarse_graph_to_refinement_sample(
             "query_text": gold_graph.query.text,
             "event_texts": [event.text for event in gold_graph.events],
             "edge_descriptions": edge_descriptions,
+            "coarse_edge_count": len(coarse_graph.edges),
+            "completion_candidate_count": completion_count,
+            "candidate_edge_count": len(edge_index),
         },
     )
 
@@ -441,6 +635,8 @@ def load_maven_refinement_samples(
     split: str = "train",
     limit: int | None = None,
     max_events: int | None = None,
+    negative_completion_ratio: float = 0.75,
+    max_completion_edges: int | None = None,
     seed: int = 7,
 ) -> list[RefinementSample]:
     graph_samples = load_maven_document_graph_samples(
@@ -459,6 +655,9 @@ def load_maven_refinement_samples(
             sample_id=graph_sample.sample_id,
             gold_graph=gold_graph,
             coarse_graph=coarse_graph,
+            negative_completion_ratio=negative_completion_ratio,
+            max_completion_edges=max_completion_edges,
+            seed=seed + index,
         )
         if sample.edge_index:
             samples.append(sample)
@@ -468,6 +667,8 @@ def load_maven_refinement_samples(
 def load_refinement_sample_from_coarse_graph(
     coarse_graph_path: Path,
     sample_id: str | None = None,
+    include_completion_candidates: bool = False,
+    max_completion_edges: int | None = None,
 ) -> RefinementSample:
     graph = load_coarse_graph(coarse_graph_path)
     inferred_sample_id = sample_id or coarse_graph_path.stem
@@ -478,6 +679,24 @@ def load_refinement_sample_from_coarse_graph(
         documents=graph.documents,
         events=graph.events,
     )
+    event_degrees = _event_degrees(graph.edges, event_ids=set(node_id_to_index.keys()))
+    candidate_edges = list(graph.edges)
+    if include_completion_candidates:
+        forbidden_pairs = {(edge.source_event_id, edge.target_event_id) for edge in graph.edges}
+        ranked_candidates = _rank_completion_pairs(graph.events, graph.query.text, forbidden_pairs)
+        selected_candidates = ranked_candidates
+        if max_completion_edges is not None and max_completion_edges > 0:
+            selected_candidates = selected_candidates[:max_completion_edges]
+        for _, source_event, target_event in selected_candidates:
+            candidate_edges.append(
+                _completion_edge(
+                    edge_id=f"inference_completion_{len(candidate_edges)}",
+                    source_event=source_event,
+                    target_event=target_event,
+                    query_text=graph.query.text,
+                    event_time_values=event_time_values,
+                )
+            )
 
     edge_index: list[list[int]] = []
     edge_features: list[list[float]] = []
@@ -486,13 +705,23 @@ def load_refinement_sample_from_coarse_graph(
     edge_strengths: list[float] = []
     edge_descriptions: list[dict[str, Any]] = []
 
-    for edge in graph.edges:
+    for edge in candidate_edges:
         if edge.source_event_id not in node_id_to_index or edge.target_event_id not in node_id_to_index:
             continue
         source_event = event_lookup[edge.source_event_id]
         target_event = event_lookup[edge.target_event_id]
+        candidate_source = str(edge.metadata.get("candidate_source", "coarse"))
         edge_index.append([node_id_to_index[edge.source_event_id], node_id_to_index[edge.target_event_id]])
-        edge_features.append(_edge_feature(edge, source_event, target_event, event_time_values))
+        edge_features.append(
+            _edge_feature(
+                edge,
+                source_event,
+                target_event,
+                event_time_values,
+                event_degrees=event_degrees,
+                candidate_source=candidate_source,
+            )
+        )
         edge_labels.append(0)
         edge_type_labels.append(RELATION_TO_ID.get(edge.relation_type, 0))
         edge_strengths.append(float(edge.score))
@@ -504,6 +733,7 @@ def load_refinement_sample_from_coarse_graph(
                 "target_text": target_event.text,
                 "coarse_relation_type": edge.relation_type,
                 "coarse_score": edge.score,
+                "candidate_source": candidate_source,
                 "delta_time": round(event_time_values.get(edge.target_event_id, 0.0) - event_time_values.get(edge.source_event_id, 0.0), 4),
             }
         )
@@ -536,6 +766,9 @@ def load_refinement_sample_from_coarse_graph(
             "query_text": graph.query.text,
             "event_texts": [event.text for event in graph.events],
             "edge_descriptions": edge_descriptions,
+            "coarse_edge_count": len(graph.edges),
+            "completion_candidate_count": max(len(edge_descriptions) - len(graph.edges), 0),
+            "candidate_edge_count": len(edge_descriptions),
         },
     )
 
@@ -603,6 +836,13 @@ def generate_synthetic_refinement_samples(num_samples: int = 32, seed: int = 7) 
                     float(abs(target - source)),
                     float(target - source) / 4.0,
                     0.0,
+                    1.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                    0.0,
+                    1.0,
+                    0.0,
                 ]
             )
             edge_labels.append(int(coarse_score >= 0.62))
@@ -656,6 +896,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-samples", type=int, default=8, help="Number of synthetic samples.")
     parser.add_argument("--limit", type=int, default=4, help="Maximum number of MAVEN rows exported.")
     parser.add_argument("--max-events", type=int, default=12, help="Maximum events kept in each MAVEN graph sample.")
+    parser.add_argument("--negative-completion-ratio", type=float, default=0.75, help="Extra non-gold completion candidates per gold edge.")
+    parser.add_argument("--max-completion-edges", type=int, default=0, help="Optional cap on added completion candidates per graph.")
+    parser.add_argument("--include-completion-candidates", action="store_true", help="Add non-coarse candidate edges when mode=coarse-graph.")
     parser.add_argument("--coarse-graph", default=None, help="Path to a coarse graph JSON file when mode=coarse-graph.")
     parser.add_argument("--output", default=None, help="Optional output JSON path.")
     return parser.parse_args()
@@ -671,7 +914,11 @@ def main() -> None:
     elif args.mode == "coarse-graph":
         if not args.coarse_graph:
             raise ValueError("--coarse-graph is required when --mode=coarse-graph")
-        sample = load_refinement_sample_from_coarse_graph(resolve_repo_path(args.coarse_graph))
+        sample = load_refinement_sample_from_coarse_graph(
+            resolve_repo_path(args.coarse_graph),
+            include_completion_candidates=args.include_completion_candidates,
+            max_completion_edges=args.max_completion_edges or None,
+        )
         payload = {"mode": "coarse-graph", "sample": sample.to_dict()}
     else:
         samples = load_maven_refinement_samples(
@@ -679,6 +926,8 @@ def main() -> None:
             split=args.split,
             limit=args.limit,
             max_events=args.max_events,
+            negative_completion_ratio=args.negative_completion_ratio,
+            max_completion_edges=args.max_completion_edges or None,
         )
         payload = {"mode": "maven", "samples": [sample.to_dict() for sample in samples]}
 

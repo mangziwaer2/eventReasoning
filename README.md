@@ -8,9 +8,9 @@ The project is organized around the following pipeline:
 
 `query + cutoff time + candidate news -> retrieved evidence -> extracted events -> coarse causal graph -> refined causal graph -> future event hypotheses`
 
-At the current stage, the implemented code reaches:
+At the current stage, the implemented code covers the graph construction and refinement path:
 
-`query + cutoff time + candidate news -> retrieved evidence -> extracted events -> coarse causal graph`
+`query + cutoff time + candidate news -> retrieved evidence -> extracted events -> coarse causal graph -> refined causal graph`
 
 ## Current Scope
 
@@ -73,6 +73,10 @@ lite_causal_eventrag/
   Builds the current local graph baseline from retrieved evidence and extracted events.
 - `src/coarse_graph_builder.py`
   Builds the current coarse causal graph from extracted events.
+- `src/refinement_dataset.py`
+  Converts a complete coarse graph into graph-level refinement tensors. This is not the Qwen event-pair task; it scores all candidate edges in a graph and can add completion candidates for missing edges.
+- `src/refinement_model.py`
+  Query-conditioned temporal relational graph refiner for coarse-graph-to-refined-graph learning.
 - `src/query_forecast.py`
   Keeps the graph-conditioned forecasting entrypoint scaffold.
 
@@ -126,16 +130,16 @@ Generate synthetic refinement samples:
 python src/refinement_dataset.py --mode synthetic --num-samples 8
 ```
 
-Train the refinement baseline on synthetic data:
+Train graph-level refinement on MAVEN-ERE:
 
 ```bash
-python src/train_refinement.py --epochs 5 --num-samples 64
+python src/train_refinement.py --dataset-mode maven --limit 2048 --epochs 30
 ```
 
-Run refinement inference on a MIRAI-derived coarse graph:
+Run refinement inference on a coarse graph JSON:
 
 ```bash
-python src/run_refinement.py --query-id 1
+python src/run_refinement.py --coarse-graph outputs/coarse_graph.json --include-completion-candidates
 ```
 
 Generate a readable event extraction log:
