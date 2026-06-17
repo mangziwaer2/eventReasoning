@@ -29,7 +29,6 @@ python -u train_refinement.py \
   --debug-max-edges 12 \
   --debug-keep-threshold 0.5 \
   --output-dir outputs/refinement_graph_4090_full \
-  2>&1 | tee outputs/refinement_graph_4090_full/console.log \
 && \
 python -u train_coarse_graph_qwen.py \
   --train-limit 0 \
@@ -47,6 +46,5 @@ python -u train_coarse_graph_qwen.py \
   --debug-samples 2 \
   --document-mode title \
   --output-dir outputs/coarse_graph_qwen_lora_4090_full \
-  2>&1 | tee outputs/coarse_graph_qwen_lora_4090_full/console.log \
 && \
 shutdown

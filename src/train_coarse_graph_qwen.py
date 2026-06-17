@@ -53,6 +53,13 @@ def save_json(path, payload: Any) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def log_line(message: str, log_path: Path | None = None) -> None:
+    print(message, flush=True)
+    if log_path is not None:
+        with log_path.open("a", encoding="utf-8") as log_file:
+            log_file.write(message + "\n")
+
+
 def summarize_pair_samples(samples: list[EventPairSample]) -> dict[str, Any]:
     relation_counts = {relation: 0 for relation in PAIR_RELATION_TYPES}
     for sample in samples:
@@ -169,6 +176,7 @@ def encode_samples_batched(
     args: argparse.Namespace,
     name: str,
     progress_enabled: bool,
+    log_path: Path | None,
 ) -> list[EncodedSample]:
     encoded_samples: list[EncodedSample] = []
     total_samples = len(samples)
@@ -207,8 +215,7 @@ def encode_samples_batched(
                     attention_mask=attention_mask,
                 )
             )
-    if progress_enabled:
-        print(f"{name} tokenized {len(encoded_samples)}/{total_samples} pair samples", flush=True)
+    log_line(f"{name} tokenized {len(encoded_samples)}/{total_samples} pair samples", log_path)
     return encoded_samples
 
 
@@ -245,6 +252,7 @@ def build_dataloader(
     shuffle: bool,
     name: str,
     progress_enabled: bool,
+    log_path: Path | None,
 ):
     from torch.utils.data import DataLoader
 
@@ -254,6 +262,7 @@ def build_dataloader(
         args=args,
         name=name,
         progress_enabled=progress_enabled,
+        log_path=log_path,
     )
     return DataLoader(
         encoded_samples,
@@ -360,14 +369,17 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     random.seed(args.seed)
     progress_enabled = not args.no_progress
+    training_log_path = output_dir / "training.log"
+    if training_log_path.exists():
+        training_log_path.unlink()
 
-    print(
+    log_line(
         "loading MAVEN pair samples"
         f" | train_limit={args.train_limit}"
         f" | validation_limit={args.validation_limit}"
         f" | max_events={args.max_events}"
         f" | negative_ratio={args.negative_ratio}",
-        flush=True,
+        training_log_path,
     )
     train_samples = load_maven_event_pair_samples(
         dataset_path=resolve_repo_path(args.dataset),
@@ -393,24 +405,24 @@ def main() -> None:
     validation_samples = limit_pair_samples(validation_samples, args.max_validation_pairs, args.seed + 23)
     train_stats = summarize_pair_samples(train_samples)
     validation_stats = summarize_pair_samples(validation_samples)
-    print(
+    log_line(
         "loaded pair samples"
         f" | train_samples={train_stats['samples']}"
         f" | val_samples={validation_stats['samples']}"
         f" | original_train_pairs={original_train_pair_count}"
         f" | original_val_pairs={original_validation_pair_count}"
         f" | train_pos_ratio={train_stats['positive_ratio']:.3f}",
-        flush=True,
+        training_log_path,
     )
 
     try:
-        print(f"loading Qwen LoRA model from {resolve_repo_path(args.model_path)}", flush=True)
+        log_line(f"loading Qwen LoRA model from {resolve_repo_path(args.model_path)}", training_log_path)
         model, tokenizer, torch = load_qwen_with_lora(resolve_repo_path(args.model_path))
     except LoraUnavailable as exc:
-        print(json.dumps({"error": str(exc)}, ensure_ascii=False))
+        log_line(json.dumps({"error": str(exc)}, ensure_ascii=False), training_log_path)
         return
     device = next(model.parameters()).device
-    print(f"loaded Qwen LoRA model | device={device}", flush=True)
+    log_line(f"loaded Qwen LoRA model | device={device}", training_log_path)
 
     train_dataloader = build_dataloader(
         train_samples,
@@ -421,6 +433,7 @@ def main() -> None:
         shuffle=True,
         name="train",
         progress_enabled=progress_enabled,
+        log_path=training_log_path,
     )
     validation_dataloader = None
     if validation_samples:
@@ -433,6 +446,7 @@ def main() -> None:
             shuffle=False,
             name="validation",
             progress_enabled=progress_enabled,
+            log_path=training_log_path,
         )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
@@ -456,7 +470,7 @@ def main() -> None:
         "task": "qwen_event_pair_to_coarse_graph",
     }
     save_json(output_dir / "train_config.json", train_config)
-    print(
+    log_line(
         " | ".join(
             [
                 "coarse qwen training",
@@ -469,10 +483,10 @@ def main() -> None:
                 f"lr={args.lr:.2e}",
             ]
         ),
-        flush=True,
+        training_log_path,
     )
-    print(f"train_relation_counts={json.dumps(train_stats['relation_counts'], ensure_ascii=False)}", flush=True)
-    print(f"val_relation_counts={json.dumps(validation_stats['relation_counts'], ensure_ascii=False)}", flush=True)
+    log_line(f"train_relation_counts={json.dumps(train_stats['relation_counts'], ensure_ascii=False)}", training_log_path)
+    log_line(f"val_relation_counts={json.dumps(validation_stats['relation_counts'], ensure_ascii=False)}", training_log_path)
 
     for epoch in range(args.epochs):
         epoch_started = time.time()
@@ -516,7 +530,7 @@ def main() -> None:
                 and args.log_every > 0
                 and (batch_index % args.log_every == 0 or batch_index == len(train_dataloader))
             ):
-                print(
+                log_line(
                     " | ".join(
                         [
                             f"epoch {epoch + 1:03d}/{args.epochs:03d} batch {batch_index:04d}/{len(train_dataloader):04d}",
@@ -525,7 +539,7 @@ def main() -> None:
                             f"time={format_seconds(time.time() - epoch_started)}",
                         ]
                     ),
-                    flush=True,
+                    training_log_path,
                 )
                 window_loss = 0.0
                 window_count = 0
@@ -556,7 +570,7 @@ def main() -> None:
         tokenizer.save_pretrained(output_dir / "latest_adapter")
         save_json(output_dir / "train_history.json", history)
 
-        print(
+        log_line(
             " | ".join(
                 [
                     f"epoch {epoch + 1:03d}/{args.epochs:03d} done" + (" best" if is_best else ""),
@@ -566,7 +580,7 @@ def main() -> None:
                     f"time={format_seconds(time.time() - epoch_started)}",
                 ]
             ),
-            flush=True,
+            training_log_path,
         )
         debug_rows, debug_blocks = print_debug_samples(
             model,
@@ -584,14 +598,14 @@ def main() -> None:
                     debug_file.write(json.dumps({"epoch": epoch + 1, **row}, ensure_ascii=False) + "\n")
         if debug_blocks:
             readable_text = "\n\n".join(f"[epoch {epoch + 1:03d}] {block}" for block in debug_blocks)
-            print(readable_text, flush=True)
+            log_line(readable_text, training_log_path)
             with debug_readable_path.open("a", encoding="utf-8") as readable_file:
                 readable_file.write(readable_text + "\n\n")
 
     model.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
     save_json(output_dir / "train_history.json", history)
-    print(f"Saved LoRA outputs to {output_dir} | total_time={format_seconds(time.time() - train_started)}")
+    log_line(f"Saved LoRA outputs to {output_dir} | total_time={format_seconds(time.time() - train_started)}", training_log_path)
 
 
 if __name__ == "__main__":
