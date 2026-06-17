@@ -1,0 +1,3 @@
+python train_coarse_graph_qwen.py     --train-limit 8192     --validation-limit 512     --max-events 16     --negative-ratio 1.5     --epochs 10     --batch-size 4     --eval-batch-size 4     --gradient-accumulation-steps 4     --output-dir outputs/coarse_graph_qwen_lora_run1 && \
+python train_refinement.py --dataset-mode maven --limit 8192 --max-events 16 --epochs 40 --output-dir outputs/refinement_graph_4090 &&\
+shutdown

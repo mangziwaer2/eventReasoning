@@ -8,9 +8,22 @@ class LoraUnavailable(RuntimeError):
     pass
 
 
+def _disable_incompatible_torchao_for_peft() -> None:
+    try:
+        import peft.import_utils as peft_import_utils
+    except ImportError:
+        return
+
+    try:
+        peft_import_utils.is_torchao_available()
+    except ImportError:
+        peft_import_utils.is_torchao_available = lambda: False
+
+
 def import_qwen_lora_stack() -> tuple[Any, Any, Any, Any, Any, Any]:
 
     import torch
+    _disable_incompatible_torchao_for_peft()
     from peft import LoraConfig
     from peft import PeftModel
     from peft import get_peft_model

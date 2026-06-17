@@ -24,12 +24,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-path", default=str(REPO_ROOT / "models" / "Qwen2.5-0.5B"), help="Local Qwen model directory.")
     parser.add_argument("--train-split", default="train", help="Training split name from the dataset.")
     parser.add_argument("--validation-split", default="valid", help="Validation split name from the dataset.")
-    parser.add_argument("--train-limit", type=int, default=128, help="Maximum number of training rows.")
+    parser.add_argument("--train-limit", type=int, default=0, help="Maximum number of training rows.")
     parser.add_argument("--validation-limit", type=int, default=32, help="Maximum number of validation rows.")
-    parser.add_argument("--max-events", type=int, default=12, help="Maximum events kept per source document.")
+    parser.add_argument("--max-events", type=int, default=16, help="Maximum events kept per source document.")
     parser.add_argument("--negative-ratio", type=float, default=1.0, help="Negative pair sampling ratio.")
     parser.add_argument("--max-sentence-gap", type=int, default=3, help="Maximum sentence gap for candidate pair construction.")
-    parser.add_argument("--epochs", type=int, default=1, help="Number of epochs.")
+    parser.add_argument("--epochs", type=int, default=40, help="Number of epochs.")
     parser.add_argument("--max-length", type=int, default=1024, help="Maximum token length.")
     parser.add_argument("--batch-size", type=int, default=4, help="Training batch size.")
     parser.add_argument("--eval-batch-size", type=int, default=4, help="Validation batch size.")
@@ -37,7 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=2e-4, help="Learning rate.")
     parser.add_argument("--log-every", type=int, default=25, help="Print one progress line every N batches. Use 0 to disable.")
     parser.add_argument("--debug-samples", type=int, default=2, help="Number of validation samples printed and saved each epoch.")
-    parser.add_argument("--seed", type=int, default=7, help="Random seed.")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--include-query", action="store_true", help="Include query text in the training prompt.")
     parser.add_argument("--document-mode", choices=["none", "title", "snippet", "summary", "full"], default="title", help="How much document text to include in the prompt.")
     parser.add_argument("--max-document-chars", type=int, default=240, help="Maximum characters kept per document snippet when document-mode=snippet.")
@@ -156,10 +156,24 @@ def collate_encoded_samples(batch, tokenizer, torch):
     }
 
 
-def build_dataloader(samples, tokenizer, args: argparse.Namespace, torch, batch_size: int, shuffle: bool):
+def build_dataloader(
+    samples,
+    tokenizer,
+    args: argparse.Namespace,
+    torch,
+    batch_size: int,
+    shuffle: bool,
+    name: str,
+    log_every: int = 1000,
+):
     from torch.utils.data import DataLoader
 
-    encoded_samples = [encode_sample(sample, tokenizer, args) for sample in samples]
+    encoded_samples = []
+    total_samples = len(samples)
+    for index, sample in enumerate(samples, start=1):
+        encoded_samples.append(encode_sample(sample, tokenizer, args))
+        if log_every > 0 and (index % log_every == 0 or index == total_samples):
+            print(f"{name} tokenized {index}/{total_samples} pair samples", flush=True)
     return DataLoader(
         encoded_samples,
         batch_size=batch_size,
@@ -194,6 +208,7 @@ def evaluate(model, dataloader, device, torch):
 def print_debug_samples(
     model,
     tokenizer,
+    torch,
     device,
     validation_samples: list[EventPairSample],
     args: argparse.Namespace,
@@ -264,6 +279,14 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     random.seed(args.seed)
 
+    print(
+        "loading MAVEN pair samples"
+        f" | train_limit={args.train_limit}"
+        f" | validation_limit={args.validation_limit}"
+        f" | max_events={args.max_events}"
+        f" | negative_ratio={args.negative_ratio}",
+        flush=True,
+    )
     train_samples = load_maven_event_pair_samples(
         dataset_path=resolve_repo_path(args.dataset),
         split=args.train_split,
@@ -284,12 +307,22 @@ def main() -> None:
     )
     train_stats = summarize_pair_samples(train_samples)
     validation_stats = summarize_pair_samples(validation_samples)
+    print(
+        "loaded pair samples"
+        f" | train_samples={train_stats['samples']}"
+        f" | val_samples={validation_stats['samples']}"
+        f" | train_pos_ratio={train_stats['positive_ratio']:.3f}",
+        flush=True,
+    )
 
     try:
+        print(f"loading Qwen LoRA model from {resolve_repo_path(args.model_path)}", flush=True)
         model, tokenizer, torch = load_qwen_with_lora(resolve_repo_path(args.model_path))
     except LoraUnavailable as exc:
         print(json.dumps({"error": str(exc)}, ensure_ascii=False))
         return
+    device = next(model.parameters()).device
+    print(f"loaded Qwen LoRA model | device={device}", flush=True)
 
     train_dataloader = build_dataloader(
         train_samples,
@@ -298,6 +331,7 @@ def main() -> None:
         torch,
         batch_size=args.batch_size,
         shuffle=True,
+        name="train",
     )
     validation_dataloader = None
     if validation_samples:
@@ -308,10 +342,10 @@ def main() -> None:
             torch,
             batch_size=args.eval_batch_size,
             shuffle=False,
+            name="validation",
         )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
-    device = next(model.parameters()).device
     history: list[dict[str, float]] = []
     global_step = 0
     best_val_loss = float("inf")
@@ -429,6 +463,7 @@ def main() -> None:
         debug_rows, debug_blocks = print_debug_samples(
             model,
             tokenizer,
+            torch,
             device,
             validation_samples,
             args,
