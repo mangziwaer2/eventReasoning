@@ -26,6 +26,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--validation-split", default="valid", help="Validation split name from the dataset.")
     parser.add_argument("--train-limit", type=int, default=0, help="Maximum number of training rows.")
     parser.add_argument("--validation-limit", type=int, default=32, help="Maximum number of validation rows.")
+    parser.add_argument("--max-train-pairs", type=int, default=0, help="Optional cap after train rows are expanded into event pairs.")
+    parser.add_argument("--max-validation-pairs", type=int, default=0, help="Optional cap after validation rows are expanded into event pairs.")
     parser.add_argument("--max-events", type=int, default=16, help="Maximum events kept per source document.")
     parser.add_argument("--negative-ratio", type=float, default=1.0, help="Negative pair sampling ratio.")
     parser.add_argument("--max-sentence-gap", type=int, default=3, help="Maximum sentence gap for candidate pair construction.")
@@ -33,9 +35,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-length", type=int, default=1024, help="Maximum token length.")
     parser.add_argument("--batch-size", type=int, default=4, help="Training batch size.")
     parser.add_argument("--eval-batch-size", type=int, default=4, help="Validation batch size.")
+    parser.add_argument("--tokenize-batch-size", type=int, default=512, help="Batch size used during prompt tokenization.")
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1, help="Gradient accumulation steps.")
     parser.add_argument("--lr", type=float, default=2e-4, help="Learning rate.")
     parser.add_argument("--log-every", type=int, default=25, help="Print one progress line every N batches. Use 0 to disable.")
+    parser.add_argument("--no-progress", action="store_true", help="Disable tqdm progress bars.")
     parser.add_argument("--debug-samples", type=int, default=2, help="Number of validation samples printed and saved each epoch.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--include-query", action="store_true", help="Include query text in the training prompt.")
@@ -60,6 +64,33 @@ def summarize_pair_samples(samples: list[EventPairSample]) -> dict[str, Any]:
         "negative_samples": relation_counts.get("none", 0),
         "positive_ratio": (len(samples) - relation_counts.get("none", 0)) / len(samples) if samples else 0.0,
     }
+
+
+def limit_pair_samples(samples: list[EventPairSample], max_pairs: int, seed: int) -> list[EventPairSample]:
+    if max_pairs <= 0 or len(samples) <= max_pairs:
+        return samples
+    rng = random.Random(seed)
+    shuffled = list(samples)
+    rng.shuffle(shuffled)
+    return shuffled[:max_pairs]
+
+
+def make_progress(iterable, total: int | None, desc: str, enabled: bool):
+    if not enabled:
+        return iterable
+    try:
+        from tqdm.auto import tqdm
+    except ImportError:
+        print(f"{desc} started", flush=True)
+        return iterable
+    return tqdm(
+        iterable,
+        total=total,
+        desc=desc,
+        dynamic_ncols=True,
+        mininterval=1.0,
+        leave=True,
+    )
 
 
 def format_seconds(seconds: float) -> str:
@@ -132,6 +163,55 @@ def encode_sample(sample: EventPairSample, tokenizer, args: argparse.Namespace) 
     return EncodedSample(input_ids=input_ids, labels=labels, attention_mask=attention_mask)
 
 
+def encode_samples_batched(
+    samples: list[EventPairSample],
+    tokenizer,
+    args: argparse.Namespace,
+    name: str,
+    progress_enabled: bool,
+) -> list[EncodedSample]:
+    encoded_samples: list[EncodedSample] = []
+    total_samples = len(samples)
+    chunk_size = max(1, int(args.tokenize_batch_size))
+    ranges = range(0, total_samples, chunk_size)
+    for start in make_progress(
+        ranges,
+        total=(total_samples + chunk_size - 1) // chunk_size if total_samples else 0,
+        desc=f"{name} tokenizing",
+        enabled=progress_enabled,
+    ):
+        chunk = samples[start : start + chunk_size]
+        text_items = [_build_text_example(sample, args) for sample in chunk]
+        prompt_texts = [item["prompt_only"] for item in text_items]
+        target_texts = [item["target_text"] for item in text_items]
+        prompt_batch = tokenizer(prompt_texts, add_special_tokens=False, padding=False)
+        target_batch = tokenizer(target_texts, add_special_tokens=False, padding=False)
+
+        for sample, prompt_ids, target_ids in zip(chunk, prompt_batch["input_ids"], target_batch["input_ids"]):
+            if not target_ids:
+                raise ValueError(f"Empty target encoding for sample {sample.sample_id}")
+
+            if len(target_ids) >= args.max_length:
+                target_ids = target_ids[: max(1, args.max_length - 1)]
+
+            available_prompt_tokens = max(1, args.max_length - len(target_ids))
+            prompt_ids = prompt_ids[:available_prompt_tokens]
+
+            input_ids = prompt_ids + target_ids
+            labels = ([-100] * len(prompt_ids)) + target_ids
+            attention_mask = [1] * len(input_ids)
+            encoded_samples.append(
+                EncodedSample(
+                    input_ids=input_ids,
+                    labels=labels,
+                    attention_mask=attention_mask,
+                )
+            )
+    if progress_enabled:
+        print(f"{name} tokenized {len(encoded_samples)}/{total_samples} pair samples", flush=True)
+    return encoded_samples
+
+
 def collate_encoded_samples(batch, tokenizer, torch):
     if not batch:
         raise ValueError("Empty batch.")
@@ -164,16 +244,17 @@ def build_dataloader(
     batch_size: int,
     shuffle: bool,
     name: str,
-    log_every: int = 1000,
+    progress_enabled: bool,
 ):
     from torch.utils.data import DataLoader
 
-    encoded_samples = []
-    total_samples = len(samples)
-    for index, sample in enumerate(samples, start=1):
-        encoded_samples.append(encode_sample(sample, tokenizer, args))
-        if log_every > 0 and (index % log_every == 0 or index == total_samples):
-            print(f"{name} tokenized {index}/{total_samples} pair samples", flush=True)
+    encoded_samples = encode_samples_batched(
+        samples=list(samples),
+        tokenizer=tokenizer,
+        args=args,
+        name=name,
+        progress_enabled=progress_enabled,
+    )
     return DataLoader(
         encoded_samples,
         batch_size=batch_size,
@@ -278,6 +359,7 @@ def main() -> None:
     output_dir = resolve_repo_path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     random.seed(args.seed)
+    progress_enabled = not args.no_progress
 
     print(
         "loading MAVEN pair samples"
@@ -305,12 +387,18 @@ def main() -> None:
         max_sentence_gap=args.max_sentence_gap,
         seed=args.seed + 1,
     )
+    original_train_pair_count = len(train_samples)
+    original_validation_pair_count = len(validation_samples)
+    train_samples = limit_pair_samples(train_samples, args.max_train_pairs, args.seed + 17)
+    validation_samples = limit_pair_samples(validation_samples, args.max_validation_pairs, args.seed + 23)
     train_stats = summarize_pair_samples(train_samples)
     validation_stats = summarize_pair_samples(validation_samples)
     print(
         "loaded pair samples"
         f" | train_samples={train_stats['samples']}"
         f" | val_samples={validation_stats['samples']}"
+        f" | original_train_pairs={original_train_pair_count}"
+        f" | original_val_pairs={original_validation_pair_count}"
         f" | train_pos_ratio={train_stats['positive_ratio']:.3f}",
         flush=True,
     )
@@ -332,6 +420,7 @@ def main() -> None:
         batch_size=args.batch_size,
         shuffle=True,
         name="train",
+        progress_enabled=progress_enabled,
     )
     validation_dataloader = None
     if validation_samples:
@@ -343,6 +432,7 @@ def main() -> None:
             batch_size=args.eval_batch_size,
             shuffle=False,
             name="validation",
+            progress_enabled=progress_enabled,
         )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
@@ -361,6 +451,8 @@ def main() -> None:
         **vars(args),
         "train_stats": train_stats,
         "validation_stats": validation_stats,
+        "original_train_pair_count": original_train_pair_count,
+        "original_validation_pair_count": original_validation_pair_count,
         "task": "qwen_event_pair_to_coarse_graph",
     }
     save_json(output_dir / "train_config.json", train_config)
@@ -391,7 +483,13 @@ def main() -> None:
         batch_count = 0
         window_count = 0
 
-        for batch_index, batch in enumerate(train_dataloader, start=1):
+        train_iterator = make_progress(
+            train_dataloader,
+            total=len(train_dataloader),
+            desc=f"epoch {epoch + 1:03d}/{args.epochs:03d}",
+            enabled=progress_enabled,
+        )
+        for batch_index, batch in enumerate(train_iterator, start=1):
             loss = compute_batch_loss(model, batch, device)
             detached_loss = float(loss.item())
             scaled_loss = loss / max(args.gradient_accumulation_steps, 1)
@@ -407,7 +505,17 @@ def main() -> None:
             batch_count += 1
             window_count += 1
 
-            if args.log_every > 0 and (batch_index % args.log_every == 0 or batch_index == len(train_dataloader)):
+            if progress_enabled and hasattr(train_iterator, "set_postfix"):
+                train_iterator.set_postfix(
+                    loss=f"{window_loss / max(window_count, 1):.4f}",
+                    step=global_step,
+                )
+
+            if (
+                not progress_enabled
+                and args.log_every > 0
+                and (batch_index % args.log_every == 0 or batch_index == len(train_dataloader))
+            ):
                 print(
                     " | ".join(
                         [

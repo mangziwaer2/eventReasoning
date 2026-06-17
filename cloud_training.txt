@@ -1,3 +1,52 @@
-python train_coarse_graph_qwen.py     --train-limit 8192     --validation-limit 512     --max-events 16     --negative-ratio 1.5     --epochs 10     --batch-size 4     --eval-batch-size 4     --gradient-accumulation-steps 4     --output-dir outputs/coarse_graph_qwen_lora_run1 && \
-python train_refinement.py --dataset-mode maven --limit 8192 --max-events 16 --epochs 40 --output-dir outputs/refinement_graph_4090 &&\
+python -u train_refinement.py \
+  --dataset-mode maven \
+  --limit 0 \
+  --max-events 16 \
+  --negative-completion-ratio 0.75 \
+  --max-completion-edges 0 \
+  --validation-ratio 0.1 \
+  --epochs 40 \
+  --hidden-dim 192 \
+  --message-steps 4 \
+  --dropout 0.12 \
+  --lr 3e-4 \
+  --weight-decay 1e-4 \
+  --grad-clip 1.0 \
+  --keep-loss-weight 1.0 \
+  --type-loss-weight 0.7 \
+  --strength-loss-weight 0.3 \
+  --density-loss-weight 0.08 \
+  --keep-pos-weight auto \
+  --max-pos-weight 12.0 \
+  --type-class-weighting auto \
+  --max-type-class-weight 4.0 \
+  --type-label-smoothing 0.02 \
+  --device auto \
+  --amp auto \
+  --num-workers 0 \
+  --log-every 25 \
+  --debug-samples 2 \
+  --debug-max-edges 12 \
+  --debug-keep-threshold 0.5 \
+  --output-dir outputs/refinement_graph_4090_full \
+  2>&1 | tee outputs/refinement_graph_4090_full/console.log \
+&& \
+python -u train_coarse_graph_qwen.py \
+  --train-limit 0 \
+  --validation-limit 0 \
+  --max-events 16 \
+  --negative-ratio 1.5 \
+  --max-sentence-gap 3 \
+  --epochs 10 \
+  --max-length 1024 \
+  --batch-size 4 \
+  --eval-batch-size 4 \
+  --gradient-accumulation-steps 4 \
+  --lr 2e-4 \
+  --log-every 25 \
+  --debug-samples 2 \
+  --document-mode title \
+  --output-dir outputs/coarse_graph_qwen_lora_4090_full \
+  2>&1 | tee outputs/coarse_graph_qwen_lora_4090_full/console.log \
+&& \
 shutdown
