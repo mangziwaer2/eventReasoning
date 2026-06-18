@@ -41,27 +41,38 @@ def _move_to_device(model, torch):
 
 def load_qwen_with_lora(
     model_path: Path,
+    adapter_path: Path | None = None,
     target_modules: list[str] | None = None,
     r: int = 8,
     alpha: int = 16,
     dropout: float = 0.05,
 ):
-    torch, auto_model_cls, auto_tokenizer_cls, lora_config_cls, get_peft_model, _ = import_qwen_lora_stack()
+    torch, auto_model_cls, auto_tokenizer_cls, lora_config_cls, get_peft_model, peft_model_cls = import_qwen_lora_stack()
 
-    tokenizer = auto_tokenizer_cls.from_pretrained(model_path, trust_remote_code=False)
+    tokenizer_source = adapter_path if adapter_path is not None and (adapter_path / "tokenizer_config.json").exists() else model_path
+    tokenizer = auto_tokenizer_cls.from_pretrained(tokenizer_source, trust_remote_code=False)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
     model = auto_model_cls.from_pretrained(model_path, trust_remote_code=False)
-    lora_config = lora_config_cls(
-        r=r,
-        lora_alpha=alpha,
-        lora_dropout=dropout,
-        target_modules=target_modules or ["q_proj", "k_proj", "v_proj", "o_proj"],
-        bias="none",
-        task_type="CAUSAL_LM",
-    )
-    model = get_peft_model(model, lora_config)
+    if adapter_path is not None:
+        try:
+            model = peft_model_cls.from_pretrained(model, adapter_path, is_trainable=True)
+        except TypeError:
+            model = peft_model_cls.from_pretrained(model, adapter_path)
+            for name, parameter in model.named_parameters():
+                if "lora_" in name:
+                    parameter.requires_grad = True
+    else:
+        lora_config = lora_config_cls(
+            r=r,
+            lora_alpha=alpha,
+            lora_dropout=dropout,
+            target_modules=target_modules or ["q_proj", "k_proj", "v_proj", "o_proj"],
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        model = get_peft_model(model, lora_config)
     model = _move_to_device(model, torch)
     return model, tokenizer, torch
 

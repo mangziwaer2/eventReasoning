@@ -1,3 +1,11 @@
+# Cloud training commands
+
+Workdir:
+cd /root/autodl-tmp/eventReasoning/src
+
+
+1) Full refinement training
+
 python -u train_refinement.py \
   --dataset-mode maven \
   --limit 0 \
@@ -28,8 +36,11 @@ python -u train_refinement.py \
   --debug-samples 2 \
   --debug-max-edges 12 \
   --debug-keep-threshold 0.5 \
-  --output-dir outputs/refinement_graph_4090_full \
-&& \
+  --output-dir outputs/refinement_graph_4090_full
+
+
+2) Full coarse graph Qwen LoRA training
+
 python -u train_coarse_graph_qwen.py \
   --train-limit 0 \
   --validation-limit 0 \
@@ -45,6 +56,34 @@ python -u train_coarse_graph_qwen.py \
   --log-every 25 \
   --debug-samples 2 \
   --document-mode title \
-  --output-dir outputs/coarse_graph_qwen_lora_4090_full \
-&& \
+  --output-dir outputs/coarse_graph_qwen_lora_4090_full
+
+
+3) Resume coarse graph Qwen LoRA training
+
+# Use this for the current interrupted run. If latest_training_state.pt exists,
+# optimizer/global_step/history are restored. If it does not exist, training
+# resumes from latest_adapter and infers the next epoch from train_history.json.
+
+python -u train_coarse_graph_qwen.py \
+  --train-limit 0 \
+  --validation-limit 0 \
+  --max-events 16 \
+  --negative-ratio 1.5 \
+  --max-sentence-gap 3 \
+  --epochs 10 \
+  --max-length 1024 \
+  --batch-size 4 \
+  --eval-batch-size 4 \
+  --gradient-accumulation-steps 4 \
+  --lr 2e-4 \
+  --log-every 25 \
+  --debug-samples 2 \
+  --document-mode title \
+  --resume-from outputs/coarse_graph_qwen_lora_4090_full \
+  --output-dir outputs/coarse_graph_qwen_lora_4090_full
+
+
+4) Optional shutdown after a successful command
+
 shutdown

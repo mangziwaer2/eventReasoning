@@ -772,7 +772,10 @@ def build_event_pair_inference_samples(
             pair_candidates.append((score, source_event.event_id, target_event.event_id))
 
     pair_candidates.sort(key=lambda item: item[0], reverse=True)
-    selected = pair_candidates[:max_pairs]
+    if max_pairs is None or max_pairs <= 0:
+        selected = pair_candidates
+    else:
+        selected = pair_candidates[:max_pairs]
     pair_samples: list[EventPairSample] = []
     for index, (candidate_score, source_event_id, target_event_id) in enumerate(selected):
         pair_samples.append(
@@ -839,9 +842,30 @@ def _extract_json_block(text: str) -> str | None:
     if stripped.startswith("{") and stripped.endswith("}"):
         return stripped
     start = stripped.find("{")
-    end = stripped.rfind("}")
-    if start >= 0 and end > start:
-        return stripped[start : end + 1]
+    if start < 0:
+        return None
+    depth = 0
+    in_string = False
+    escape = False
+    for index in range(start, len(stripped)):
+        char = stripped[index]
+        if escape:
+            escape = False
+            continue
+        if char == "\\":
+            escape = True
+            continue
+        if char == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return stripped[start : index + 1]
     return None
 
 

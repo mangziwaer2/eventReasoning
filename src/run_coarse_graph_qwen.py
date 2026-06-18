@@ -49,6 +49,18 @@ def _format_prompt(prompt: str) -> str:
     )
 
 
+def resolve_generation_eos_ids(tokenizer) -> list[int] | int | None:
+    eos_ids: list[int] = []
+    if tokenizer.eos_token_id is not None:
+        eos_ids.append(int(tokenizer.eos_token_id))
+    im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+    if isinstance(im_end_id, int) and im_end_id >= 0 and im_end_id not in eos_ids:
+        eos_ids.append(im_end_id)
+    if not eos_ids:
+        return None
+    return eos_ids if len(eos_ids) > 1 else eos_ids[0]
+
+
 def main() -> None:
     args = parse_args()
     if args.input_mode == "mirai":
@@ -108,10 +120,10 @@ def main() -> None:
             outputs = model.generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                max_new_tokens=96,
+                max_new_tokens=48,
                 do_sample=False,
                 pad_token_id=tokenizer.eos_token_id,
-                eos_token_id=tokenizer.eos_token_id,
+                eos_token_id=resolve_generation_eos_ids(tokenizer),
             )
             generated = tokenizer.decode(outputs[0][input_ids.shape[-1] :], skip_special_tokens=True).strip()
             parsed = parse_pair_payload(generated)

@@ -24,8 +24,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-path", default=str(REPO_ROOT / "models" / "Qwen2.5-0.5B"), help="Local Qwen model directory.")
     parser.add_argument("--train-split", default="train", help="Training split name from the dataset.")
     parser.add_argument("--validation-split", default="valid", help="Validation split name from the dataset.")
-    parser.add_argument("--train-limit", type=int, default=0, help="Maximum number of training rows.")
-    parser.add_argument("--validation-limit", type=int, default=32, help="Maximum number of validation rows.")
+    parser.add_argument("--train-limit", type=int, default=4, help="Maximum number of training rows.")
+    parser.add_argument("--validation-limit", type=int, default=1, help="Maximum number of validation rows.")
     parser.add_argument("--max-train-pairs", type=int, default=0, help="Optional cap after train rows are expanded into event pairs.")
     parser.add_argument("--max-validation-pairs", type=int, default=0, help="Optional cap after validation rows are expanded into event pairs.")
     parser.add_argument("--max-events", type=int, default=16, help="Maximum events kept per source document.")
@@ -33,8 +33,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-sentence-gap", type=int, default=3, help="Maximum sentence gap for candidate pair construction.")
     parser.add_argument("--epochs", type=int, default=40, help="Number of epochs.")
     parser.add_argument("--max-length", type=int, default=1024, help="Maximum token length.")
-    parser.add_argument("--batch-size", type=int, default=4, help="Training batch size.")
-    parser.add_argument("--eval-batch-size", type=int, default=4, help="Validation batch size.")
+    parser.add_argument("--batch-size", type=int, default=1, help="Training batch size.")
+    parser.add_argument("--eval-batch-size", type=int, default=1, help="Validation batch size.")
     parser.add_argument("--tokenize-batch-size", type=int, default=512, help="Batch size used during prompt tokenization.")
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1, help="Gradient accumulation steps.")
     parser.add_argument("--lr", type=float, default=2e-4, help="Learning rate.")
@@ -46,6 +46,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--document-mode", choices=["none", "title", "snippet", "summary", "full"], default="title", help="How much document text to include in the prompt.")
     parser.add_argument("--max-document-chars", type=int, default=240, help="Maximum characters kept per document snippet when document-mode=snippet.")
     parser.add_argument("--output-dir", default=str(REPO_ROOT / "outputs" / "coarse_graph_qwen_lora"), help="Training output directory.")
+    parser.add_argument("--resume-from", default=None, help="Resume from an output dir, adapter dir, or latest_training_state.pt.")
     return parser.parse_args()
 
 
@@ -58,6 +59,132 @@ def log_line(message: str, log_path: Path | None = None) -> None:
     if log_path is not None:
         with log_path.open("a", encoding="utf-8") as log_file:
             log_file.write(message + "\n")
+
+
+def resolve_resume_sources(resume_from: str | None, output_dir: Path) -> tuple[Path | None, Path | None]:
+    if not resume_from:
+        return None, None
+
+    resume_path = resolve_repo_path(resume_from)
+    state_path: Path | None = None
+    adapter_path: Path | None = None
+
+    if resume_path.is_dir():
+        latest_state = resume_path / "latest_training_state.pt"
+        if latest_state.exists():
+            state_path = latest_state
+        latest_adapter = resume_path / "latest_adapter"
+        best_adapter = resume_path / "best_adapter"
+        if latest_adapter.exists():
+            adapter_path = latest_adapter
+        elif (resume_path / "adapter_config.json").exists():
+            adapter_path = resume_path
+        elif best_adapter.exists():
+            adapter_path = best_adapter
+    elif resume_path.is_file():
+        if resume_path.suffix.lower() in {".pt", ".pth"}:
+            state_path = resume_path
+            sibling_adapter = resume_path.parent / ("best_adapter" if "best" in resume_path.stem else "latest_adapter")
+            if sibling_adapter.exists():
+                adapter_path = sibling_adapter
+        elif resume_path.name == "adapter_config.json":
+            adapter_path = resume_path.parent
+
+    if adapter_path is None:
+        fallback_adapter = output_dir / "latest_adapter"
+        if fallback_adapter.exists():
+            adapter_path = fallback_adapter
+
+    if adapter_path is None:
+        raise FileNotFoundError(
+            f"Could not find a LoRA adapter to resume from. "
+            f"Checked resume_from={resume_path} and output_dir={output_dir}."
+        )
+    return state_path, adapter_path
+
+
+def load_json_if_exists(path: Path, default: Any) -> Any:
+    if not path.exists():
+        return default
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def load_torch_checkpoint(path: Path, torch, device):
+    try:
+        return torch.load(path, map_location=device, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=device)
+
+
+def save_training_state(
+    path: Path,
+    optimizer,
+    args: argparse.Namespace,
+    history: list[dict[str, float]],
+    epoch: int,
+    global_step: int,
+    best_val_loss: float,
+    adapter_path: Path,
+    torch,
+) -> None:
+    torch.save(
+        {
+            "epoch": epoch,
+            "global_step": global_step,
+            "best_val_loss": best_val_loss,
+            "optimizer_state_dict": optimizer.state_dict(),
+            "history": history,
+            "config": vars(args),
+            "adapter_path": str(adapter_path),
+        },
+        path,
+    )
+
+
+def infer_resume_progress(
+    output_dir: Path,
+    state_path: Path | None,
+    optimizer,
+    torch,
+    device,
+    log_path: Path | None,
+) -> tuple[int, int, float, list[dict[str, float]]]:
+    history: list[dict[str, float]] = []
+    global_step = 0
+    best_val_loss = float("inf")
+    start_epoch = 0
+
+    if state_path is not None and state_path.exists():
+        checkpoint = load_torch_checkpoint(state_path, torch, device)
+        if checkpoint.get("optimizer_state_dict") is not None:
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        history = list(checkpoint.get("history", []))
+        start_epoch = int(checkpoint.get("epoch", len(history)))
+        global_step = int(checkpoint.get("global_step", 0))
+        best_val_loss = float(checkpoint.get("best_val_loss", float("inf")))
+        log_line(
+            f"resumed training state from {state_path} | start_epoch={start_epoch} | global_step={global_step}",
+            log_path,
+        )
+    else:
+        loaded_history = load_json_if_exists(output_dir / "train_history.json", [])
+        if isinstance(loaded_history, list):
+            history = loaded_history
+        start_epoch = len(history)
+        if history:
+            global_step = int(history[-1].get("optimizer_steps", 0))
+            best_val_loss = min(float(item.get("val_loss", item.get("loss", float("inf")))) for item in history)
+            log_line(
+                "resumed from adapter without optimizer state"
+                f" | inferred_start_epoch={start_epoch}"
+                f" | inferred_global_step={global_step}"
+                f" | best_val_loss={best_val_loss:.4f}",
+                log_path,
+            )
+
+    if best_val_loss == float("inf") and history:
+        best_val_loss = min(float(item.get("val_loss", item.get("loss", float("inf")))) for item in history)
+    return start_epoch, global_step, best_val_loss, history
 
 
 def summarize_pair_samples(samples: list[EventPairSample]) -> dict[str, Any]:
@@ -127,6 +254,18 @@ def _format_prompt_only(prompt: str) -> str:
 
 def _format_target(target: str) -> str:
     return f"{target}<|im_end|>"
+
+
+def resolve_generation_eos_ids(tokenizer) -> list[int] | int | None:
+    eos_ids: list[int] = []
+    if tokenizer.eos_token_id is not None:
+        eos_ids.append(int(tokenizer.eos_token_id))
+    im_end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+    if isinstance(im_end_id, int) and im_end_id >= 0 and im_end_id not in eos_ids:
+        eos_ids.append(im_end_id)
+    if not eos_ids:
+        return None
+    return eos_ids if len(eos_ids) > 1 else eos_ids[0]
 
 
 @dataclass(slots=True)
@@ -326,10 +465,10 @@ def print_debug_samples(
             outputs = model.generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                max_new_tokens=96,
+                max_new_tokens=48,
                 do_sample=False,
                 pad_token_id=tokenizer.eos_token_id,
-                eos_token_id=tokenizer.eos_token_id,
+                eos_token_id=resolve_generation_eos_ids(tokenizer),
             )
             prediction = tokenizer.decode(outputs[0][input_ids.shape[-1] :], skip_special_tokens=True).strip()
             parsed = parse_pair_payload(prediction)
@@ -369,8 +508,10 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     random.seed(args.seed)
     progress_enabled = not args.no_progress
+    resume_state_path, resume_adapter_path = resolve_resume_sources(args.resume_from, output_dir)
+    is_resuming = resume_adapter_path is not None
     training_log_path = output_dir / "training.log"
-    if training_log_path.exists():
+    if training_log_path.exists() and not is_resuming:
         training_log_path.unlink()
 
     log_line(
@@ -416,8 +557,17 @@ def main() -> None:
     )
 
     try:
-        log_line(f"loading Qwen LoRA model from {resolve_repo_path(args.model_path)}", training_log_path)
-        model, tokenizer, torch = load_qwen_with_lora(resolve_repo_path(args.model_path))
+        if resume_adapter_path is not None:
+            log_line(
+                f"loading Qwen LoRA model from {resolve_repo_path(args.model_path)} with adapter {resume_adapter_path}",
+                training_log_path,
+            )
+        else:
+            log_line(f"loading Qwen LoRA model from {resolve_repo_path(args.model_path)}", training_log_path)
+        model, tokenizer, torch = load_qwen_with_lora(
+            resolve_repo_path(args.model_path),
+            adapter_path=resume_adapter_path,
+        )
     except LoraUnavailable as exc:
         log_line(json.dumps({"error": str(exc)}, ensure_ascii=False), training_log_path)
         return
@@ -450,15 +600,25 @@ def main() -> None:
         )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    start_epoch = 0
     history: list[dict[str, float]] = []
     global_step = 0
     best_val_loss = float("inf")
+    if is_resuming:
+        start_epoch, global_step, best_val_loss, history = infer_resume_progress(
+            output_dir=output_dir,
+            state_path=resume_state_path,
+            optimizer=optimizer,
+            torch=torch,
+            device=device,
+            log_path=training_log_path,
+        )
     train_started = time.time()
     debug_jsonl_path = output_dir / "debug_predictions.jsonl"
     debug_readable_path = output_dir / "debug_readable.log"
-    if debug_jsonl_path.exists():
+    if debug_jsonl_path.exists() and start_epoch == 0:
         debug_jsonl_path.unlink()
-    if debug_readable_path.exists():
+    if debug_readable_path.exists() and start_epoch == 0:
         debug_readable_path.unlink()
 
     train_config = {
@@ -467,6 +627,10 @@ def main() -> None:
         "validation_stats": validation_stats,
         "original_train_pair_count": original_train_pair_count,
         "original_validation_pair_count": original_validation_pair_count,
+        "resume_from": str(resolve_repo_path(args.resume_from)) if args.resume_from else None,
+        "resume_state_path": str(resume_state_path) if resume_state_path else None,
+        "resume_adapter_path": str(resume_adapter_path) if resume_adapter_path else None,
+        "start_epoch": start_epoch,
         "task": "qwen_event_pair_to_coarse_graph",
     }
     save_json(output_dir / "train_config.json", train_config)
@@ -487,8 +651,13 @@ def main() -> None:
     )
     log_line(f"train_relation_counts={json.dumps(train_stats['relation_counts'], ensure_ascii=False)}", training_log_path)
     log_line(f"val_relation_counts={json.dumps(validation_stats['relation_counts'], ensure_ascii=False)}", training_log_path)
+    if start_epoch >= args.epochs:
+        log_line(
+            f"resume start_epoch={start_epoch} is already >= epochs={args.epochs}; no remaining epochs to train.",
+            training_log_path,
+        )
 
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         epoch_started = time.time()
         model.train()
         optimizer.zero_grad(set_to_none=True)
@@ -564,10 +733,34 @@ def main() -> None:
         is_best = val_loss < best_val_loss
         if is_best:
             best_val_loss = val_loss
-            model.save_pretrained(output_dir / "best_adapter")
-            tokenizer.save_pretrained(output_dir / "best_adapter")
-        model.save_pretrained(output_dir / "latest_adapter")
-        tokenizer.save_pretrained(output_dir / "latest_adapter")
+            best_adapter_dir = output_dir / "best_adapter"
+            model.save_pretrained(best_adapter_dir)
+            tokenizer.save_pretrained(best_adapter_dir)
+            save_training_state(
+                output_dir / "best_training_state.pt",
+                optimizer=optimizer,
+                args=args,
+                history=history,
+                epoch=epoch + 1,
+                global_step=global_step,
+                best_val_loss=best_val_loss,
+                adapter_path=best_adapter_dir,
+                torch=torch,
+            )
+        latest_adapter_dir = output_dir / "latest_adapter"
+        model.save_pretrained(latest_adapter_dir)
+        tokenizer.save_pretrained(latest_adapter_dir)
+        save_training_state(
+            output_dir / "latest_training_state.pt",
+            optimizer=optimizer,
+            args=args,
+            history=history,
+            epoch=epoch + 1,
+            global_step=global_step,
+            best_val_loss=best_val_loss,
+            adapter_path=latest_adapter_dir,
+            torch=torch,
+        )
         save_json(output_dir / "train_history.json", history)
 
         log_line(
