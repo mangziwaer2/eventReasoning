@@ -43,7 +43,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-sentence-gap", type=int, default=3, help="Maximum same-document sentence gap for coarse candidate pairs.")
     parser.add_argument("--max-pairs", type=int, default=64, help="Maximum coarse candidate pairs per document. Use 0 for all generated candidates.")
     parser.add_argument("--coarse-keep-threshold", type=float, default=0.5, help="Minimum coarse relation score to keep an edge.")
-    parser.add_argument("--coarse-batch-size", type=int, default=8, help="Batch size for Qwen generation during evaluation.")
+    parser.add_argument("--coarse-batch-size", type=int, default=1, help="Batch size for Qwen generation during evaluation.")
     parser.add_argument("--coarse-max-length", type=int, default=1024, help="Maximum coarse prompt length.")
     parser.add_argument("--coarse-max-new-tokens", type=int, default=48, help="Maximum generated tokens for coarse JSON.")
     parser.add_argument("--include-query", action="store_true", help="Include query title in coarse Qwen prompts.")
