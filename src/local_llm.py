@@ -137,6 +137,8 @@ class LocalQwenGenerator:
         self._torch = torch
         self.max_new_tokens = max_new_tokens
         self.tokenizer = auto_tokenizer_cls.from_pretrained(model_path, trust_remote_code=False)
+        if self.tokenizer.pad_token_id is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
         self.model = auto_model_cls.from_pretrained(model_path, trust_remote_code=False)
 
         if torch.cuda.is_available():
@@ -146,10 +148,20 @@ class LocalQwenGenerator:
             self.device = "cpu"
         self.model.eval()
 
-    def generate(self, prompt: str, temperature: float = 0.2) -> str:
+    def generate(
+        self,
+        prompt: str,
+        temperature: float = 0.2,
+        system_prompt: str | None = None,
+        max_new_tokens: int | None = None,
+    ) -> str:
         if hasattr(self.tokenizer, "apply_chat_template") and getattr(self.tokenizer, "chat_template", None):
             messages = [
-                {"role": "system", "content": "You forecast events from a local causal graph and must follow JSON output exactly."},
+                {
+                    "role": "system",
+                    "content": system_prompt
+                    or "You forecast events from a local causal graph and must follow JSON output exactly.",
+                },
                 {"role": "user", "content": prompt},
             ]
             input_ids = self.tokenizer.apply_chat_template(
@@ -167,7 +179,7 @@ class LocalQwenGenerator:
             outputs = self.model.generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                max_new_tokens=self.max_new_tokens,
+                max_new_tokens=max_new_tokens or self.max_new_tokens,
                 do_sample=temperature > 0,
                 temperature=temperature if temperature > 0 else None,
                 pad_token_id=self.tokenizer.eos_token_id,
