@@ -53,24 +53,15 @@ class PipelineTrajectory:
 
 
 class PipelinePolicy:
-    """Interface for future reinforcement learning over the full local pipeline."""
+    """Interface for future RL over graph construction with fixed event inputs and forecaster."""
 
     name = "base"
-
-    def build_event_extraction_prompt(self, default_prompt: str, observation: dict[str, Any]) -> str:
-        return default_prompt
-
-    def select_event_limit(self, default_limit: int, observation: dict[str, Any]) -> int:
-        return default_limit
 
     def select_coarse_threshold(self, default_threshold: float, observation: dict[str, Any]) -> float:
         return default_threshold
 
     def select_refinement_threshold(self, default_threshold: float, observation: dict[str, Any]) -> float:
         return default_threshold
-
-    def build_forecast_prompt(self, default_prompt: str, observation: dict[str, Any]) -> str:
-        return default_prompt
 
     def compute_reward(self, prediction: dict[str, Any], gold: dict[str, Any], trajectory: PipelineTrajectory) -> float:
         return 0.0

@@ -1,0 +1,48 @@
+{
+  "schema_version": "event-input-v1",
+  "sample_id": "example_001",
+  "query_id": "example_001",
+  "query": {
+    "query_id": "example_001",
+    "text": "What important event may happen next between Country A and Country B?",
+    "cutoff_time": "2025-01-31",
+    "focus_entities": ["Country A", "Country B"],
+    "metadata": {}
+  },
+  "documents": [
+    {
+      "document_id": "doc_001",
+      "title": "Country A imposes new restrictions",
+      "text": "Country A imposed new trade restrictions. Country B announced retaliatory measures.",
+      "publish_time": "2025-01-30",
+      "source": "example",
+      "metadata": {}
+    }
+  ],
+  "events": [
+    {
+      "event_id": "e1",
+      "trigger": "imposed",
+      "mention": "Country A imposed new trade restrictions",
+      "participants": ["Country A"],
+      "document_id": "doc_001",
+      "sentence_index": 0,
+      "confidence": 1.0,
+      "evidence": "Country A imposed new trade restrictions."
+    },
+    {
+      "event_id": "e2",
+      "trigger": "announced",
+      "mention": "Country B announced retaliatory measures",
+      "participants": ["Country B"],
+      "document_id": "doc_001",
+      "sentence_index": 1,
+      "confidence": 1.0,
+      "evidence": "Country B announced retaliatory measures."
+    }
+  ],
+  "metadata": {
+    "event_source": "gold_or_frozen_external_extractor",
+    "extractor_name": "replace-with-actual-name"
+  }
+}

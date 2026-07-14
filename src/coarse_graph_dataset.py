@@ -19,6 +19,8 @@ from causal_graph import QuerySpec
 from event_extraction import extract_titlecase_entities
 from event_extraction import format_event_mention
 from event_extraction import lexical_overlap
+from event_input import materialize_event_input
+from event_input import select_event_input_record
 from mirai_dataset import export_mirai_query_snapshot
 from mirai_dataset import get_mirai_query_by_id
 from mirai_dataset import load_mirai_news_for_docids
@@ -626,6 +628,50 @@ def load_jsonl_document_graph_sample(
         max_events_per_doc=max_events_per_doc,
         max_events=max_events,
         metadata={"dataset": "jsonl"},
+    )
+
+
+def load_preextracted_document_graph_sample(
+    input_path: Path,
+    query_id: str | None = None,
+    dataset_path: Path | None = None,
+    split: str = "test",
+    max_docs: int = 6,
+    max_events: int | None = None,
+) -> DocumentGraphSample:
+    record = select_event_input_record(input_path, query_id=query_id)
+    fallback_query: QuerySpec | None = None
+    fallback_documents: list[NewsDocument] | None = None
+    if record.query is None or not record.documents:
+        if dataset_path is None:
+            raise ValueError(
+                "The pre-extracted event record must embed query and documents, "
+                "or a MIRAI dataset path must be provided as context."
+            )
+        example = get_mirai_query_by_id(dataset_path, query_id=record.query_id, split=split)
+        fallback_query = example.build_query_spec()
+        fallback_documents = load_mirai_news_for_docids(dataset_path, example.docids)[:max_docs]
+
+    active_query = fallback_query or record.query
+    active_documents = fallback_documents if fallback_documents is not None else record.documents[:max_docs]
+    query, documents, events = materialize_event_input(
+        record,
+        query=active_query,
+        documents=active_documents,
+        max_events=max_events,
+    )
+    return DocumentGraphSample(
+        sample_id=record.sample_id,
+        query=query,
+        documents=documents,
+        events=events,
+        gold_graph=None,
+        metadata={
+            **record.metadata,
+            "event_source": "precomputed",
+            "event_input_schema": record.schema_version,
+            "query_id": record.query_id,
+        },
     )
 
 

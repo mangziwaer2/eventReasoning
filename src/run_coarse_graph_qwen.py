@@ -8,6 +8,7 @@ from coarse_graph_dataset import build_event_pair_inference_samples
 from coarse_graph_dataset import build_graph_from_pair_predictions
 from coarse_graph_dataset import load_jsonl_document_graph_sample
 from coarse_graph_dataset import load_mirai_document_graph_sample
+from coarse_graph_dataset import load_preextracted_document_graph_sample
 from coarse_graph_dataset import parse_pair_payload
 from local_qwen_lora import LoraUnavailable
 from local_qwen_lora import load_trained_qwen_lora
@@ -17,14 +18,14 @@ from path_utils import resolve_repo_path
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run Qwen LoRA event-pair relation classification and assemble a coarse graph.")
-    parser.add_argument("--input-mode", choices=["mirai", "jsonl"], default="mirai", help="Input source.")
+    parser.add_argument("--input-mode", choices=["events", "mirai", "jsonl"], default="mirai", help="Input source. Use events to skip event extraction.")
     parser.add_argument("--dataset", default=str(REPO_ROOT / "datasets" / "MIRAI_data.zip"), help="Path to MIRAI zip file when input-mode=mirai.")
-    parser.add_argument("--query-id", default="1", help="MIRAI QueryId when input-mode=mirai.")
+    parser.add_argument("--query-id", default=None, help="MIRAI QueryId, or a record selector for a multi-record event input.")
     parser.add_argument("--split", default="test", help="MIRAI split name.")
-    parser.add_argument("--input", default=None, help="Path to news JSONL file when input-mode=jsonl.")
+    parser.add_argument("--input", default=None, help="Path to event-input-v1 JSON/JSONL or news JSONL, depending on input-mode.")
     parser.add_argument("--query", default=None, help="Query text when input-mode=jsonl.")
     parser.add_argument("--cutoff", default=None, help="Cutoff time when input-mode=jsonl.")
-    parser.add_argument("--event-extractor", default="rule", help="Event extractor backend name.")
+    parser.add_argument("--event-extractor", default="rule", help="Event extractor backend for mirai/jsonl modes only.")
     parser.add_argument("--max-docs", type=int, default=6, help="Maximum retrieved documents.")
     parser.add_argument("--max-events-per-doc", type=int, default=6, help="Maximum events kept per document.")
     parser.add_argument("--max-events", type=int, default=12, help="Maximum total events passed to pair classification.")
@@ -66,14 +67,14 @@ def main() -> None:
     if args.input_mode == "mirai":
         document_sample = load_mirai_document_graph_sample(
             dataset_path=resolve_repo_path(args.dataset),
-            query_id=args.query_id,
+            query_id=args.query_id or "1",
             split=args.split,
             event_extractor_name=args.event_extractor,
             max_docs=args.max_docs,
             max_events_per_doc=args.max_events_per_doc,
             max_events=args.max_events,
         )
-    else:
+    elif args.input_mode == "jsonl":
         if not args.input or not args.query:
             raise ValueError("--input and --query are required when --input-mode=jsonl")
         document_sample = load_jsonl_document_graph_sample(
@@ -83,6 +84,17 @@ def main() -> None:
             event_extractor_name=args.event_extractor,
             max_docs=args.max_docs,
             max_events_per_doc=args.max_events_per_doc,
+            max_events=args.max_events,
+        )
+    else:
+        if not args.input:
+            raise ValueError("--input is required when --input-mode=events")
+        document_sample = load_preextracted_document_graph_sample(
+            input_path=resolve_repo_path(args.input),
+            query_id=args.query_id,
+            dataset_path=resolve_repo_path(args.dataset),
+            split=args.split,
+            max_docs=args.max_docs,
             max_events=args.max_events,
         )
 

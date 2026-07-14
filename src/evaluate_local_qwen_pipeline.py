@@ -18,6 +18,9 @@ from coarse_graph_dataset import parse_pair_payload
 from event_extraction import format_event_mention
 from event_extraction import normalize_text
 from event_extraction import split_sentences
+from event_input import EventInputValidationError
+from event_input import load_event_input_index
+from event_input import materialize_event_input
 from local_llm import LocalGenerationUnavailable
 from local_llm import LocalQwenGenerator
 from local_qwen_lora import LoraUnavailable
@@ -39,9 +42,9 @@ from run_refinement import load_model_state
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Local no-API evaluation: native Qwen extracts events from MIRAI documents, "
-            "Qwen LoRA builds the coarse graph, refinement produces a causal graph, "
-            "and native Qwen forecasts the future event."
+            "Local no-API evaluation: pre-extracted events or an optional frozen Qwen extractor "
+            "provide event nodes, Qwen LoRA builds the coarse graph, refinement produces a causal graph, "
+            "and native Qwen forecasts future events."
         )
     )
     parser.add_argument("--dataset", default=str(REPO_ROOT / "datasets" / "MIRAI_data.zip"), help="Path to MIRAI_data.zip.")
@@ -49,14 +52,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=8, help="Maximum query examples. Use 0 for the full split.")
     parser.add_argument("--query-id", default=None, help="Optional single MIRAI QueryId.")
 
-    parser.add_argument("--model-path", default=str(REPO_ROOT / "models" / "Qwen2.5-0.5B"), help="Native local Qwen model path for event extraction and forecasting.")
+    parser.add_argument("--model-path", default=str(REPO_ROOT / "models" / "Qwen2.5-0.5B"), help="Native local Qwen model path for forecasting and optional event extraction.")
     parser.add_argument("--coarse-base-model-path", default=None, help="Base Qwen model for the coarse LoRA adapter. Defaults to --model-path.")
     parser.add_argument("--coarse-adapter-path", default=str(REPO_ROOT / "outputs" / "coarse_graph_qwen_lora_4090_full" / "best_adapter"), help="Coarse graph Qwen LoRA adapter path.")
     parser.add_argument("--refinement-model-path", default=str(REPO_ROOT / "outputs" / "refinement_graph_4090_full" / "refinement_model.pt"), help="Refinement model path.")
 
-    parser.add_argument("--max-docs", type=int, default=4, help="Maximum dataset documents passed to native Qwen.")
-    parser.add_argument("--max-document-chars", type=int, default=900, help="Maximum characters kept per document in the extraction prompt.")
-    parser.add_argument("--max-events", type=int, default=16, help="Maximum events kept after Qwen extraction.")
+    parser.add_argument("--event-source", choices=["precomputed", "qwen"], default="precomputed", help="Event input source. precomputed is the research setting; qwen is an optional frozen-extractor baseline.")
+    parser.add_argument("--precomputed-events", default=None, help="event-input-v1 JSON/JSONL path required when event-source=precomputed.")
+    parser.add_argument("--max-docs", type=int, default=4, help="Maximum MIRAI documents used as authoritative context.")
+    parser.add_argument("--max-document-chars", type=int, default=900, help="Maximum characters per document in the optional Qwen extraction prompt.")
+    parser.add_argument("--max-events", type=int, default=16, help="Maximum pre-extracted or Qwen-extracted events kept per query.")
     parser.add_argument("--event-extraction-temperature", type=float, default=0.0, help="Native Qwen temperature for event extraction.")
     parser.add_argument("--event-extraction-max-new-tokens", type=int, default=768, help="Maximum native Qwen tokens for event extraction JSON.")
 
@@ -262,7 +267,13 @@ def parse_qwen_events(raw_response: str, query, documents, max_events: int) -> t
     return events, metadata
 
 
-def build_document_sample_from_qwen_events(example, query, documents, events: list[EventNode]) -> DocumentGraphSample:
+def build_document_sample_from_events(
+    example,
+    query,
+    documents,
+    events: list[EventNode],
+    event_source: str,
+) -> DocumentGraphSample:
     return DocumentGraphSample(
         sample_id=f"mirai_{example.query_id}",
         query=query,
@@ -272,7 +283,7 @@ def build_document_sample_from_qwen_events(example, query, documents, events: li
         metadata={
             "dataset": "MIRAI",
             "query_id": example.query_id,
-            "native_qwen_event_extraction": True,
+            "event_source": event_source,
         },
     )
 
@@ -505,6 +516,20 @@ def main() -> None:
     if not examples:
         raise RuntimeError(f"No MIRAI examples found for split={args.split!r}, query_id={args.query_id!r}.")
 
+    precomputed_event_index = {}
+    precomputed_events_path: Path | None = None
+    if args.event_source == "precomputed":
+        if not args.precomputed_events:
+            raise EventInputValidationError("--precomputed-events is required when --event-source=precomputed")
+        precomputed_events_path = resolve_repo_path(args.precomputed_events)
+        precomputed_event_index = load_event_input_index(precomputed_events_path)
+        missing_query_ids = [example.query_id for example in examples if example.query_id not in precomputed_event_index]
+        if missing_query_ids:
+            preview = missing_query_ids[:10]
+            raise EventInputValidationError(
+                f"Precomputed event input is missing {len(missing_query_ids)} requested MIRAI query ids; preview={preview}."
+            )
+
     policy = build_pipeline_policy(args.policy)
     native_qwen = LocalQwenGenerator(resolve_repo_path(args.model_path), max_new_tokens=max(args.event_extraction_max_new_tokens, args.forecast_max_new_tokens))
     try:
@@ -527,6 +552,7 @@ def main() -> None:
                 "local qwen pipeline eval",
                 f"split={args.split}",
                 f"samples={len(examples)}",
+                f"event_source={args.event_source}",
                 f"native_device={native_qwen.device}",
                 f"coarse_device={device}",
             ]
@@ -547,39 +573,68 @@ def main() -> None:
                 },
             )
 
-            extraction_prompt = build_event_extraction_prompt(
-                query_text=query.text,
-                documents=documents,
-                max_document_chars=args.max_document_chars,
-                max_events=args.max_events,
-            )
-            extraction_prompt = policy.build_event_extraction_prompt(
-                extraction_prompt,
-                {
-                    "query": query.to_dict(),
-                    "document_count": len(documents),
+            if args.event_source == "precomputed":
+                record = precomputed_event_index[example.query_id]
+                _, _, events = materialize_event_input(
+                    record,
+                    query=query,
+                    documents=documents,
+                    max_events=args.max_events,
+                )
+                event_input_metadata = {
+                    "source": "precomputed",
+                    "valid": True,
+                    "parsed_json": True,
+                    "schema_version": record.schema_version,
+                    "raw_event_count": len(record.events),
+                    "event_count": len(events),
+                    "extractor_name": record.metadata.get("extractor_name"),
+                }
+                event_input_action = {
+                    "source": "precomputed",
+                    "event_input_path": str(precomputed_events_path),
                     "max_events": args.max_events,
-                },
-            )
-            raw_event_response = native_qwen.generate(
-                extraction_prompt,
-                temperature=args.event_extraction_temperature,
-                system_prompt="You extract structured event mentions and return strict JSON only.",
-                max_new_tokens=args.event_extraction_max_new_tokens,
-            )
-            events, event_parse_metadata = parse_qwen_events(raw_event_response, query, documents, args.max_events)
-            trajectory.add_step(
-                "event_extraction",
-                observation={"document_count": len(documents), "query": query.text},
-                action={"prompt_chars": len(extraction_prompt), "max_events": args.max_events},
-                metadata={
+                }
+            else:
+                extraction_prompt = build_event_extraction_prompt(
+                    query_text=query.text,
+                    documents=documents,
+                    max_document_chars=args.max_document_chars,
+                    max_events=args.max_events,
+                )
+                raw_event_response = native_qwen.generate(
+                    extraction_prompt,
+                    temperature=args.event_extraction_temperature,
+                    system_prompt="You extract structured event mentions and return strict JSON only.",
+                    max_new_tokens=args.event_extraction_max_new_tokens,
+                )
+                events, event_parse_metadata = parse_qwen_events(raw_event_response, query, documents, args.max_events)
+                event_input_metadata = {
                     **event_parse_metadata,
+                    "source": "qwen",
+                    "valid": bool(event_parse_metadata.get("parsed_json")) and len(events) >= 2,
                     "event_count": len(events),
                     "raw_response": raw_event_response,
-                },
+                }
+                event_input_action = {
+                    "source": "qwen",
+                    "prompt_chars": len(extraction_prompt),
+                    "max_events": args.max_events,
+                }
+            trajectory.add_step(
+                "event_input",
+                observation={"document_count": len(documents), "query": query.text},
+                action=event_input_action,
+                metadata=event_input_metadata,
             )
 
-            document_sample = build_document_sample_from_qwen_events(example, query, documents, events)
+            document_sample = build_document_sample_from_events(
+                example,
+                query,
+                documents,
+                events,
+                event_source=args.event_source,
+            )
             pair_samples = build_event_pair_inference_samples(
                 sample=document_sample,
                 max_sentence_gap=args.max_sentence_gap,
@@ -631,14 +686,6 @@ def main() -> None:
             )
 
             forecast_prompt = render_refined_graph_prompt(example, query, refined_graph, args)
-            forecast_prompt = policy.build_forecast_prompt(
-                forecast_prompt,
-                {
-                    "query": query.to_dict(),
-                    "event_count": len(refined_graph.events),
-                    "edge_count": len(refined_graph.edges),
-                },
-            )
             raw_forecast = native_qwen.generate(
                 forecast_prompt,
                 temperature=args.forecast_temperature,
@@ -661,10 +708,7 @@ def main() -> None:
                 "query_id": example.query_id,
                 "mirai_query": json.loads(export_mirai_query_snapshot(example)),
                 "document_count": len(documents),
-                "event_extraction": {
-                    **event_parse_metadata,
-                    "event_count": len(events),
-                },
+                "event_input": event_input_metadata,
                 "coarse": {
                     "candidate_pairs": len(pair_samples),
                     "parse_rate": safe_div(sum(1 for item in pair_predictions if item is not None), len(pair_predictions)),
@@ -706,10 +750,16 @@ def main() -> None:
             "coarse_base_model_path": str(resolve_repo_path(args.coarse_base_model_path)) if args.coarse_base_model_path else str(resolve_repo_path(args.model_path)),
             "coarse_adapter_path": str(resolve_repo_path(args.coarse_adapter_path)),
             "refinement_model_path": str(resolve_repo_path(args.refinement_model_path)),
+            "precomputed_events": str(precomputed_events_path) if precomputed_events_path is not None else None,
             "policy": policy.name,
         },
         "samples": len(rows),
-        "event_extraction_parse_rate": safe_div(sum(1 for row in rows if row["event_extraction"]["parsed_json"]), len(rows)),
+        "event_input_success_rate": safe_div(sum(1 for row in rows if row["event_input"]["valid"]), len(rows)),
+        "event_extraction_parse_rate": (
+            safe_div(sum(1 for row in rows if row["event_input"]["parsed_json"]), len(rows))
+            if args.event_source == "qwen"
+            else None
+        ),
         "forecast_parse_rate": safe_div(sum(1 for row in rows if row["forecast_prediction"]["parsed_json"]), len(rows)),
         "code_hit_rate": safe_div(sum(1 for row in rows if row["score"]["code_hit"]), len(rows)),
         "code_hit_with_alternatives_rate": safe_div(
@@ -717,7 +767,7 @@ def main() -> None:
             len(rows),
         ),
         "average_reward": safe_div(sum(float(row["reward"]) for row in rows), len(rows)),
-        "average_event_count": safe_div(sum(int(row["event_extraction"]["event_count"]) for row in rows), len(rows)),
+        "average_event_count": safe_div(sum(int(row["event_input"]["event_count"]) for row in rows), len(rows)),
         "average_coarse_edge_count": safe_div(sum(int(row["coarse"]["edge_count"]) for row in rows), len(rows)),
         "average_refined_edge_count": safe_div(sum(int(row["refinement"]["edge_count"]) for row in rows), len(rows)),
         "outputs": {
@@ -743,5 +793,5 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
-    except LocalGenerationUnavailable as exc:
+    except (LocalGenerationUnavailable, EventInputValidationError) as exc:
         print(json.dumps({"error": str(exc)}, ensure_ascii=False))
