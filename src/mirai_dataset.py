@@ -102,10 +102,10 @@ def _parse_literal_dict(raw_value: str) -> dict[str, int]:
     return {}
 
 
-def load_mirai_queries(zip_path: Path, split: str = "test", limit: int | None = None) -> list[MiraiQueryExample]:
+def load_mirai_queries(zip_path: Path, split: str = "test", limit: int = 0) -> list[MiraiQueryExample]:
     member_name = f"MIRAI/{split}/relation_query.csv"
     rows = _read_tsv_rows(zip_path, member_name)
-    if limit is not None:
+    if limit >0:
         rows = rows[:limit]
 
     examples: list[MiraiQueryExample] = []
