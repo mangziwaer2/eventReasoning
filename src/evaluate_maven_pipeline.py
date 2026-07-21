@@ -34,7 +34,7 @@ def parse_args() -> argparse.Namespace:
         description="Evaluate MAVEN coarse Qwen generation and refinement metrics end to end.",
     )
     parser.add_argument("--dataset", default=str(REPO_ROOT / "datasets" / "MAVEN_ERE.zip"), help="Path to MAVEN-ERE zip file.")
-    parser.add_argument("--split", default="test", help="MAVEN split name: test, valid, train, etc.")
+    parser.add_argument("--split", default="valid", help="MAVEN split name: test, valid, train, etc.")
     parser.add_argument("--limit", type=int, default=0, help="Maximum MAVEN rows. Use 0 for full split.")
     parser.add_argument("--max-events", type=int, default=16, help="Maximum events kept per document graph.")
 

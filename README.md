@@ -148,6 +148,30 @@ python src/evaluate_local_qwen_pipeline.py \
 
 当前端到端入口已打通，但论文所需的 documents-only、events-only、coarse、refined、shuffled 和 oracle 对照仍需按 [项目书](docs/项目书.md) 的路线补齐。
 
+## Qwen3 ?????
+
+Qwen3-4B-Thinking ?????
+
+```bash
+python src/chat_qwen3_thinking.py \
+  --model-path models/Qwen3-4B-Thinking-2507 \
+  --show-thinking
+```
+
+?? MAVEN gold events ????????????????
+
+```bash
+python src/evaluate_qwen3_coarse_graph.py \
+  --model-path models/Qwen3-4B-Thinking-2507 \
+  --split valid \
+  --limit 10 \
+  --gold-scope causal \
+  --output-dir outputs/qwen3_zero_shot_coarse_valid10
+```
+
+????? [Qwen3 ?????](docs/qwen3?????.md)?
+
+
 ## 当前结论
 
 - 已完成：严格预抽取事件输入、Qwen 粗图训练/续训、整图 refinement、MAVEN 评测入口、本地 Qwen 未来预测入口。

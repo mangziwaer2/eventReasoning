@@ -8,6 +8,7 @@
 
 - [训练操作手册](训练操作手册.md)：本地检查、云端训练、续训和评测命令。
 - [事件输入规范](事件输入规范.md)：`event-input-v1`、Gold-event/Frozen-extractor 设置和防泄漏要求。
+- [Qwen3 ?????](qwen3?????.md)?Thinking ???????????????
 - [Coarse Graph Qwen Training](coarse_graph_qwen_training.md)：粗图 Qwen LoRA 的数据与日志说明。
 
 ## 模型细节

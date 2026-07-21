@@ -1,5 +1,6 @@
 # Core runtime
-transformers
+transformers>=4.51.0
+accelerate
 safetensors
 peft
 tqdm
