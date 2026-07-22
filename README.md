@@ -148,32 +148,23 @@ python src/evaluate_local_qwen_pipeline.py \
 
 当前端到端入口已打通，但论文所需的 documents-only、events-only、coarse、refined、shuffled 和 oracle 对照仍需按 [项目书](docs/项目书.md) 的路线补齐。
 
-## Qwen3 ?????
+## Forecast Trace 主线
 
-Qwen3-4B-Thinking ?????
+当前主线不是直接让 LLM 开放生成未来事件，而是：
 
-```bash
-python src/chat_qwen3_thinking.py \
-  --model-path models/Qwen3-4B-Thinking-2507 \
-  --show-thinking
+```text
+query + cutoff 前文档 + 严格事件节点
+-> coarse graph
+-> refined graph
+-> forecast_trace
+-> closed-set final_answer
 ```
 
-?? MAVEN gold events ????????????????
+`forecast_trace` 预测 `t` 时刻之前可能发生的中间事件，并回指 refined graph 中的历史事件与边；`final_answer` 从候选集合中选择 `t` 时刻事件，用于稳定计算 Accuracy/F1/Hit@K。
 
-```bash
-python src/evaluate_qwen3_coarse_graph.py \
-  --model-path models/Qwen3-4B-Thinking-2507 \
-  --split valid \
-  --limit 10 \
-  --gold-scope causal \
-  --output-dir outputs/qwen3_zero_shot_coarse_valid10
-```
-
-????? [Qwen3 ?????](docs/qwen3?????.md)?
-
-
+具体流程、样本级输入输出、训练方法、RL 奖励和评测指标见 [Forecast Trace Pipeline](docs/forecast_trace_pipeline.md)。
 ## 当前结论
 
 - 已完成：严格预抽取事件输入、Qwen 粗图训练/续训、整图 refinement、MAVEN 评测入口、本地 Qwen 未来预测入口。
-- 尚未证明：refined graph 能显著提升 MIRAI 未来事件预测。
-- 下一步 P0：运行现有 checkpoint 的完整图指标，并把 refinement 训练数据改为真实 out-of-fold coarse predictions。
+- 尚未证明：`refined graph + forecast_trace` 能显著提升 MIRAI 闭集未来事件预测。
+- 下一步 P0：实现 forecast trace schema、端到端 trace 评测模式和离线 reward 计算，再把 refinement 训练数据改为真实 out-of-fold coarse predictions。
