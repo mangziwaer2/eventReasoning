@@ -18,14 +18,17 @@ from coarse_graph_dataset import parse_pair_payload
 from event_extraction import format_event_mention
 from event_extraction import normalize_text
 from event_extraction import split_sentences
+from forecast_trace_prompt import build_structured_forecast_prompt
+from forecast_trace_schema import parse_structured_forecast
 from event_input import EventInputValidationError
 from event_input import load_event_input_index
 from event_input import materialize_event_input
 from local_llm import LocalGenerationUnavailable
 from local_llm import LocalQwenGenerator
 from local_qwen_lora import LoraUnavailable
-from local_qwen_lora import load_trained_qwen_lora
+from local_qwen_lora import load_qwen_for_inference
 from mirai_dataset import export_mirai_query_snapshot
+from mirai_dataset import load_mirai_event_code_choices
 from mirai_dataset import load_mirai_news_for_docids
 from mirai_dataset import load_mirai_queries
 from path_utils import REPO_ROOT
@@ -43,7 +46,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Local no-API evaluation: pre-extracted events or an optional frozen Qwen extractor "
-            "provide event nodes, Qwen LoRA builds the coarse graph, refinement produces a causal graph, "
+            "provide event nodes, a frozen or adapter-based coarse Qwen builds the coarse graph, refinement produces a causal graph, "
             "and native Qwen forecasts future events."
         )
     )
@@ -52,10 +55,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=8, help="Maximum query examples. Use 0 for the full split.")
     parser.add_argument("--query-id", default=None, help="Optional single MIRAI QueryId.")
 
-    parser.add_argument("--model-path", default=str(REPO_ROOT / "models" / "Qwen2.5-0.5B"), help="Native local Qwen model path for forecasting and optional event extraction.")
-    parser.add_argument("--coarse-base-model-path", default=None, help="Base Qwen model for the coarse LoRA adapter. Defaults to --model-path.")
-    parser.add_argument("--coarse-adapter-path", default=str(REPO_ROOT / "outputs" / "coarse_graph_qwen_lora_4090_full" / "best_adapter"), help="Coarse graph Qwen LoRA adapter path.")
+    parser.add_argument("--model-path", default=str(REPO_ROOT / "models" / "Qwen2.5-0.5B"), help="Native local Qwen model path for optional event extraction and default forecasting.")
+    parser.add_argument("--coarse-base-model-path", default=None, help="Base Qwen model for the coarse stage. Defaults to --model-path.")
+    parser.add_argument("--coarse-adapter-path", default=None, help="Optional coarse LoRA adapter path. Omit to run the coarse stage frozen.")
     parser.add_argument("--refinement-model-path", default=str(REPO_ROOT / "outputs" / "refinement_graph_4090_full" / "refinement_model.pt"), help="Refinement model path.")
+    parser.add_argument("--forecast-base-model-path", default=None, help="Base Qwen model for LoRA B. Defaults to --model-path.")
+    parser.add_argument("--forecast-adapter-path", default=None, help="Optional LoRA B adapter path for structured forecasting.")
 
     parser.add_argument("--event-source", choices=["precomputed", "qwen"], default="precomputed", help="Event input source. precomputed is the research setting; qwen is an optional frozen-extractor baseline.")
     parser.add_argument("--precomputed-events", default=None, help="event-input-v1 JSON/JSONL path required when event-source=precomputed.")
@@ -70,19 +75,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--coarse-batch-size", type=int, default=8, help="Batch size for Qwen LoRA pair generation.")
     parser.add_argument("--coarse-max-length", type=int, default=1024, help="Maximum coarse pair prompt length.")
     parser.add_argument("--coarse-max-new-tokens", type=int, default=48, help="Maximum generated tokens for coarse relation JSON.")
-    parser.add_argument("--coarse-keep-threshold", type=float, default=0.5, help="Minimum coarse relation score kept as an edge.")
+    parser.add_argument("--coarse-keep-threshold", type=float, default=0.5, help="Minimum coarse relation confidence kept as an edge.")
 
     parser.add_argument("--include-completion-candidates", dest="include_completion_candidates", action="store_true", default=True, help="Add heuristic completion candidates before refinement.")
     parser.add_argument("--no-completion-candidates", dest="include_completion_candidates", action="store_false", help="Disable refinement completion candidates.")
     parser.add_argument("--max-completion-edges", type=int, default=64, help="Maximum completion candidates for refinement. Use 0 for no cap.")
     parser.add_argument("--refinement-keep-threshold", type=float, default=0.5, help="Minimum refinement keep probability.")
 
+    parser.add_argument("--prediction-mode", choices=["forecast-trace", "legacy"], default="forecast-trace", help="forecast-trace emits structured trace + final_answer; legacy emits the older flat JSON.")
     parser.add_argument("--forecast-temperature", type=float, default=0.0, help="Native Qwen temperature for final forecasting.")
     parser.add_argument("--forecast-max-new-tokens", type=int, default=320, help="Maximum native Qwen tokens for forecast JSON.")
     parser.add_argument("--max-graph-events-in-prompt", type=int, default=24, help="Maximum graph events shown to forecast Qwen.")
     parser.add_argument("--max-graph-edges-in-prompt", type=int, default=48, help="Maximum graph edges shown to forecast Qwen.")
+    parser.add_argument("--forecast-max-document-chars", type=int, default=700, help="Maximum characters per document shown to LoRA B.")
+    parser.add_argument("--max-choice-codes", type=int, default=0, help="Optional cap for dataset-level MIRAI event-code choices. Use 0 for all observed codes.")
 
-    parser.add_argument("--policy", default="mirai_code_reward", help="RL hook policy name: noop or mirai_code_reward.")
+    parser.add_argument("--policy", default="forecast_trace_reward", help="RL hook policy name: noop, mirai_code_reward, or forecast_trace_reward.")
     parser.add_argument("--output-dir", default=str(REPO_ROOT / "outputs" / "local_qwen_pipeline_eval"), help="Evaluation output directory.")
     parser.add_argument("--log-every", type=int, default=1, help="Print progress every N samples. Use 0 to disable.")
     return parser.parse_args()
@@ -400,7 +408,7 @@ def render_refined_graph_prompt(example, query, graph: CoarseCausalGraph, args: 
     edge_lines = []
     for edge in sorted(graph.edges, key=lambda item: float(item.score), reverse=True)[: args.max_graph_edges_in_prompt]:
         edge_lines.append(
-            f"- {edge.source_event_id} --{edge.relation_type}:{float(edge.score):.3f}--> {edge.target_event_id}"
+            f"- {edge.source_event_id} -> {edge.target_event_id} | relation={edge.relation_type} | confidence={float(edge.score):.3f}"
         )
     doc_lines = [
         f"- {document.document_id} | {document.publish_time or '-'} | {compact_text(document.title, 160)}"
@@ -515,6 +523,11 @@ def main() -> None:
         )
     if not examples:
         raise RuntimeError(f"No MIRAI examples found for split={args.split!r}, query_id={args.query_id!r}.")
+    choice_pool = (
+        load_mirai_event_code_choices(dataset_path, max_choices=args.max_choice_codes)
+        if args.prediction_mode == "forecast-trace"
+        else []
+    )
 
     precomputed_event_index = {}
     precomputed_events_path: Path | None = None
@@ -531,17 +544,33 @@ def main() -> None:
             )
 
     policy = build_pipeline_policy(args.policy)
-    native_qwen = LocalQwenGenerator(resolve_repo_path(args.model_path), max_new_tokens=max(args.event_extraction_max_new_tokens, args.forecast_max_new_tokens))
+    native_model_path = resolve_repo_path(args.model_path)
+    native_qwen = LocalQwenGenerator(
+        native_model_path,
+        max_new_tokens=max(args.event_extraction_max_new_tokens, args.forecast_max_new_tokens),
+    )
+    forecast_base_model_path = resolve_repo_path(args.forecast_base_model_path) if args.forecast_base_model_path else native_model_path
+    forecast_adapter_path = resolve_repo_path(args.forecast_adapter_path) if args.forecast_adapter_path else None
+    if forecast_adapter_path is None and forecast_base_model_path == native_model_path:
+        forecast_qwen = native_qwen
+    else:
+        forecast_qwen = LocalQwenGenerator(
+            forecast_base_model_path,
+            max_new_tokens=args.forecast_max_new_tokens,
+            adapter_path=forecast_adapter_path,
+        )
     try:
-        coarse_base_model_path = resolve_repo_path(args.coarse_base_model_path) if args.coarse_base_model_path else resolve_repo_path(args.model_path)
-        coarse_model, coarse_tokenizer, torch = load_trained_qwen_lora(
+        coarse_base_model_path = resolve_repo_path(args.coarse_base_model_path) if args.coarse_base_model_path else native_model_path
+        coarse_adapter_path = resolve_repo_path(args.coarse_adapter_path) if args.coarse_adapter_path else None
+        coarse_model, coarse_tokenizer, torch = load_qwen_for_inference(
             base_model_path=coarse_base_model_path,
-            adapter_path=resolve_repo_path(args.coarse_adapter_path),
+            adapter_path=coarse_adapter_path,
         )
     except LoraUnavailable as exc:
         raise RuntimeError(str(exc)) from exc
     coarse_model.eval()
     device = next(coarse_model.parameters()).device
+    coarse_mode = "frozen" if coarse_adapter_path is None else "lora"
     refinement_model = load_refinement_model(args, torch, device)
 
     started = time.time()
@@ -554,7 +583,10 @@ def main() -> None:
                 f"samples={len(examples)}",
                 f"event_source={args.event_source}",
                 f"native_device={native_qwen.device}",
+                f"forecast_device={forecast_qwen.device}",
                 f"coarse_device={device}",
+                f"coarse_mode={coarse_mode}",
+                f"prediction_mode={args.prediction_mode}",
             ]
         ),
         flush=True,
@@ -685,23 +717,71 @@ def main() -> None:
                 metadata={"refined_edge_count": len(refined_graph.edges)},
             )
 
-            forecast_prompt = render_refined_graph_prompt(example, query, refined_graph, args)
-            raw_forecast = native_qwen.generate(
-                forecast_prompt,
-                temperature=args.forecast_temperature,
-                system_prompt="You forecast future events from a refined causal graph and return strict JSON only.",
-                max_new_tokens=args.forecast_max_new_tokens,
-            )
-            forecast_prediction = parse_forecast_json(raw_forecast)
+            if args.prediction_mode == "forecast-trace":
+                prompt_bundle = build_structured_forecast_prompt(
+                    query=query,
+                    documents=documents,
+                    refined_graph=refined_graph,
+                    choices=choice_pool,
+                    max_graph_events=args.max_graph_events_in_prompt,
+                    max_graph_edges=args.max_graph_edges_in_prompt,
+                    max_document_chars=args.forecast_max_document_chars,
+                )
+                forecast_prompt = prompt_bundle.prompt
+                raw_forecast = forecast_qwen.generate(
+                    forecast_prompt,
+                    temperature=args.forecast_temperature,
+                    system_prompt="You output structured forecast_trace and closed-set final_answer JSON only.",
+                    max_new_tokens=args.forecast_max_new_tokens,
+                )
+                forecast_prediction = parse_structured_forecast(raw_forecast, choices=prompt_bundle.choices)
+                forecast_context = {
+                    "prediction_mode": args.prediction_mode,
+                    "choices": prompt_bundle.choices,
+                    "event_ref_to_id": prompt_bundle.event_ref_to_id,
+                    "edge_ref_to_id": prompt_bundle.edge_ref_to_id,
+                    "refined_graph": refined_graph.to_dict(),
+                }
+            else:
+                forecast_prompt = render_refined_graph_prompt(example, query, refined_graph, args)
+                raw_forecast = forecast_qwen.generate(
+                    forecast_prompt,
+                    temperature=args.forecast_temperature,
+                    system_prompt="You forecast future events from a refined causal graph and return strict JSON only.",
+                    max_new_tokens=args.forecast_max_new_tokens,
+                )
+                forecast_prediction = parse_forecast_json(raw_forecast)
+                forecast_context = {
+                    "prediction_mode": args.prediction_mode,
+                    "choices": [],
+                    "event_ref_to_id": {},
+                    "edge_ref_to_id": {},
+                    "refined_graph": refined_graph.to_dict(),
+                }
             score = score_prediction(forecast_prediction, example.gold_summary())
-            reward = policy.compute_reward(forecast_prediction, example.gold_summary(), trajectory)
+            trajectory.metadata.update(forecast_context)
+            reward_breakdown = policy.compute_reward_breakdown(forecast_prediction, example.gold_summary(), trajectory)
+            fallback_reward = (
+                reward_breakdown["total"]
+                if "total" in reward_breakdown
+                else policy.compute_reward(forecast_prediction, example.gold_summary(), trajectory)
+            )
+            for context_key in forecast_context:
+                trajectory.metadata.pop(context_key, None)
+            reward = float(fallback_reward)
             trajectory.final_reward = reward
             trajectory.add_step(
                 "forecast",
                 observation={"event_count": len(refined_graph.events), "edge_count": len(refined_graph.edges)},
                 action={"prompt_chars": len(forecast_prompt)},
                 reward=reward,
-                metadata={"raw_response": raw_forecast, "prediction": forecast_prediction, "score": score},
+                metadata={
+                    **forecast_context,
+                    "raw_response": raw_forecast,
+                    "prediction": forecast_prediction,
+                    "score": score,
+                    "reward_breakdown": reward_breakdown,
+                },
             )
 
             row = {
@@ -710,6 +790,7 @@ def main() -> None:
                 "document_count": len(documents),
                 "event_input": event_input_metadata,
                 "coarse": {
+                    "generation_mode": f"pairwise_candidate_batching:{coarse_mode}",
                     "candidate_pairs": len(pair_samples),
                     "parse_rate": safe_div(sum(1 for item in pair_predictions if item is not None), len(pair_predictions)),
                     "edge_count": len(coarse_graph.edges),
@@ -720,6 +801,8 @@ def main() -> None:
                 "forecast_prediction": forecast_prediction,
                 "score": score,
                 "reward": reward,
+                "reward_breakdown": reward_breakdown,
+                "choices": choice_pool if args.prediction_mode == "forecast-trace" else [],
                 "trajectory": trajectory.to_dict(),
             }
             rows.append(row)
@@ -742,16 +825,43 @@ def main() -> None:
                     flush=True,
                 )
 
+    reward_keys = sorted({key for row in rows for key in row.get("reward_breakdown", {})})
+    average_reward_breakdown = {
+        key: safe_div(sum(float(row.get("reward_breakdown", {}).get(key, 0.0)) for row in rows), len(rows))
+        for key in reward_keys
+    }
+    average_trace_event_count = safe_div(
+        sum(
+            len(row["forecast_prediction"].get("forecast_trace", {}).get("intermediate_events", []))
+            for row in rows
+            if isinstance(row["forecast_prediction"].get("forecast_trace", {}), dict)
+        ),
+        len(rows),
+    )
+    average_trace_edge_count = safe_div(
+        sum(
+            len(row["forecast_prediction"].get("forecast_trace", {}).get("trace_edges", []))
+            for row in rows
+            if isinstance(row["forecast_prediction"].get("forecast_trace", {}), dict)
+        ),
+        len(rows),
+    )
+
     metrics = {
         "config": {
             **vars(args),
             "dataset": str(dataset_path),
             "model_path": str(resolve_repo_path(args.model_path)),
             "coarse_base_model_path": str(resolve_repo_path(args.coarse_base_model_path)) if args.coarse_base_model_path else str(resolve_repo_path(args.model_path)),
-            "coarse_adapter_path": str(resolve_repo_path(args.coarse_adapter_path)),
+            "coarse_adapter_path": str(coarse_adapter_path) if coarse_adapter_path is not None else None,
+            "coarse_mode": coarse_mode,
             "refinement_model_path": str(resolve_repo_path(args.refinement_model_path)),
+            "forecast_base_model_path": str(forecast_base_model_path),
+            "forecast_adapter_path": str(forecast_adapter_path) if forecast_adapter_path is not None else None,
             "precomputed_events": str(precomputed_events_path) if precomputed_events_path is not None else None,
             "policy": policy.name,
+            "choice_count": len(choice_pool),
+            "coarse_generation_mode": f"pairwise_candidate_batching:{coarse_mode}",
         },
         "samples": len(rows),
         "event_input_success_rate": safe_div(sum(1 for row in rows if row["event_input"]["valid"]), len(rows)),
@@ -767,6 +877,9 @@ def main() -> None:
             len(rows),
         ),
         "average_reward": safe_div(sum(float(row["reward"]) for row in rows), len(rows)),
+        "average_reward_breakdown": average_reward_breakdown,
+        "average_trace_event_count": average_trace_event_count,
+        "average_trace_edge_count": average_trace_edge_count,
         "average_event_count": safe_div(sum(int(row["event_input"]["event_count"]) for row in rows), len(rows)),
         "average_coarse_edge_count": safe_div(sum(int(row["coarse"]["edge_count"]) for row in rows), len(rows)),
         "average_refined_edge_count": safe_div(sum(int(row["refinement"]["edge_count"]) for row in rows), len(rows)),

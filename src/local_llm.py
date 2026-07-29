@@ -132,14 +132,31 @@ def parse_forecast_response(query_id: str, prompt: str, raw_response: str, gold:
 
 
 class LocalQwenGenerator:
-    def __init__(self, model_path: Path, max_new_tokens: int = 160) -> None:
+    def __init__(self, model_path: Path, max_new_tokens: int = 160, adapter_path: Path | None = None) -> None:
         torch, auto_model_cls, auto_tokenizer_cls = _import_transformers()
         self._torch = torch
         self.max_new_tokens = max_new_tokens
-        self.tokenizer = auto_tokenizer_cls.from_pretrained(model_path, trust_remote_code=False)
+        self.adapter_path = adapter_path
+        tokenizer_source = adapter_path if adapter_path is not None and (adapter_path / "tokenizer_config.json").exists() else model_path
+        self.tokenizer = auto_tokenizer_cls.from_pretrained(tokenizer_source, trust_remote_code=False)
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         self.model = auto_model_cls.from_pretrained(model_path, trust_remote_code=False)
+        if adapter_path is not None:
+            try:
+                from local_qwen_lora import _disable_incompatible_torchao_for_peft
+
+                _disable_incompatible_torchao_for_peft()
+            except ImportError:
+                pass
+            try:
+                from peft import PeftModel
+            except ImportError as exc:
+                raise LocalGenerationUnavailable(
+                    "Loading a forecast LoRA adapter requires `peft`. "
+                    "Install it or omit --forecast-adapter-path."
+                ) from exc
+            self.model = PeftModel.from_pretrained(self.model, adapter_path)
 
         if torch.cuda.is_available():
             self.device = "cuda"

@@ -109,7 +109,9 @@ def _render_edges(
                 [
                     edge_ref,
                     f"edge_id={edge.edge_id}",
-                    f"{source_ref} --{edge.relation_type}:{float(edge.score):.3f}--> {target_ref}",
+                    f"{source_ref} -> {target_ref}",
+                    f"relation={edge.relation_type}",
+                    f"confidence={float(edge.score):.3f}",
                     f"source_event_id={edge.source_event_id}",
                     f"target_event_id={edge.target_event_id}",
                 ]

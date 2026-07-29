@@ -353,7 +353,7 @@ document context + source event mention + target event mention + optional query
 输出：
 
 ```json
-{"relation_type": "none|precedes|causes", "score": 0.0}
+{"relation_type": "none|precedes|causes", "confidence": 0.0}
 ```
 
 训练目标：

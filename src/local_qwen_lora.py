@@ -92,3 +92,36 @@ def load_trained_qwen_lora(
     model = peft_model_cls.from_pretrained(model, adapter_path)
     model = _move_to_device(model, torch)
     return model, tokenizer, torch
+
+
+def load_qwen_for_inference(
+    base_model_path: Path,
+    adapter_path: Path | None = None,
+):
+    """Load a causal LM for inference, optionally attaching a frozen LoRA adapter."""
+    try:
+        import torch
+        from transformers import AutoModelForCausalLM
+        from transformers import AutoTokenizer
+    except ImportError as exc:
+        raise LoraUnavailable(
+            "Inference requires `torch` and `transformers`."
+        ) from exc
+
+    tokenizer_source = adapter_path if adapter_path is not None and (adapter_path / "tokenizer_config.json").exists() else base_model_path
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, trust_remote_code=False)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model = AutoModelForCausalLM.from_pretrained(base_model_path, trust_remote_code=False)
+    if adapter_path is not None:
+        try:
+            _disable_incompatible_torchao_for_peft()
+            from peft import PeftModel
+        except ImportError as exc:
+            raise LoraUnavailable(
+                "Loading a coarse LoRA adapter requires `peft`."
+            ) from exc
+        model = PeftModel.from_pretrained(model, adapter_path)
+    model = _move_to_device(model, torch)
+    return model, tokenizer, torch

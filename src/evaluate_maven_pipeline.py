@@ -15,7 +15,7 @@ from coarse_graph_dataset import build_graph_from_pair_predictions
 from coarse_graph_dataset import load_maven_document_graph_samples
 from coarse_graph_dataset import parse_pair_payload
 from local_qwen_lora import LoraUnavailable
-from local_qwen_lora import load_trained_qwen_lora
+from local_qwen_lora import load_qwen_for_inference
 from path_utils import REPO_ROOT
 from path_utils import resolve_repo_path
 from refinement_dataset import EDGE_FEATURE_DIM
@@ -39,10 +39,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-events", type=int, default=16, help="Maximum events kept per document graph.")
 
     parser.add_argument("--base-model-path", default=str(REPO_ROOT / "models" / "Qwen2.5-0.5B"), help="Base Qwen model directory.")
-    parser.add_argument("--coarse-adapter-path", default=str(REPO_ROOT / "outputs" / "coarse_graph_qwen_lora_4090_full" / "best_adapter"), help="Trained coarse Qwen LoRA adapter directory.")
+    parser.add_argument("--coarse-adapter-path", default=None, help="Optional coarse Qwen LoRA adapter directory. Omit to run the coarse stage frozen.")
     parser.add_argument("--max-sentence-gap", type=int, default=3, help="Maximum same-document sentence gap for coarse candidate pairs.")
     parser.add_argument("--max-pairs", type=int, default=64, help="Maximum coarse candidate pairs per document. Use 0 for all generated candidates.")
-    parser.add_argument("--coarse-keep-threshold", type=float, default=0.5, help="Minimum coarse relation score to keep an edge.")
+    parser.add_argument("--coarse-keep-threshold", type=float, default=0.5, help="Minimum coarse relation confidence to keep an edge.")
     parser.add_argument("--coarse-batch-size", type=int, default=1, help="Batch size for Qwen generation during evaluation.")
     parser.add_argument("--coarse-max-length", type=int, default=1024, help="Maximum coarse prompt length.")
     parser.add_argument("--coarse-max-new-tokens", type=int, default=48, help="Maximum generated tokens for coarse JSON.")
@@ -335,15 +335,17 @@ def main() -> None:
         raise RuntimeError(f"No MAVEN samples loaded from split={args.split!r}.")
 
     try:
-        coarse_model, tokenizer, torch = load_trained_qwen_lora(
+        coarse_adapter_path = resolve_repo_path(args.coarse_adapter_path) if args.coarse_adapter_path else None
+        coarse_model, tokenizer, torch = load_qwen_for_inference(
             base_model_path=resolve_repo_path(args.base_model_path),
-            adapter_path=resolve_repo_path(args.coarse_adapter_path),
+            adapter_path=coarse_adapter_path,
         )
     except LoraUnavailable as exc:
         print(json.dumps({"error": str(exc)}, ensure_ascii=False))
         return
     coarse_model.eval()
     device = next(coarse_model.parameters()).device
+    coarse_mode = "frozen" if coarse_adapter_path is None else "lora"
     refinement_model = load_refinement_model(args, torch, device)
 
     coarse_gold_raw_labels: list[str] = []
@@ -374,6 +376,7 @@ def main() -> None:
                 f"split={args.split}",
                 f"samples={len(samples)}",
                 f"device={device}",
+                f"coarse_mode={coarse_mode}",
                 f"max_events={args.max_events}",
                 f"max_pairs={args.max_pairs}",
             ]
@@ -414,8 +417,12 @@ def main() -> None:
                 coarse_candidate_pairs_global.add((sample_id, pair[0], pair[1]))
                 gold_label = gold_label_map.get(pair, "none")
                 pred_raw = normalize_label(prediction.get("relation_type") if prediction else "none")
-                pred_score = float(prediction.get("score", 0.0)) if prediction else 0.0
-                pred_thresholded = pred_raw if pred_raw != "none" and pred_score >= args.coarse_keep_threshold else "none"
+                pred_confidence = (
+                    float(prediction.get("confidence", prediction.get("score", 0.0))) if prediction else 0.0
+                )
+                pred_thresholded = (
+                    pred_raw if pred_raw != "none" and pred_confidence >= args.coarse_keep_threshold else "none"
+                )
                 coarse_gold_raw_labels.append(gold_label)
                 coarse_pred_raw_labels.append(pred_raw)
                 coarse_pred_thresholded_labels.append(pred_thresholded)
@@ -502,7 +509,8 @@ def main() -> None:
             **vars(args),
             "dataset": str(resolve_repo_path(args.dataset)),
             "base_model_path": str(resolve_repo_path(args.base_model_path)),
-            "coarse_adapter_path": str(resolve_repo_path(args.coarse_adapter_path)),
+            "coarse_adapter_path": str(coarse_adapter_path) if coarse_adapter_path is not None else None,
+            "coarse_mode": coarse_mode,
             "refinement_model_path": str(resolve_repo_path(args.refinement_model_path)),
             "device": str(device),
         },

@@ -11,7 +11,7 @@ Event extraction is outside this method. MAVEN-ERE training reads gold event men
 The model predicts strict JSON:
 
 ```json
-{"relation_type": "causes", "score": 0.82}
+{"relation_type": "causes", "confidence": 0.82}
 ```
 
 Allowed relation values:
@@ -87,7 +87,7 @@ The readable debug file shows validation examples:
 
 ```text
 [epoch 001] coarse qwen debug sample=...
-gold=causes:1.000 parsed={'relation_type': 'causes', 'score': 0.81}
+gold=causes confidence=1.000 parsed={'relation_type': 'causes', 'confidence': 0.81}
 source_event: trigger=attacked; mention=...
 target_event: trigger=fled; mention=...
 ```

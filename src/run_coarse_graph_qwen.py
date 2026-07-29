@@ -11,13 +11,13 @@ from coarse_graph_dataset import load_mirai_document_graph_sample
 from coarse_graph_dataset import load_preextracted_document_graph_sample
 from coarse_graph_dataset import parse_pair_payload
 from local_qwen_lora import LoraUnavailable
-from local_qwen_lora import load_trained_qwen_lora
+from local_qwen_lora import load_qwen_for_inference
 from path_utils import REPO_ROOT
 from path_utils import resolve_repo_path
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run Qwen LoRA event-pair relation classification and assemble a coarse graph.")
+    parser = argparse.ArgumentParser(description="Run Qwen event-pair relation classification and assemble a coarse graph.")
     parser.add_argument("--input-mode", choices=["events", "mirai", "jsonl"], default="mirai", help="Input source. Use events to skip event extraction.")
     parser.add_argument("--dataset", default=str(REPO_ROOT / "datasets" / "MIRAI_data.zip"), help="Path to MIRAI zip file when input-mode=mirai.")
     parser.add_argument("--query-id", default=None, help="MIRAI QueryId, or a record selector for a multi-record event input.")
@@ -30,10 +30,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-events-per-doc", type=int, default=6, help="Maximum events kept per document.")
     parser.add_argument("--max-events", type=int, default=12, help="Maximum total events passed to pair classification.")
     parser.add_argument("--max-sentence-gap", type=int, default=3, help="Maximum sentence gap for same-document candidate pairs.")
-    parser.add_argument("--max-pairs", type=int, default=64, help="Maximum number of candidate pairs scored.")
-    parser.add_argument("--keep-threshold", type=float, default=0.5, help="Minimum pair score required to keep an edge.")
+    parser.add_argument("--max-pairs", type=int, default=64, help="Maximum number of candidate pairs classified.")
+    parser.add_argument("--keep-threshold", type=float, default=0.5, help="Minimum pair confidence required to keep an edge.")
     parser.add_argument("--base-model-path", default=str(REPO_ROOT / "models" / "Qwen2.5-0.5B"), help="Base Qwen model directory.")
-    parser.add_argument("--adapter-path", default=str(REPO_ROOT / "outputs" / "coarse_graph_qwen_lora"), help="Trained LoRA adapter directory.")
+    parser.add_argument("--adapter-path", default=None, help="Optional LoRA adapter directory. Omit to run the coarse stage as a frozen model.")
     parser.add_argument("--max-length", type=int, default=1024, help="Maximum prompt length.")
     parser.add_argument("--include-query", action="store_true", help="Include query text in the prompt.")
     parser.add_argument("--document-mode", choices=["none", "title", "snippet", "summary", "full"], default="title", help="How much document text to include in the prompt.")
@@ -105,9 +105,10 @@ def main() -> None:
     )
 
     try:
-        model, tokenizer, torch = load_trained_qwen_lora(
+        adapter_path = resolve_repo_path(args.adapter_path) if args.adapter_path else None
+        model, tokenizer, torch = load_qwen_for_inference(
             base_model_path=resolve_repo_path(args.base_model_path),
-            adapter_path=resolve_repo_path(args.adapter_path),
+            adapter_path=adapter_path,
         )
     except LoraUnavailable as exc:
         print(json.dumps({"error": str(exc)}, ensure_ascii=False))
@@ -160,6 +161,7 @@ def main() -> None:
     result = {
         "sample_id": document_sample.sample_id,
         "metadata": document_sample.metadata,
+        "coarse_mode": "frozen" if args.adapter_path is None else "lora",
         "candidate_pair_count": len(pair_samples),
         "pair_predictions": pair_previews,
         "coarse_graph": coarse_graph.to_dict(),

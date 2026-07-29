@@ -481,7 +481,7 @@ def print_debug_samples(
                 "source_event_id": sample.source_event_id,
                 "target_event_id": sample.target_event_id,
                 "gold_relation_type": sample.relation_type,
-                "gold_score": sample.score,
+                "gold_confidence": sample.score,
                 "prediction": prediction,
                 "parsed_prediction": parsed,
                 "source_event": source_event.text if source_event is not None else "",
@@ -492,7 +492,7 @@ def print_debug_samples(
                 "\n".join(
                     [
                         f"coarse qwen debug sample={sample.sample_id}",
-                        f"gold={sample.relation_type}:{sample.score:.3f} parsed={parsed}",
+                        f"gold={sample.relation_type} confidence={sample.score:.3f} parsed={parsed}",
                         f"raw={shorten_text(prediction, 240)}",
                         f"source_event: {shorten_text(row['source_event'])}",
                         f"target_event: {shorten_text(row['target_event'])}",

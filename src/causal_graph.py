@@ -136,6 +136,7 @@ class CoarseCausalEdge:
             "source_event_id": self.source_event_id,
             "target_event_id": self.target_event_id,
             "relation_type": self.relation_type,
+            "confidence": self.score,
             "score": self.score,
             "evidence": [item.to_dict() for item in self.evidence],
             "feature_scores": self.feature_scores,

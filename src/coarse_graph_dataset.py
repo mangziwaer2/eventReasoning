@@ -121,6 +121,7 @@ class EventPairSample:
             "source_event_id": self.source_event_id,
             "target_event_id": self.target_event_id,
             "relation_type": self.relation_type,
+            "confidence": self.score,
             "score": self.score,
             "metadata": self.metadata,
         }
@@ -140,9 +141,10 @@ class EventPairSample:
 
         prompt_lines = [
             "You classify the relation between two candidate events.",
-            "Return strict JSON with the schema {\"relation_type\": ..., \"score\": ...} only.",
+            "Return strict JSON with the schema {\"relation_type\": ..., \"confidence\": ...} only.",
             "Allowed relation_type values: none, precedes, causes, escalates, mitigates.",
             "Use none when there is no supported directed relation from source_event to target_event.",
+            "confidence is your certainty in the selected relation_type; confident none should have high confidence.",
         ]
         if include_query and self.query.text:
             prompt_lines.extend(["", f"Query: {self.query.text}"])
@@ -173,7 +175,7 @@ class EventPairSample:
             "sample_id": self.sample_id,
             "prompt": "\n".join(prompt_lines),
             "target": json.dumps(
-                {"relation_type": self.relation_type, "score": round(float(self.score), 4)},
+                {"relation_type": self.relation_type, "confidence": round(float(self.score), 4)},
                 ensure_ascii=False,
             ),
             "metadata": self.metadata,
@@ -857,15 +859,16 @@ def parse_pair_payload(text: str) -> dict[str, Any] | None:
     relation_type = str(payload.get("relation_type", "")).strip().lower()
     if relation_type not in PAIR_RELATION_TO_ID:
         return None
-    raw_score = payload.get("score", 0.0)
+    raw_confidence = payload.get("confidence", payload.get("score", 0.0))
     try:
-        score = float(raw_score)
+        confidence = float(raw_confidence)
     except (TypeError, ValueError):
-        score = 0.0
-    score = round(min(max(score, 0.0), 1.0), 4)
+        confidence = 0.0
+    confidence = round(min(max(confidence, 0.0), 1.0), 4)
     return {
         "relation_type": relation_type,
-        "score": score,
+        "confidence": confidence,
+        "score": confidence,
     }
 
 
@@ -875,10 +878,19 @@ def graph_edges_to_payload(graph: CoarseCausalGraph) -> list[dict[str, Any]]:
             "source_event_id": edge.source_event_id,
             "target_event_id": edge.target_event_id,
             "relation_type": edge.relation_type,
+            "confidence": round(float(edge.score), 4),
             "score": round(float(edge.score), 4),
         }
         for edge in graph.edges
     ]
+
+
+def _read_relation_confidence(payload: dict[str, Any]) -> float:
+    try:
+        confidence = float(payload.get("confidence", payload.get("score", 0.0)))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    return round(min(max(confidence, 0.0), 1.0), 4)
 
 
 def _extract_json_block(text: str) -> str | None:
@@ -927,8 +939,8 @@ def build_graph_from_pair_predictions(
         if prediction is None:
             continue
         relation_type = str(prediction.get("relation_type", "")).strip().lower()
-        score = float(prediction.get("score", 0.0))
-        if relation_type == "none" or relation_type not in RELATION_TO_ID or score < keep_threshold:
+        confidence = _read_relation_confidence(prediction)
+        if relation_type == "none" or relation_type not in RELATION_TO_ID or confidence < keep_threshold:
             continue
         source_event = event_lookup[pair_sample.source_event_id]
         target_event = event_lookup[pair_sample.target_event_id]
@@ -938,12 +950,13 @@ def build_graph_from_pair_predictions(
                 source_event_id=pair_sample.source_event_id,
                 target_event_id=pair_sample.target_event_id,
                 relation_type=relation_type,
-                score=round(score, 4),
+                score=confidence,
                 evidence=source_event.evidence + target_event.evidence,
                 feature_scores={},
                 metadata={
                     "generated_by": "qwen_pair_classifier",
                     "candidate_score": pair_sample.metadata.get("candidate_score"),
+                    "confidence": confidence,
                 },
             )
         )
@@ -1006,7 +1019,7 @@ def _parse_edge(data: dict[str, Any]) -> CoarseCausalEdge:
         source_event_id=str(data.get("source_event_id", "")),
         target_event_id=str(data.get("target_event_id", "")),
         relation_type=str(data.get("relation_type", "")),
-        score=float(data.get("score", 0.0)),
+        score=float(data.get("score", data.get("confidence", 0.0))),
         evidence=[_parse_evidence(item) for item in data.get("evidence", [])],
         feature_scores={str(key): float(value) for key, value in dict(data.get("feature_scores", {})).items()},
         metadata=dict(data.get("metadata", {})),
