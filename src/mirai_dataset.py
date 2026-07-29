@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+from collections import Counter
 import csv
 import io
 import json
@@ -25,7 +26,7 @@ class MiraiQueryExample:
     event_base_code: str
     docids: list[str]
     answer_list: list[str]
-    answer_dict: dict[str, int]
+    answer_dict: dict[str, list[str]]
     raw_row: dict[str, str]
 
     def build_query_text(self) -> str:
@@ -84,7 +85,7 @@ def _parse_literal_list(raw_value: str) -> list[str]:
     return []
 
 
-def _parse_literal_dict(raw_value: str) -> dict[str, int]:
+def _parse_answer_dict(raw_value: str) -> dict[str, list[str]]:
     if not raw_value:
         return {}
     try:
@@ -92,12 +93,12 @@ def _parse_literal_dict(raw_value: str) -> dict[str, int]:
     except (SyntaxError, ValueError):
         return {}
     if isinstance(value, dict):
-        parsed: dict[str, int] = {}
+        parsed: dict[str, list[str]] = {}
         for key, item in value.items():
-            try:
-                parsed[str(key)] = int(item)
-            except (TypeError, ValueError):
-                continue
+            if isinstance(item, list):
+                parsed[str(key)] = [str(code) for code in item]
+            elif item is not None:
+                parsed[str(key)] = [str(item)]
         return parsed
     return {}
 
@@ -122,11 +123,51 @@ def load_mirai_queries(zip_path: Path, split: str = "test", limit: int = 0) -> l
                 event_base_code=row["EventBaseCode"],
                 docids=_parse_literal_list(row.get("Docids", "")),
                 answer_list=_parse_literal_list(row.get("AnswerList", "")),
-                answer_dict=_parse_literal_dict(row.get("AnswerDict", "")),
+                answer_dict=_parse_answer_dict(row.get("AnswerDict", "")),
                 raw_row=row,
             )
         )
     return examples
+
+
+def load_mirai_event_code_choices(zip_path: Path, max_choices: int = 0) -> list[dict[str, object]]:
+    """Return dataset-level event-code choices without using per-query gold answers."""
+    code_counts: Counter[str] = Counter()
+    code_names: dict[str, Counter[str]] = {}
+    with zipfile.ZipFile(zip_path) as archive:
+        member_name = "MIRAI/data_kg.csv"
+        with archive.open(member_name) as handle:
+            reader = csv.DictReader(
+                io.TextIOWrapper(handle, encoding="utf-8", errors="replace"),
+                delimiter="\t",
+            )
+            for row in reader:
+                code = str(row.get("EventBaseCode", "")).strip()
+                if not code:
+                    continue
+                code_counts[code] += 1
+                relation_name = str(row.get("RelName", "")).strip()
+                if relation_name:
+                    code_names.setdefault(code, Counter())[relation_name] += 1
+
+    ranked_codes = sorted(code_counts, key=lambda code: (-code_counts[code], code))
+    if max_choices and max_choices > 0:
+        ranked_codes = ranked_codes[:max_choices]
+    ranked_codes = sorted(ranked_codes)
+    choices: list[dict[str, object]] = []
+    for index, code in enumerate(ranked_codes, start=1):
+        description = ""
+        if code in code_names and code_names[code]:
+            description = code_names[code].most_common(1)[0][0]
+        choices.append(
+            {
+                "choice_id": f"C{index:03d}",
+                "event_code": code,
+                "description": description,
+                "metadata": {"dataset_frequency": code_counts[code]},
+            }
+        )
+    return choices
 
 
 def get_mirai_query_by_id(zip_path: Path, query_id: str, split: str = "test") -> MiraiQueryExample:
