@@ -81,6 +81,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-completion-candidates", dest="include_completion_candidates", action="store_false", help="Disable refinement completion candidates.")
     parser.add_argument("--max-completion-edges", type=int, default=64, help="Maximum completion candidates for refinement. Use 0 for no cap.")
     parser.add_argument("--refinement-keep-threshold", type=float, default=0.5, help="Minimum refinement keep probability.")
+    parser.add_argument("--skip-refinement", action="store_true", help="Bypass graph refinement and forecast directly from the coarse graph.")
 
     parser.add_argument("--prediction-mode", choices=["forecast-trace", "legacy"], default="forecast-trace", help="forecast-trace emits structured trace + final_answer; legacy emits the older flat JSON.")
     parser.add_argument("--forecast-temperature", type=float, default=0.0, help="Native Qwen temperature for final forecasting.")
@@ -89,6 +90,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-graph-edges-in-prompt", type=int, default=48, help="Maximum graph edges shown to forecast Qwen.")
     parser.add_argument("--forecast-max-document-chars", type=int, default=700, help="Maximum characters per document shown to LoRA B.")
     parser.add_argument("--max-choice-codes", type=int, default=0, help="Optional cap for dataset-level MIRAI event-code choices. Use 0 for all observed codes.")
+    parser.add_argument("--no-save-forecast-prompts", dest="save_forecast_prompts", action="store_false", default=True, help="Do not store forecast prompts in predictions.jsonl. Disable only when outputs are too large; RL training needs these prompts.")
 
     parser.add_argument("--policy", default="forecast_trace_reward", help="RL hook policy name: noop, mirai_code_reward, or forecast_trace_reward.")
     parser.add_argument("--output-dir", default=str(REPO_ROOT / "outputs" / "local_qwen_pipeline_eval"), help="Evaluation output directory.")
@@ -571,7 +573,7 @@ def main() -> None:
     coarse_model.eval()
     device = next(coarse_model.parameters()).device
     coarse_mode = "frozen" if coarse_adapter_path is None else "lora"
-    refinement_model = load_refinement_model(args, torch, device)
+    refinement_model = None if args.skip_refinement else load_refinement_model(args, torch, device)
 
     started = time.time()
     rows: list[dict[str, Any]] = []
@@ -586,6 +588,7 @@ def main() -> None:
                 f"forecast_device={forecast_qwen.device}",
                 f"coarse_device={device}",
                 f"coarse_mode={coarse_mode}",
+                f"refinement={'skipped' if args.skip_refinement else 'enabled'}",
                 f"prediction_mode={args.prediction_mode}",
             ]
         ),
@@ -697,25 +700,44 @@ def main() -> None:
                 },
             )
 
-            refined_graph = refine_graph(
-                coarse_graph=coarse_graph,
-                sample_id=f"mirai_{example.query_id}",
-                temp_dir=temp_dir,
-                refinement_model=refinement_model,
-                torch=torch,
-                device=device,
-                args=args,
-            )
-            trajectory.add_step(
-                "refinement",
-                observation={"coarse_edge_count": len(coarse_graph.edges)},
-                action={
-                    "keep_threshold": args.refinement_keep_threshold,
-                    "include_completion_candidates": args.include_completion_candidates,
-                    "max_completion_edges": args.max_completion_edges,
-                },
-                metadata={"refined_edge_count": len(refined_graph.edges)},
-            )
+            if args.skip_refinement:
+                refined_graph = coarse_graph
+                trajectory.add_step(
+                    "refinement",
+                    observation={"coarse_edge_count": len(coarse_graph.edges)},
+                    action={"skip_refinement": True},
+                    metadata={
+                        "skipped": True,
+                        "refined_edge_count": len(refined_graph.edges),
+                        "graph_source": "coarse_graph",
+                    },
+                )
+            else:
+                if refinement_model is None:
+                    raise RuntimeError("refinement_model is not loaded; omit --skip-refinement or provide a model.")
+                refined_graph = refine_graph(
+                    coarse_graph=coarse_graph,
+                    sample_id=f"mirai_{example.query_id}",
+                    temp_dir=temp_dir,
+                    refinement_model=refinement_model,
+                    torch=torch,
+                    device=device,
+                    args=args,
+                )
+                trajectory.add_step(
+                    "refinement",
+                    observation={"coarse_edge_count": len(coarse_graph.edges)},
+                    action={
+                        "keep_threshold": args.refinement_keep_threshold,
+                        "include_completion_candidates": args.include_completion_candidates,
+                        "max_completion_edges": args.max_completion_edges,
+                    },
+                    metadata={
+                        "skipped": False,
+                        "refined_edge_count": len(refined_graph.edges),
+                        "graph_source": "refinement_model",
+                    },
+                )
 
             if args.prediction_mode == "forecast-trace":
                 prompt_bundle = build_structured_forecast_prompt(
@@ -796,7 +818,9 @@ def main() -> None:
                     "edge_count": len(coarse_graph.edges),
                 },
                 "refinement": {
+                    "skipped": bool(args.skip_refinement),
                     "edge_count": len(refined_graph.edges),
+                    "graph_source": "coarse_graph" if args.skip_refinement else "refinement_model",
                 },
                 "forecast_prediction": forecast_prediction,
                 "score": score,
@@ -805,6 +829,13 @@ def main() -> None:
                 "choices": choice_pool if args.prediction_mode == "forecast-trace" else [],
                 "trajectory": trajectory.to_dict(),
             }
+            if args.save_forecast_prompts:
+                row["forecast_prompt"] = forecast_prompt
+                row["forecast_system_prompt"] = (
+                    "You output structured forecast_trace and closed-set final_answer JSON only."
+                    if args.prediction_mode == "forecast-trace"
+                    else "You forecast future events from a refined causal graph and return strict JSON only."
+                )
             rows.append(row)
             with predictions_path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -855,7 +886,8 @@ def main() -> None:
             "coarse_base_model_path": str(resolve_repo_path(args.coarse_base_model_path)) if args.coarse_base_model_path else str(resolve_repo_path(args.model_path)),
             "coarse_adapter_path": str(coarse_adapter_path) if coarse_adapter_path is not None else None,
             "coarse_mode": coarse_mode,
-            "refinement_model_path": str(resolve_repo_path(args.refinement_model_path)),
+            "refinement_model_path": None if args.skip_refinement else str(resolve_repo_path(args.refinement_model_path)),
+            "skip_refinement": bool(args.skip_refinement),
             "forecast_base_model_path": str(forecast_base_model_path),
             "forecast_adapter_path": str(forecast_adapter_path) if forecast_adapter_path is not None else None,
             "precomputed_events": str(precomputed_events_path) if precomputed_events_path is not None else None,

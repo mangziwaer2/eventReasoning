@@ -868,7 +868,6 @@ def parse_pair_payload(text: str) -> dict[str, Any] | None:
     return {
         "relation_type": relation_type,
         "confidence": confidence,
-        "score": confidence,
     }
 
 

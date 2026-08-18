@@ -248,10 +248,10 @@ Qwen coarse 输出：
 ```json
 {
   "edges": [
-    {"source": "e1", "target": "e2", "relation": "precedes", "score": 0.72},
-    {"source": "e1", "target": "e3", "relation": "causes", "score": 0.58},
-    {"source": "e2", "target": "e4", "relation": "causes", "score": 0.64},
-    {"source": "e3", "target": "e4", "relation": "causes", "score": 0.81}
+    {"source": "e1", "target": "e2", "relation": "precedes", "confidence": 0.72},
+    {"source": "e1", "target": "e3", "relation": "causes", "confidence": 0.58},
+    {"source": "e2", "target": "e4", "relation": "causes", "confidence": 0.64},
+    {"source": "e3", "target": "e4", "relation": "causes", "confidence": 0.81}
   ]
 }
 ```

@@ -95,7 +95,6 @@ class ForecastTraceTests(unittest.TestCase):
         self.assertIsNotNone(parsed)
         self.assertEqual(parsed["relation_type"], "none")
         self.assertEqual(parsed["confidence"], 1.0)
-        self.assertEqual(parsed["score"], 1.0)
 
         legacy = parse_pair_payload('{"relation_type": "causes", "score": 0.74}')
         self.assertIsNotNone(legacy)
