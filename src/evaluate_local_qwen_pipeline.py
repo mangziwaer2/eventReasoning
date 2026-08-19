@@ -64,6 +64,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--event-source", choices=["precomputed", "qwen"], default="precomputed", help="Event input source. precomputed is the research setting; qwen is an optional frozen-extractor baseline.")
     parser.add_argument("--precomputed-events", default=None, help="event-input-v1 JSON/JSONL path required when event-source=precomputed.")
+    parser.add_argument("--queries-from-precomputed-events", action="store_true", help="When using precomputed events, evaluate the query_ids present in that file instead of the first N rows from MIRAI split.")
     parser.add_argument("--max-docs", type=int, default=4, help="Maximum MIRAI documents used as authoritative context.")
     parser.add_argument("--max-document-chars", type=int, default=900, help="Maximum characters per document in the optional Qwen extraction prompt.")
     parser.add_argument("--max-events", type=int, default=16, help="Maximum pre-extracted or Qwen-extracted events kept per query.")
@@ -514,15 +515,34 @@ def main() -> None:
     if predictions_path.exists():
         predictions_path.unlink()
 
+    precomputed_event_index = {}
+    precomputed_events_path: Path | None = None
+    if args.event_source == "precomputed":
+        if not args.precomputed_events:
+            raise EventInputValidationError("--precomputed-events is required when --event-source=precomputed")
+        precomputed_events_path = resolve_repo_path(args.precomputed_events)
+        precomputed_event_index = load_event_input_index(precomputed_events_path)
+
     dataset_path = resolve_repo_path(args.dataset)
+    all_examples = load_mirai_queries(dataset_path, split=args.split)
     if args.query_id:
-        examples = [example for example in load_mirai_queries(dataset_path, split=args.split) if example.query_id == str(args.query_id)]
+        examples = [example for example in all_examples if example.query_id == str(args.query_id)]
+    elif args.queries_from_precomputed_events:
+        if args.event_source != "precomputed":
+            raise EventInputValidationError("--queries-from-precomputed-events requires --event-source precomputed")
+        example_by_query_id = {example.query_id: example for example in all_examples}
+        ordered_query_ids = list(precomputed_event_index)
+        if args.limit > 0:
+            ordered_query_ids = ordered_query_ids[: args.limit]
+        missing_dataset_query_ids = [query_id for query_id in ordered_query_ids if query_id not in example_by_query_id]
+        if missing_dataset_query_ids:
+            raise EventInputValidationError(
+                "Precomputed event input contains query ids not present in the active MIRAI split; "
+                f"preview={missing_dataset_query_ids[:10]}."
+            )
+        examples = [example_by_query_id[query_id] for query_id in ordered_query_ids]
     else:
-        examples = load_mirai_queries(
-            dataset_path,
-            split=args.split,
-            limit=args.limit if args.limit > 0 else None,
-        )
+        examples = all_examples[: args.limit] if args.limit > 0 else all_examples
     if not examples:
         raise RuntimeError(f"No MIRAI examples found for split={args.split!r}, query_id={args.query_id!r}.")
     choice_pool = (
@@ -531,13 +551,7 @@ def main() -> None:
         else []
     )
 
-    precomputed_event_index = {}
-    precomputed_events_path: Path | None = None
     if args.event_source == "precomputed":
-        if not args.precomputed_events:
-            raise EventInputValidationError("--precomputed-events is required when --event-source=precomputed")
-        precomputed_events_path = resolve_repo_path(args.precomputed_events)
-        precomputed_event_index = load_event_input_index(precomputed_events_path)
         missing_query_ids = [example.query_id for example in examples if example.query_id not in precomputed_event_index]
         if missing_query_ids:
             preview = missing_query_ids[:10]
