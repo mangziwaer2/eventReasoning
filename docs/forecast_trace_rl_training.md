@@ -1,6 +1,6 @@
 # Forecast Trace RL 训练流程与公式
 
-本文记录当前代码中已经实现的端到端训练、推理、评估和 RL 继续训练流程。这里的 RL 指离线 reward-weighted LoRA 训练：先用当前 pipeline 采样 forecast rollout，再用确定性 reward 给每个输出加权，继续训练 LoRA B。
+本文记录端到端训练、推理、评估和离线 RL 继续训练流程。当前默认实验跳过 refinement，预测 prompt 不包含 choices，LoRA B 在同一个 completion 中输出 `forecast_trace` 和 `final_answer.event_code`。
 
 ## 1. 当前代码完整性
 
@@ -9,14 +9,14 @@
 - 事件输入：event-input-v1，输入显式事件、提及、证据和文档，见 src/event_input.py。
 - 粗图推理：src/run_coarse_graph_qwen.py / src/evaluate_local_qwen_pipeline.py，输入候选事件对，输出单对关系 JSON，多次迭代组装 G_coarse。
 - Refinement 训练和推理：src/train_refinement.py、src/run_refinement.py，基于 MAVEN-ERE 训练图级 keep/drop/retype/strength。
-- 端到端 MIRAI 评估：src/evaluate_local_qwen_pipeline.py，串联 event input -> coarse -> refinement -> loraB forecast。
+- 端到端 MIRAI 评估：src/evaluate_local_qwen_pipeline.py，默认串联 event input -> coarse -> LoRA B forecast。
 - Reward 重算：src/score_forecast_trace_rewards.py。
 - RL 继续训练：src/train_forecast_trace_rl.py，从 pipeline rollout 的 predictions.jsonl 训练 LoRA B。
 
 仍未完成：
 
 - forecastQA.zip 已在 datasets/，但当前没有 ForecastQA loader、prompt builder 或评估入口，因此还不能说已经接入 ForecastQA。
-- 当前 RL 不是在线 PPO/GRPO；它是离线 reward-weighted policy optimization，优点是稳定、依赖少、能直接利用本地评估输出。
+- `src/train_forecast_trace_rl.py` 是离线 reward-weighted policy optimization；在线组内采样使用 `src/train_forecast_trace_grpo.py`。
 
 ## 2. 数据集是否满足
 
@@ -55,7 +55,7 @@
 
 推理时对多个候选事件对重复执行这个分类器，然后保留 relation_type != none 且 confidence >= threshold 的边，得到 G_coarse。
 
-### 3.2 Refinement 阶段
+### 3.2 Refinement 阶段（当前跳过）
 
 输入是完整粗图 G_coarse 和可选补边候选。模型输出每条候选边的：
 
@@ -69,7 +69,7 @@
 
 输入：
 
-    query + choices + cutoff-before documents + refinedGraph
+    query + cutoff-before documents + observed events + coarseGraph
 
 输出严格 JSON：
 
@@ -92,11 +92,10 @@
         ],
         "trace_edges": [
           {"source_id": "H01", "target_id": "ft_1", "relation_type": "causes", "confidence": 0.77},
-          {"source_id": "ft_1", "target_id": "answer_C001", "relation_type": "raises_likelihood", "confidence": 0.73}
+          {"source_id": "ft_1", "target_id": "answer_036", "relation_type": "raises_likelihood", "confidence": 0.73}
         ]
       },
       "final_answer": {
-        "choice_id": "C001",
         "event_code": "036",
         "confidence": 0.76
       }
@@ -114,7 +113,6 @@
       --precomputed-events datasets/mirai_events_test.jsonl ^
       --model-path models/Qwen3-4B ^
       --coarse-base-model-path models/Qwen3-4B ^
-      --refinement-model-path outputs/refinement_graph_4090_full/refinement_model.pt ^
       --forecast-base-model-path models/Qwen3-4B ^
       --policy forecast_trace_reward ^
       --prediction-mode forecast-trace ^
@@ -176,7 +174,6 @@ predictions.jsonl 现在默认保存 forecast_prompt 和 forecast_system_prompt�
       --precomputed-events datasets/mirai_events_test.jsonl ^
       --model-path models/Qwen3-4B ^
       --coarse-base-model-path models/Qwen3-4B ^
-      --refinement-model-path outputs/refinement_graph_4090_full/refinement_model.pt ^
       --forecast-base-model-path models/Qwen3-4B ^
       --forecast-adapter-path outputs/forecast_trace_rl_lora/best_adapter ^
       --policy forecast_trace_reward ^
@@ -215,10 +212,10 @@ predictions.jsonl 现在默认保存 forecast_prompt 和 forecast_system_prompt�
 各项定义：
 
 - A_i：final answer reward。主答案命中 gold answer list 得 1；alternative 命中得 0.5；否则 0。
-- F_i：格式分。由 parsed JSON、trace 字段完整性、final_answer 完整性、答案是否在候选 choices 内组成。
+- F_i：格式分。由 parsed JSON、trace 字段完整性和 `final_answer.event_code` 完整性组成。
 - G_i：grounding 分。0.65 * valid_event_ref_ratio + 0.35 * valid_edge_ref_ratio。
 - U_i：时间分。trace 的 relative_time 越符合 t-1/t-2/... 越高。
-- B_i：bridge 分。在 G_refined + forecast_trace 上，从支持历史事件到 answer_choice 的最佳路径置信度乘积。
+- B_i：bridge 分。在 G_coarse + forecast_trace 上，从支持历史事件到 `answer_<event_code>` 的最佳路径置信度乘积。
 - P_generic_i：泛化事件惩罚，例如 tensions rise、situation worsens。
 - P_density_i：过密 trace 惩罚，防止输出很多无用中间事件和边。
 
@@ -252,7 +249,7 @@ LoRA B 的训练目标是加权 token NLL：
 
     maximize mean_i alpha_i * log pi_theta(y_i | x_i)
 
-其中 x_i 是 query + choices + documents + refinedGraph prompt，y_i 是模型生成的 forecast JSON。
+其中 x_i 是 query + documents + observed events + coarseGraph prompt，y_i 是包含 trace 和 answer 的完整 forecast JSON。
 
 ## 7. 下一步建议
 
@@ -262,4 +259,4 @@ LoRA B 的训练目标是加权 token NLL：
 2. 用 score_forecast_trace_rewards.py 看 reward breakdown，重点检查 invalid refs、generic events、答案越界。
 3. 用 train_forecast_trace_rl.py 对 LoRA B 做 1 epoch 小规模继续训练。
 4. 用 RL adapter 重跑 MIRAI eval，对比 code_hit_rate、average_reward、valid_event_ref_ratio、generic_penalty。
-5. 如果 RL 后格式稳定且 reward 提升，再考虑接入 ForecastQA 或做在线 GRPO。
+5. 如果 RL/GRPO 后格式稳定且 reward 提升，再接入 refinement 并做严格增量对照。

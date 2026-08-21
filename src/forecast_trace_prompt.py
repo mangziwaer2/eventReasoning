@@ -9,6 +9,9 @@ from causal_graph import NewsDocument
 from causal_graph import QuerySpec
 
 
+FORECAST_TRACE_SYSTEM_PROMPT = "You output a grounded forecast_trace followed by a final event_code JSON only."
+
+
 @dataclass(slots=True)
 class ForecastPromptBundle:
     prompt: str
@@ -22,24 +25,6 @@ def compact_text(text: str, max_chars: int) -> str:
     if len(compact) <= max_chars:
         return compact
     return compact[: max(0, max_chars - 3)].rstrip() + "..."
-
-
-def normalize_choices(choices: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
-    normalized: list[dict[str, Any]] = []
-    for index, choice in enumerate(choices or [], start=1):
-        event_code = str(choice.get("event_code", choice.get("code", ""))).strip()
-        if not event_code:
-            continue
-        choice_id = str(choice.get("choice_id", "")).strip() or f"C{index:03d}"
-        normalized.append(
-            {
-                "choice_id": choice_id,
-                "event_code": event_code,
-                "description": str(choice.get("description", choice.get("relation_name", ""))).strip(),
-                "metadata": dict(choice.get("metadata", {})) if isinstance(choice.get("metadata"), dict) else {},
-            }
-        )
-    return normalized
 
 
 def _event_trigger(event: EventNode) -> str:
@@ -120,34 +105,31 @@ def _render_edges(
     return "\n".join(f"- {line}" for line in lines) if lines else "- none", edge_ref_to_id
 
 
-def _render_choices(choices: list[dict[str, Any]]) -> str:
-    if not choices:
-        return "- no explicit choices; output the best three-digit event_code"
-    return "\n".join(
-        f"- {choice['choice_id']} | event_code={choice['event_code']} | description={choice.get('description') or '-'}"
-        for choice in choices
-    )
-
-
 def build_structured_forecast_prompt(
     query: QuerySpec,
     documents: list[NewsDocument],
     refined_graph: CoarseCausalGraph,
-    choices: list[dict[str, Any]] | None,
+    choices: list[dict[str, Any]] | None = None,
     max_graph_events: int = 24,
     max_graph_edges: int = 48,
     max_document_chars: int = 700,
 ) -> ForecastPromptBundle:
-    normalized_choices = normalize_choices(choices)
+    # The no-refinement research path deliberately does not expose the global
+    # event-code inventory. The finite answer space is learned from labels and
+    # enforced by decoding/reward outside the prompt.
+    del choices
+    normalized_choices: list[dict[str, Any]] = []
     event_block, event_ref_to_id, id_to_event_ref = _render_events(refined_graph, max_graph_events)
     edge_block, edge_ref_to_id = _render_edges(refined_graph, max_graph_edges, id_to_event_ref)
     prompt = (
         "You are LoRA B for future event forecasting.\n"
-        "Input includes query, closed candidate choices, cutoff-before documents, and a refined causal graph.\n"
-        "First output a structured forecast_trace, then output a closed-set final_answer.\n"
-        "Use only visible historical events and refined edges as support. Do not invent historical support.\n"
+        "Input includes query, cutoff-before documents, observed events, and a coarse causal graph.\n"
+        "First output a structured forecast_trace, then output a final_answer with one event_code.\n"
+        "No candidate choices are provided. Do not output choice_id or copy a candidate list.\n"
+        "The event_code is the closed-set target learned during training; output the valid code directly.\n"
+        "Use only visible historical events and coarse-graph edges as support. Do not invent historical support.\n"
         "Intermediate trace events may be new future hypotheses before the target time, but their support must point to visible events/edges.\n"
-        "The final answer must choose exactly one provided choice_id/event_code when choices are provided.\n"
+        "The final trace event should explain why the final event_code is likely.\n"
         "Return strict JSON only with this schema:\n"
         "{\n"
         '  "forecast_trace": {\n'
@@ -163,23 +145,21 @@ def build_structured_forecast_prompt(
         "    ],\n"
         '    "trace_edges": [\n'
         '      {"source_ref": "H01", "target_ref": "ft_1", "relation_type": "causes", "confidence": 0.0},\n'
-        '      {"source_ref": "ft_1", "target_ref": "answer_C001", "relation_type": "raises_likelihood", "confidence": 0.0}\n'
+        '      {"source_ref": "ft_1", "target_ref": "answer_173", "relation_type": "raises_likelihood", "confidence": 0.0}\n'
         "    ]\n"
         "  },\n"
-        '  "final_answer": {"choice_id": "C001", "event_code": "000", "confidence": 0.0}\n'
+        '  "final_answer": {"event_code": "000", "event": "event description", "confidence": 0.0}\n'
         "}\n\n"
-        "Invalid outputs: nonexistent event_ref/edge_ref, generic events like 'tensions rise', answers outside the choices, or cutoff-after facts as observed history.\n\n"
+        "Invalid outputs: nonexistent event_ref/edge_ref, generic events like 'tensions rise', invalid event_code, or cutoff-after facts as observed history.\n\n"
         f"QueryId: {query.query_id}\n"
         f"Query: {query.text}\n"
         f"Target/Cutoff date: {query.cutoff_time or '-'}\n"
         f"Focus actors: {', '.join(query.focus_entities) or '-'}\n\n"
-        "Choices:\n"
-        f"{_render_choices(normalized_choices)}\n\n"
         "Documents:\n"
         f"{_render_documents(documents, max_document_chars)}\n\n"
         "Visible historical events:\n"
         f"{event_block}\n\n"
-        "Refined causal edges:\n"
+        "Coarse causal edges:\n"
         f"{edge_block}\n"
     )
     return ForecastPromptBundle(

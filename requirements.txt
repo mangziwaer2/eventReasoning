@@ -4,3 +4,5 @@ accelerate
 safetensors
 peft
 tqdm
+trl
+datasets

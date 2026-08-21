@@ -18,6 +18,7 @@ from coarse_graph_dataset import parse_pair_payload
 from event_extraction import format_event_mention
 from event_extraction import normalize_text
 from event_extraction import split_sentences
+from forecast_trace_prompt import FORECAST_TRACE_SYSTEM_PROMPT
 from forecast_trace_prompt import build_structured_forecast_prompt
 from forecast_trace_schema import parse_structured_forecast
 from event_input import EventInputValidationError
@@ -28,7 +29,6 @@ from local_llm import LocalQwenGenerator
 from local_qwen_lora import LoraUnavailable
 from local_qwen_lora import load_qwen_for_inference
 from mirai_dataset import export_mirai_query_snapshot
-from mirai_dataset import load_mirai_event_code_choices
 from mirai_dataset import load_mirai_news_for_docids
 from mirai_dataset import load_mirai_queries
 from path_utils import REPO_ROOT
@@ -46,8 +46,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Local no-API evaluation: pre-extracted events or an optional frozen Qwen extractor "
-            "provide event nodes, a frozen or adapter-based coarse Qwen builds the coarse graph, refinement produces a causal graph, "
-            "and native Qwen forecasts future events."
+            "provide event nodes, a frozen or adapter-based coarse Qwen builds the causal graph, "
+            "and native Qwen forecasts a structured future trace. Refinement is optional and disabled by default."
         )
     )
     parser.add_argument("--dataset", default=str(REPO_ROOT / "datasets" / "MIRAI_data.zip"), help="Path to MIRAI_data.zip.")
@@ -56,15 +56,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--query-id", default=None, help="Optional single MIRAI QueryId.")
 
     parser.add_argument("--model-path", default=str(REPO_ROOT / "models" / "Qwen2.5-0.5B"), help="Native local Qwen model path for optional event extraction and default forecasting.")
-    parser.add_argument("--coarse-base-model-path", default=None, help="Base Qwen model for the coarse stage. Defaults to --model-path.")
+    parser.add_argument("--coarse-base-model-path", default=str(REPO_ROOT / "models" / "Qwen2.5-0.5B"), help="Base Qwen model for the coarse stage. Defaults to --model-path.")
     parser.add_argument("--coarse-adapter-path", default=None, help="Optional coarse LoRA adapter path. Omit to run the coarse stage frozen.")
     parser.add_argument("--refinement-model-path", default=str(REPO_ROOT / "outputs" / "refinement_graph_4090_full" / "refinement_model.pt"), help="Refinement model path.")
-    parser.add_argument("--forecast-base-model-path", default=None, help="Base Qwen model for LoRA B. Defaults to --model-path.")
+    parser.add_argument("--forecast-base-model-path", default=str(REPO_ROOT / "models" / "Qwen2.5-0.5B"), help="Base Qwen model for LoRA B. Defaults to --model-path.")
     parser.add_argument("--forecast-adapter-path", default=None, help="Optional LoRA B adapter path for structured forecasting.")
 
     parser.add_argument("--event-source", choices=["precomputed", "qwen"], default="precomputed", help="Event input source. precomputed is the research setting; qwen is an optional frozen-extractor baseline.")
-    parser.add_argument("--precomputed-events", default=None, help="event-input-v1 JSON/JSONL path required when event-source=precomputed.")
-    parser.add_argument("--queries-from-precomputed-events", action="store_true", help="When using precomputed events, evaluate the query_ids present in that file instead of the first N rows from MIRAI split.")
+    parser.add_argument("--precomputed-events", default="datasets/mirai_event_inputs_rule/mirai_event_input_train.jsonl", help="event-input-v1 JSON/JSONL path required when event-source=precomputed.")
+    parser.add_argument(
+        "--queries-from-precomputed-events",
+        dest="queries_from_precomputed_events",
+        action="store_true",
+        default=True,
+        help="Evaluate the query_ids present in the precomputed event file (default).",
+    )
+    parser.add_argument(
+        "--queries-from-dataset-split",
+        dest="queries_from_precomputed_events",
+        action="store_false",
+        help="Ignore precomputed-file query order and evaluate the selected MIRAI split instead.",
+    )
     parser.add_argument("--max-docs", type=int, default=4, help="Maximum MIRAI documents used as authoritative context.")
     parser.add_argument("--max-document-chars", type=int, default=900, help="Maximum characters per document in the optional Qwen extraction prompt.")
     parser.add_argument("--max-events", type=int, default=16, help="Maximum pre-extracted or Qwen-extracted events kept per query.")
@@ -82,15 +94,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-completion-candidates", dest="include_completion_candidates", action="store_false", help="Disable refinement completion candidates.")
     parser.add_argument("--max-completion-edges", type=int, default=64, help="Maximum completion candidates for refinement. Use 0 for no cap.")
     parser.add_argument("--refinement-keep-threshold", type=float, default=0.5, help="Minimum refinement keep probability.")
-    parser.add_argument("--skip-refinement", action="store_true", help="Bypass graph refinement and forecast directly from the coarse graph.")
+    parser.add_argument(
+        "--skip-refinement",
+        dest="skip_refinement",
+        action="store_true",
+        default=True,
+        help="Use the coarse graph directly. This is the default no-refinement research path.",
+    )
+    parser.add_argument(
+        "--enable-refinement",
+        dest="skip_refinement",
+        action="store_false",
+        help="Enable the optional refinement model for an ablation or later experiment.",
+    )
 
     parser.add_argument("--prediction-mode", choices=["forecast-trace", "legacy"], default="forecast-trace", help="forecast-trace emits structured trace + final_answer; legacy emits the older flat JSON.")
-    parser.add_argument("--forecast-temperature", type=float, default=0.0, help="Native Qwen temperature for final forecasting.")
+    parser.add_argument("--forecast-temperature", type=float, default=0.7, help="Native Qwen temperature for final forecasting.")
     parser.add_argument("--forecast-max-new-tokens", type=int, default=320, help="Maximum native Qwen tokens for forecast JSON.")
     parser.add_argument("--max-graph-events-in-prompt", type=int, default=24, help="Maximum graph events shown to forecast Qwen.")
     parser.add_argument("--max-graph-edges-in-prompt", type=int, default=48, help="Maximum graph edges shown to forecast Qwen.")
     parser.add_argument("--forecast-max-document-chars", type=int, default=700, help="Maximum characters per document shown to LoRA B.")
-    parser.add_argument("--max-choice-codes", type=int, default=0, help="Optional cap for dataset-level MIRAI event-code choices. Use 0 for all observed codes.")
+    parser.add_argument(
+        "--max-choice-codes",
+        type=int,
+        default=0,
+        help="Deprecated compatibility option; no-refinement forecast prompts do not serialize candidate choices.",
+    )
     parser.add_argument("--no-save-forecast-prompts", dest="save_forecast_prompts", action="store_false", default=True, help="Do not store forecast prompts in predictions.jsonl. Disable only when outputs are too large; RL training needs these prompts.")
 
     parser.add_argument("--policy", default="forecast_trace_reward", help="RL hook policy name: noop, mirai_code_reward, or forecast_trace_reward.")
@@ -545,11 +574,9 @@ def main() -> None:
         examples = all_examples[: args.limit] if args.limit > 0 else all_examples
     if not examples:
         raise RuntimeError(f"No MIRAI examples found for split={args.split!r}, query_id={args.query_id!r}.")
-    choice_pool = (
-        load_mirai_event_code_choices(dataset_path, max_choices=args.max_choice_codes)
-        if args.prediction_mode == "forecast-trace"
-        else []
-    )
+    # Event-code supervision is kept in the dataset/reward path. The global
+    # code inventory is intentionally not serialized into the forecast prompt.
+    choice_pool: list[dict[str, Any]] = []
 
     if args.event_source == "precomputed":
         missing_query_ids = [example.query_id for example in examples if example.query_id not in precomputed_event_index]
@@ -728,7 +755,7 @@ def main() -> None:
                 )
             else:
                 if refinement_model is None:
-                    raise RuntimeError("refinement_model is not loaded; omit --skip-refinement or provide a model.")
+                    raise RuntimeError("refinement_model is not loaded; keep --skip-refinement or provide a refinement model.")
                 refined_graph = refine_graph(
                     coarse_graph=coarse_graph,
                     sample_id=f"mirai_{example.query_id}",
@@ -767,13 +794,13 @@ def main() -> None:
                 raw_forecast = forecast_qwen.generate(
                     forecast_prompt,
                     temperature=args.forecast_temperature,
-                    system_prompt="You output structured forecast_trace and closed-set final_answer JSON only.",
+                    system_prompt=FORECAST_TRACE_SYSTEM_PROMPT,
                     max_new_tokens=args.forecast_max_new_tokens,
                 )
                 forecast_prediction = parse_structured_forecast(raw_forecast, choices=prompt_bundle.choices)
                 forecast_context = {
                     "prediction_mode": args.prediction_mode,
-                    "choices": prompt_bundle.choices,
+                    "choices": [],
                     "event_ref_to_id": prompt_bundle.event_ref_to_id,
                     "edge_ref_to_id": prompt_bundle.edge_ref_to_id,
                     "refined_graph": refined_graph.to_dict(),
@@ -783,7 +810,7 @@ def main() -> None:
                 raw_forecast = forecast_qwen.generate(
                     forecast_prompt,
                     temperature=args.forecast_temperature,
-                    system_prompt="You forecast future events from a refined causal graph and return strict JSON only.",
+                    system_prompt="You forecast future events from a causal graph and return strict JSON only.",
                     max_new_tokens=args.forecast_max_new_tokens,
                 )
                 forecast_prediction = parse_forecast_json(raw_forecast)
@@ -840,13 +867,13 @@ def main() -> None:
                 "score": score,
                 "reward": reward,
                 "reward_breakdown": reward_breakdown,
-                "choices": choice_pool if args.prediction_mode == "forecast-trace" else [],
+                "choices": [],
                 "trajectory": trajectory.to_dict(),
             }
             if args.save_forecast_prompts:
                 row["forecast_prompt"] = forecast_prompt
                 row["forecast_system_prompt"] = (
-                    "You output structured forecast_trace and closed-set final_answer JSON only."
+                    FORECAST_TRACE_SYSTEM_PROMPT
                     if args.prediction_mode == "forecast-trace"
                     else "You forecast future events from a refined causal graph and return strict JSON only."
                 )

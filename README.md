@@ -2,7 +2,7 @@
 
 本项目研究一个明确问题：
 
-> 给定截止时间前的新闻文档和上游已抽取事件，构建并修正事件因果图，再让 LLM 基于该图预测未来事件。
+> 给定截止时间前的新闻文档和上游已抽取事件，构建事件因果图，再让 LLM 基于该图输出开放式未来事件轨迹和可训练的目标事件代码。
 
 本项目不研究或训练事件抽取器。MAVEN 使用数据集 gold events，MIRAI 使用冻结外部抽取器预计算的事件。最终评价标准是未来事件预测效果，不是事件抽取准确率或单独的图边分类准确率。
 
@@ -13,14 +13,13 @@ gold/frozen upstream extractor (outside our method)
 -> query + cutoff time + documents + strict event mentions
 -> candidate event pairs
 -> Qwen LoRA coarse graph
--> graph-level refinement
--> refined causal graph
--> frozen LLM future event prediction
+-> forecast_trace + final_answer.event_code
+-> deterministic reward / offline RL / GRPO
 ```
 
 - 粗图模型：默认 `Qwen2.5-0.5B + LoRA`，负责高频事件对关系评分。
-- Refinement：time-aware relational GNN，整图执行删边、补边、改类和强度重估。
-- 最终预测模型：建议使用原生 Qwen 4B 或更大模型，读取 refined graph 后输出 Top-K 未来事件。
+- Refinement：当前默认关闭；no-refinement 方法验证可行后，再接入 time-aware relational GNN 做对照。
+- 最终预测模型：读取 coarse graph，联合输出开放式 `forecast_trace` 与闭集监督目标 `event_code`。
 - 主数据集：MAVEN-ERE 用于图监督，MIRAI 用于最终未来事件预测评测。
 - 对外输入：统一使用 [`event-input-v1`](docs/事件输入规范.md)，其他使用者可替换自己的事件抽取器。
 
@@ -34,6 +33,8 @@ docs/
   事件输入规范.md                   预抽取事件 schema 与实验边界
   训练操作手册.md                   训练、续训和评测命令
   coarse_graph_qwen_training.md    粗图训练细节
+  forecast_trace_no_refinement.md  当前默认主线和运行入口
+  forecast_trace_prompt_templates.md 当前使用的全部 prompt 模板
   refinement模型结构说明.md         Refinement 结构和参数
 
 src/
@@ -52,6 +53,9 @@ src/
   evaluate_maven_pipeline.py       粗图与 refinement 图指标
   evaluate_local_qwen_pipeline.py  无 API 的端到端未来预测
   rl_pipeline_hooks.py             后续 RL 接口
+  forecast_trace_grpo_rewards.py   GRPO reward 适配器
+  train_forecast_trace_rl.py       离线 reward-weighted LoRA
+  train_forecast_trace_grpo.py     TRL GRPO 训练入口
 ```
 
 `datasets/`、`models/` 和 `outputs/` 是本地大文件目录，不纳入 Git。
@@ -104,7 +108,7 @@ python src/train_coarse_graph_qwen.py \
   --output-dir outputs/coarse_graph_qwen_lora_4090_full
 ```
 
-Refinement：
+Refinement（后续可选，当前主线暂不运行）：
 
 ```bash
 python src/train_refinement.py \
@@ -142,7 +146,6 @@ python src/evaluate_local_qwen_pipeline.py \
   --model-path models/Qwen2.5-4B \
   --coarse-base-model-path models/Qwen2.5-0.5B \
   --coarse-adapter-path outputs/coarse_graph_qwen_lora_4090_full/best_adapter \
-  --refinement-model-path outputs/refinement_graph_4090_full/refinement_model.pt \
   --output-dir outputs/local_qwen_pipeline_eval
 ```
 
@@ -155,16 +158,15 @@ python src/evaluate_local_qwen_pipeline.py \
 ```text
 query + cutoff 前文档 + 严格事件节点
 -> coarse graph
--> refined graph
 -> forecast_trace
--> closed-set final_answer
+-> final_answer.event_code
 ```
 
-`forecast_trace` 预测 `t` 时刻之前可能发生的中间事件，并回指 refined graph 中的历史事件与边；`final_answer` 从候选集合中选择 `t` 时刻事件，用于稳定计算 Accuracy/F1/Hit@K。
+`forecast_trace` 预测 `t` 时刻之前可能发生的中间事件，并回指 coarse graph 中的历史事件与边；`final_answer` 直接生成数据集标签空间中的 `event_code`，用于稳定计算 Accuracy/F1/Hit@K。候选 choices 不再进入预测 prompt，trace 和 answer 保持在同一个 completion 中。
 
-具体流程、样本级输入输出、训练方法、RL 奖励和评测指标见 [Forecast Trace Pipeline](docs/forecast_trace_pipeline.md)。
+当前流程见 [No-refinement Forecast Trace](docs/forecast_trace_no_refinement.md)，实际 prompt 见 [Forecast Trace Prompt 模板清单](docs/forecast_trace_prompt_templates.md)。
 ## 当前结论
 
-- 已完成：严格预抽取事件输入、Qwen 粗图训练/续训、整图 refinement、MAVEN 评测入口、本地 Qwen 未来预测入口。
-- 尚未证明：`refined graph + forecast_trace` 能显著提升 MIRAI 闭集未来事件预测。
-- 下一步 P0：实现 forecast trace schema、端到端 trace 评测模式和离线 reward 计算，再把 refinement 训练数据改为真实 out-of-fold coarse predictions。
+- 已完成：严格预抽取事件输入、Qwen 粗图、no-refinement forecast trace、直接 event-code answer、确定性 reward、离线 RL 与 GRPO 接口。
+- 尚未证明：`coarse graph + forecast_trace` 能显著提升 MIRAI 目标事件预测和开放式 trace 质量。
+- 下一步 P0：先跑 no-refinement 基线与 RL 小实验；方法有效后再接入 refinement 做增量对照。

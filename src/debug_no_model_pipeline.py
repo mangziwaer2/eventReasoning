@@ -11,11 +11,11 @@ from coarse_graph_dataset import build_graph_from_pair_predictions
 from event_input import EventInputRecord
 from event_input import load_event_input_index
 from event_input import materialize_event_input
+from forecast_trace_prompt import FORECAST_TRACE_SYSTEM_PROMPT
 from forecast_trace_prompt import build_structured_forecast_prompt
 from forecast_trace_schema import parse_structured_forecast
 from mirai_dataset import export_mirai_query_snapshot
 from mirai_dataset import get_mirai_query_by_id
-from mirai_dataset import load_mirai_event_code_choices
 from mirai_dataset import load_mirai_news_for_docids
 from path_utils import REPO_ROOT
 from path_utils import resolve_repo_path
@@ -23,12 +23,7 @@ from rl_pipeline_hooks import PipelineTrajectory
 from rl_pipeline_hooks import build_pipeline_policy
 
 
-DEFAULT_CHOICES = [
-    {"choice_id": "C001", "event_code": "010", "description": "make a public statement"},
-    {"choice_id": "C002", "event_code": "030", "description": "express intent to cooperate"},
-    {"choice_id": "C003", "event_code": "112", "description": "impose administrative sanctions"},
-    {"choice_id": "C004", "event_code": "173", "description": "arrest or detain"},
-]
+DEFAULT_EVENT_CODE = "010"
 
 
 def parse_args() -> argparse.Namespace:
@@ -42,13 +37,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--query-id", default=None, help="Record selector for JSONL input. Defaults to first/single record.")
     parser.add_argument("--dataset", default=str(REPO_ROOT / "datasets" / "MIRAI_data.zip"), help="MIRAI zip, only used with --mirai-query-id.")
     parser.add_argument("--split", default="test", help="MIRAI split, only used with --mirai-query-id.")
-    parser.add_argument("--mirai-query-id", default=None, help="Optional MIRAI QueryId used to supply query/docs/gold/choices.")
+    parser.add_argument("--mirai-query-id", default=None, help="Optional MIRAI QueryId used to supply query, documents, and gold labels.")
     parser.add_argument("--max-docs", type=int, default=4, help="Maximum documents for MIRAI mode.")
     parser.add_argument("--max-events", type=int, default=16, help="Maximum events kept.")
     parser.add_argument("--max-pairs", type=int, default=64, help="Maximum candidate event pairs.")
     parser.add_argument("--max-sentence-gap", type=int, default=3, help="Candidate event-pair sentence gap.")
     parser.add_argument("--coarse-keep-threshold", type=float, default=0.5, help="Mock coarse confidence threshold.")
-    parser.add_argument("--max-choice-codes", type=int, default=12, help="MIRAI choice cap in debug output. Use 0 for all.")
     parser.add_argument("--policy", default="forecast_trace_reward", help="Reward policy name.")
     parser.add_argument("--output", default=str(REPO_ROOT / "outputs" / "debug_no_model_pipeline.json"), help="Debug JSON output path. Use '-' to print JSON to stdout.")
     parser.add_argument("--predictions-output", default=None, help="Optional one-row predictions.jsonl compatible with RL training. Use '-' to print it to stdout; omit with --output - to avoid file writes.")
@@ -66,7 +60,7 @@ def load_record(input_path: Path, query_id: str | None) -> EventInputRecord:
     return next(iter(index.values()))
 
 
-def build_document_sample(args: argparse.Namespace) -> tuple[DocumentGraphSample, dict[str, Any], list[dict[str, Any]]]:
+def build_document_sample(args: argparse.Namespace) -> tuple[DocumentGraphSample, dict[str, Any]]:
     input_path = resolve_repo_path(args.input)
     record = load_record(input_path, args.query_id)
 
@@ -76,7 +70,6 @@ def build_document_sample(args: argparse.Namespace) -> tuple[DocumentGraphSample
         query = example.build_query_spec()
         documents = load_mirai_news_for_docids(dataset_path, example.docids)[: args.max_docs]
         gold = json.loads(export_mirai_query_snapshot(example))
-        choices = load_mirai_event_code_choices(dataset_path, max_choices=args.max_choice_codes)
     else:
         if record.query is None:
             raise RuntimeError("The event input record has no query. Provide --mirai-query-id or include query in input.")
@@ -85,10 +78,9 @@ def build_document_sample(args: argparse.Namespace) -> tuple[DocumentGraphSample
         gold = {
             "query_id": query.query_id,
             "date_str": query.cutoff_time,
-            "answer_list": [DEFAULT_CHOICES[0]["event_code"]],
+            "answer_list": [DEFAULT_EVENT_CODE],
             "debug_gold": True,
         }
-        choices = DEFAULT_CHOICES
 
     _, _, events = materialize_event_input(record, query=query, documents=documents, max_events=args.max_events)
     sample = DocumentGraphSample(
@@ -104,7 +96,7 @@ def build_document_sample(args: argparse.Namespace) -> tuple[DocumentGraphSample
             "mirai_query_id": args.mirai_query_id,
         },
     )
-    return sample, gold, choices
+    return sample, gold
 
 
 def lexical_overlap_score(left: str, right: str) -> float:
@@ -151,14 +143,9 @@ def mock_pair_prediction(pair_sample) -> dict[str, Any]:
     }
 
 
-def mock_forecast_json(prompt_bundle, gold: dict[str, Any], choices: list[dict[str, Any]]) -> str:
-    first_choice = choices[0] if choices else {"choice_id": "", "event_code": ""}
+def mock_forecast_json(prompt_bundle, gold: dict[str, Any]) -> str:
     gold_codes = [str(item) for item in gold.get("answer_list", []) if str(item)]
-    selected = first_choice
-    for choice in choices:
-        if str(choice.get("event_code")) in gold_codes:
-            selected = choice
-            break
+    selected_code = gold_codes[0] if gold_codes else DEFAULT_EVENT_CODE
 
     event_refs = list(prompt_bundle.event_ref_to_id)
     edge_refs = list(prompt_bundle.edge_ref_to_id)
@@ -177,7 +164,7 @@ def mock_forecast_json(prompt_bundle, gold: dict[str, Any], choices: list[dict[s
                     },
                     "supporting_event_ids": [support_event] if support_event else [],
                     "supporting_edge_ids": [support_edge] if support_edge else [],
-                    "expected_effect": "debug hypothesis linking visible history to the selected answer",
+                    "expected_effect": "debug hypothesis linking visible history to the final event code",
                     "confidence": 0.66,
                 }
             ],
@@ -185,7 +172,7 @@ def mock_forecast_json(prompt_bundle, gold: dict[str, Any], choices: list[dict[s
                 {"source_id": support_event, "target_id": "ft_1", "relation_type": "causes", "confidence": 0.61},
                 {
                     "source_id": "ft_1",
-                    "target_id": f"answer_{selected.get('choice_id', '')}",
+                    "target_id": f"answer_{selected_code}",
                     "relation_type": "raises_likelihood",
                     "confidence": 0.6,
                 },
@@ -194,9 +181,8 @@ def mock_forecast_json(prompt_bundle, gold: dict[str, Any], choices: list[dict[s
             else [],
         },
         "final_answer": {
-            "choice_id": selected.get("choice_id", ""),
-            "event_code": selected.get("event_code", ""),
-            "event": selected.get("description", ""),
+            "event_code": selected_code,
+            "event": str(gold.get("relation_name", "debug target event")),
             "confidence": 0.64,
             "supporting_event_ids": [support_event] if support_event else [],
             "supporting_edge_ids": [support_edge] if support_edge else [],
@@ -207,7 +193,7 @@ def mock_forecast_json(prompt_bundle, gold: dict[str, Any], choices: list[dict[s
 
 def main() -> None:
     args = parse_args()
-    document_sample, gold, choices = build_document_sample(args)
+    document_sample, gold = build_document_sample(args)
     pair_samples = build_event_pair_inference_samples(
         sample=document_sample,
         max_sentence_gap=args.max_sentence_gap,
@@ -226,9 +212,8 @@ def main() -> None:
         query=document_sample.query,
         documents=document_sample.documents,
         refined_graph=refined_graph,
-        choices=choices,
     )
-    raw_forecast = mock_forecast_json(prompt_bundle, gold=gold, choices=prompt_bundle.choices)
+    raw_forecast = mock_forecast_json(prompt_bundle, gold=gold)
     forecast_prediction = parse_structured_forecast(raw_forecast, choices=prompt_bundle.choices)
 
     trajectory = PipelineTrajectory(
@@ -236,7 +221,7 @@ def main() -> None:
         metadata={
             "policy": args.policy,
             "query": document_sample.query.to_dict(),
-            "choices": prompt_bundle.choices,
+            "choices": [],
             "event_ref_to_id": prompt_bundle.event_ref_to_id,
             "edge_ref_to_id": prompt_bundle.edge_ref_to_id,
             "refined_graph": refined_graph.to_dict(),
@@ -272,7 +257,7 @@ def main() -> None:
         reward=reward,
         metadata={
             "prediction_mode": "forecast-trace",
-            "choices": prompt_bundle.choices,
+            "choices": [],
             "event_ref_to_id": prompt_bundle.event_ref_to_id,
             "edge_ref_to_id": prompt_bundle.edge_ref_to_id,
             "refined_graph": refined_graph.to_dict(),
@@ -290,7 +275,7 @@ def main() -> None:
             "query": document_sample.query.to_dict(),
             "documents": [document.to_dict() for document in document_sample.documents],
             "events": [event.to_dict() for event in document_sample.events],
-            "choices": prompt_bundle.choices,
+            "choices": [],
             "gold": gold,
         },
         "coarse": {
@@ -345,11 +330,11 @@ def main() -> None:
         "coarse": {"generation_mode": "mock_no_model", "candidate_pairs": len(pair_samples), "edge_count": len(coarse_graph.edges)},
         "refinement": {"skipped": True, "edge_count": len(refined_graph.edges), "graph_source": "coarse_graph"},
         "forecast_prompt": prompt_bundle.prompt,
-        "forecast_system_prompt": "You output structured forecast_trace and closed-set final_answer JSON only.",
+        "forecast_system_prompt": FORECAST_TRACE_SYSTEM_PROMPT,
         "forecast_prediction": forecast_prediction,
         "reward": reward,
         "reward_breakdown": reward_breakdown,
-        "choices": prompt_bundle.choices,
+        "choices": [],
         "trajectory": trajectory.to_dict(),
     }
     row_text = json.dumps(row, ensure_ascii=False) + "\n"

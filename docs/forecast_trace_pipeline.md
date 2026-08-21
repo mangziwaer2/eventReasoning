@@ -4,6 +4,8 @@
 日期：2026-07-22
 状态：新主线的实现规格书
 
+> 本文保留包含 refinement 与显式 choices 的完整阶段方案。当前实际验证主线已经收敛为 no-refinement、无 choices、直接输出 `event_code`，以 [No-refinement Forecast Trace](forecast_trace_no_refinement.md) 和 [Prompt 模板清单](forecast_trace_prompt_templates.md) 为准。
+
 ## 1. 目标
 
 本项目最终要做的是：

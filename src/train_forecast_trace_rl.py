@@ -13,12 +13,13 @@ from local_qwen_lora import LoraUnavailable
 from local_qwen_lora import load_qwen_with_lora
 from path_utils import REPO_ROOT
 from path_utils import resolve_repo_path
+from forecast_trace_prompt import FORECAST_TRACE_SYSTEM_PROMPT
 from rl_pipeline_hooks import PipelineStep
 from rl_pipeline_hooks import PipelineTrajectory
 from rl_pipeline_hooks import build_pipeline_policy
 
 
-DEFAULT_FORECAST_SYSTEM_PROMPT = "You output structured forecast_trace and closed-set final_answer JSON only."
+DEFAULT_FORECAST_SYSTEM_PROMPT = FORECAST_TRACE_SYSTEM_PROMPT
 
 
 @dataclass(slots=True)
