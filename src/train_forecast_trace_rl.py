@@ -64,7 +64,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-length", type=int, default=2048, help="Maximum prompt + completion token length.")
     parser.add_argument("--max-completion-tokens", type=int, default=512, help="Maximum completion tokens kept for training.")
     parser.add_argument("--target-modules", nargs="+", default=["q_proj", "k_proj", "v_proj", "o_proj"], help="LoRA target modules for a fresh adapter.")
-    parser.add_argument("--lora-r", type=int, default=8, help="LoRA rank for a fresh adapter.")
+    parser.add_argument("--lora-r", type=int, default=16, help="LoRA rank for a fresh adapter.")
     parser.add_argument("--lora-alpha", type=int, default=16, help="LoRA alpha for a fresh adapter.")
     parser.add_argument("--lora-dropout", type=float, default=0.05, help="LoRA dropout for a fresh adapter.")
 
