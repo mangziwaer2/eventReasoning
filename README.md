@@ -142,7 +142,7 @@ python src/evaluate_maven_pipeline.py \
 python src/evaluate_local_qwen_pipeline.py \
   --limit 8 \
   --event-source precomputed \
-  --precomputed-events datasets/mirai_events_test.jsonl \
+  --precomputed-events datasets/mirai_event_inputs_rule/mirai_event_input_test.jsonl \
   --model-path models/Qwen2.5-4B \
   --coarse-base-model-path models/Qwen2.5-0.5B \
   --coarse-adapter-path outputs/coarse_graph_qwen_lora_4090_full/best_adapter \

@@ -15,6 +15,7 @@
 - [Coarse Graph Qwen Training](coarse_graph_qwen_training.md)：粗图 Qwen LoRA 的数据与日志说明。
 - [Forecast Trace 离线 RL](forecast_trace_rl_training.md)：reward-weighted LoRA continuation。
 - [Forecast Trace GRPO](forecast_trace_grpo_training.md)：TRL GRPO 数据、reward 与训练入口。
+- [Cloud no-refinement runbook](cloud_rl_no_refinement.md)：云端 rollout、离线 RL 和伪划分评测命令。
 
 ## 模型细节
 

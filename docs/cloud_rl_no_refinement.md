@@ -15,20 +15,20 @@ build_summary.json
 
 Use frozen Qwen4B for coarse graph construction, skip refinement, and save forecast prompts for RL.
 
-python src/evaluate_local_qwen_pipeline.py
---split test
---event-source precomputed
---precomputed-events datasets/mirai_event_inputs_rule/mirai_event_input_train.jsonl
---queries-from-precomputed-events
---model-path models/Qwen3-4B
---coarse-base-model-path models/Qwen3-4B 
---forecast-base-model-path models/Qwen3-4B
---policy forecast_trace_reward
---prediction-mode forecast-trace
---forecast-temperature 0.7
---forecast-max-new-tokens 512
---output-dir outputs/rollouts_mirai_rule_train_no_refine
-
+python src/evaluate_local_qwen_pipeline.py \
+  --split test \
+  --event-source precomputed \
+  --precomputed-events datasets/mirai_event_inputs_rule/mirai_event_input_train.jsonl \
+  --queries-from-precomputed-events \
+  --model-path models/Qwen3-4B \
+  --coarse-base-model-path models/Qwen3-4B \
+  --skip-refinement \
+  --forecast-base-model-path models/Qwen3-4B \
+  --policy forecast_trace_reward \
+  --prediction-mode forecast-trace \
+  --forecast-temperature 0.7 \
+  --forecast-max-new-tokens 512 \
+  --output-dir outputs/rollouts_mirai_rule_train_no_refine
 Optional: if you already have a supervised LoRA-B adapter, add:
 
 --forecast-adapter-path outputs/forecast_trace_sft_lora/best_adapter

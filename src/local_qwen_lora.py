@@ -33,6 +33,16 @@ def import_qwen_lora_stack() -> tuple[Any, Any, Any, Any, Any, Any]:
     return torch, AutoModelForCausalLM, AutoTokenizer, LoraConfig, get_peft_model, PeftModel
 
 
+def _inference_model_kwargs(torch: Any) -> dict[str, Any]:
+    model_kwargs: dict[str, Any] = {"trust_remote_code": False, "low_cpu_mem_usage": True}
+    if torch.cuda.is_available():
+        if hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported():
+            model_kwargs["torch_dtype"] = torch.bfloat16
+        else:
+            model_kwargs["torch_dtype"] = torch.float16
+    return model_kwargs
+
+
 def _move_to_device(model, torch):
     if torch.cuda.is_available():
         return model.to("cuda")
@@ -54,7 +64,7 @@ def load_qwen_with_lora(
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model = auto_model_cls.from_pretrained(model_path, trust_remote_code=False)
+    model = auto_model_cls.from_pretrained(model_path, **_inference_model_kwargs(torch))
     if adapter_path is not None:
         try:
             model = peft_model_cls.from_pretrained(model, adapter_path, is_trainable=True)
@@ -88,7 +98,7 @@ def load_trained_qwen_lora(
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model = auto_model_cls.from_pretrained(base_model_path, trust_remote_code=False)
+    model = auto_model_cls.from_pretrained(base_model_path, **_inference_model_kwargs(torch))
     model = peft_model_cls.from_pretrained(model, adapter_path)
     model = _move_to_device(model, torch)
     return model, tokenizer, torch
@@ -113,7 +123,7 @@ def load_qwen_for_inference(
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model = AutoModelForCausalLM.from_pretrained(base_model_path, trust_remote_code=False)
+    model = AutoModelForCausalLM.from_pretrained(base_model_path, **_inference_model_kwargs(torch))
     if adapter_path is not None:
         try:
             _disable_incompatible_torchao_for_peft()

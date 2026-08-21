@@ -110,7 +110,7 @@
     python src/evaluate_local_qwen_pipeline.py ^
       --limit 8 ^
       --event-source precomputed ^
-      --precomputed-events datasets/mirai_events_test.jsonl ^
+      --precomputed-events datasets/mirai_event_inputs_rule/mirai_event_input_test.jsonl ^
       --model-path models/Qwen3-4B ^
       --coarse-base-model-path models/Qwen3-4B ^
       --forecast-base-model-path models/Qwen3-4B ^
@@ -171,7 +171,7 @@ predictions.jsonl 现在默认保存 forecast_prompt 和 forecast_system_prompt�
     python src/evaluate_local_qwen_pipeline.py ^
       --limit 8 ^
       --event-source precomputed ^
-      --precomputed-events datasets/mirai_events_test.jsonl ^
+      --precomputed-events datasets/mirai_event_inputs_rule/mirai_event_input_test.jsonl ^
       --model-path models/Qwen3-4B ^
       --coarse-base-model-path models/Qwen3-4B ^
       --forecast-base-model-path models/Qwen3-4B ^

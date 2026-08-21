@@ -25,6 +25,7 @@ from event_input import EventInputValidationError
 from event_input import load_event_input_index
 from event_input import materialize_event_input
 from local_llm import LocalGenerationUnavailable
+from local_llm import LoadedQwenGenerator
 from local_llm import LocalQwenGenerator
 from local_qwen_lora import LoraUnavailable
 from local_qwen_lora import load_qwen_for_inference
@@ -588,13 +589,53 @@ def main() -> None:
 
     policy = build_pipeline_policy(args.policy)
     native_model_path = resolve_repo_path(args.model_path)
-    native_qwen = LocalQwenGenerator(
-        native_model_path,
-        max_new_tokens=max(args.event_extraction_max_new_tokens, args.forecast_max_new_tokens),
-    )
+    native_qwen = None
     forecast_base_model_path = resolve_repo_path(args.forecast_base_model_path) if args.forecast_base_model_path else native_model_path
     forecast_adapter_path = resolve_repo_path(args.forecast_adapter_path) if args.forecast_adapter_path else None
-    if forecast_adapter_path is None and forecast_base_model_path == native_model_path:
+    coarse_base_model_path = resolve_repo_path(args.coarse_base_model_path) if args.coarse_base_model_path else native_model_path
+    coarse_adapter_path = resolve_repo_path(args.coarse_adapter_path) if args.coarse_adapter_path else None
+    share_coarse_with_native = (
+        args.event_source == "qwen"
+        and coarse_adapter_path is None
+        and coarse_base_model_path == native_model_path
+    )
+    share_forecast_with_coarse = (
+        forecast_adapter_path == coarse_adapter_path
+        and forecast_base_model_path == coarse_base_model_path
+    )
+    if args.event_source == "qwen":
+        native_qwen = LocalQwenGenerator(
+            native_model_path,
+            max_new_tokens=max(args.event_extraction_max_new_tokens, args.forecast_max_new_tokens),
+        )
+    try:
+        if share_coarse_with_native:
+            if native_qwen is None:
+                raise RuntimeError("native_qwen is not loaded; event-source=qwen requires the extractor model.")
+            coarse_model = native_qwen.model
+            coarse_tokenizer = native_qwen.tokenizer
+            torch = native_qwen._torch
+            device = native_qwen.device
+            coarse_mode = "shared-native"
+        else:
+            coarse_model, coarse_tokenizer, torch = load_qwen_for_inference(
+                base_model_path=coarse_base_model_path,
+                adapter_path=coarse_adapter_path,
+            )
+            coarse_model.eval()
+            device = next(coarse_model.parameters()).device
+            coarse_mode = "frozen" if coarse_adapter_path is None else "lora"
+    except LoraUnavailable as exc:
+        raise RuntimeError(str(exc)) from exc
+
+    if share_forecast_with_coarse:
+        forecast_qwen = LoadedQwenGenerator(
+            coarse_model,
+            coarse_tokenizer,
+            torch,
+            max_new_tokens=args.forecast_max_new_tokens,
+        )
+    elif forecast_adapter_path is None and forecast_base_model_path == native_model_path and native_qwen is not None:
         forecast_qwen = native_qwen
     else:
         forecast_qwen = LocalQwenGenerator(
@@ -602,18 +643,6 @@ def main() -> None:
             max_new_tokens=args.forecast_max_new_tokens,
             adapter_path=forecast_adapter_path,
         )
-    try:
-        coarse_base_model_path = resolve_repo_path(args.coarse_base_model_path) if args.coarse_base_model_path else native_model_path
-        coarse_adapter_path = resolve_repo_path(args.coarse_adapter_path) if args.coarse_adapter_path else None
-        coarse_model, coarse_tokenizer, torch = load_qwen_for_inference(
-            base_model_path=coarse_base_model_path,
-            adapter_path=coarse_adapter_path,
-        )
-    except LoraUnavailable as exc:
-        raise RuntimeError(str(exc)) from exc
-    coarse_model.eval()
-    device = next(coarse_model.parameters()).device
-    coarse_mode = "frozen" if coarse_adapter_path is None else "lora"
     refinement_model = None if args.skip_refinement else load_refinement_model(args, torch, device)
 
     started = time.time()
@@ -625,7 +654,7 @@ def main() -> None:
                 f"split={args.split}",
                 f"samples={len(examples)}",
                 f"event_source={args.event_source}",
-                f"native_device={native_qwen.device}",
+                f"native_device={native_qwen.device if native_qwen is not None else 'not-loaded'}",
                 f"forecast_device={forecast_qwen.device}",
                 f"coarse_device={device}",
                 f"coarse_mode={coarse_mode}",
@@ -672,6 +701,8 @@ def main() -> None:
                     "max_events": args.max_events,
                 }
             else:
+                if native_qwen is None:
+                    raise RuntimeError("native_qwen is not loaded; event-source=qwen requires the extractor model.")
                 extraction_prompt = build_event_extraction_prompt(
                     query_text=query.text,
                     documents=documents,

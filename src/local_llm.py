@@ -26,6 +26,89 @@ def _import_transformers() -> tuple[Any, Any, Any]:
     return torch, AutoModelForCausalLM, AutoTokenizer
 
 
+def _inference_model_kwargs(torch: Any) -> dict[str, Any]:
+    model_kwargs: dict[str, Any] = {"trust_remote_code": False, "low_cpu_mem_usage": True}
+    if torch.cuda.is_available():
+        if hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported():
+            model_kwargs["torch_dtype"] = torch.bfloat16
+        else:
+            model_kwargs["torch_dtype"] = torch.float16
+    return model_kwargs
+
+
+def _generate_text(
+    model,
+    tokenizer,
+    torch,
+    device: str,
+    prompt: str,
+    temperature: float,
+    system_prompt: str | None,
+    max_new_tokens: int,
+) -> str:
+    if hasattr(tokenizer, "apply_chat_template") and getattr(tokenizer, "chat_template", None):
+        messages = [
+            {
+                "role": "system",
+                "content": system_prompt
+                or "You forecast events from a local causal graph and must follow JSON output exactly.",
+            },
+            {"role": "user", "content": prompt},
+        ]
+        input_ids = tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            return_tensors="pt",
+        )
+    else:
+        input_ids = tokenizer(prompt, return_tensors="pt").input_ids
+
+    input_ids = input_ids.to(device)
+    attention_mask = torch.ones_like(input_ids)
+
+    with torch.no_grad():
+        outputs = model.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=max_new_tokens,
+            do_sample=temperature > 0,
+            temperature=temperature if temperature > 0 else None,
+            pad_token_id=tokenizer.eos_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+
+    generated_ids = outputs[0][input_ids.shape[-1] :]
+    return tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+
+
+class LoadedQwenGenerator:
+    def __init__(self, model, tokenizer, torch, max_new_tokens: int = 160) -> None:
+        self.model = model
+        self.tokenizer = tokenizer
+        self._torch = torch
+        self.max_new_tokens = max_new_tokens
+        self.device = str(next(model.parameters()).device)
+        self.model.eval()
+
+    def generate(
+        self,
+        prompt: str,
+        temperature: float = 0.2,
+        system_prompt: str | None = None,
+        max_new_tokens: int | None = None,
+    ) -> str:
+        return _generate_text(
+            model=self.model,
+            tokenizer=self.tokenizer,
+            torch=self._torch,
+            device=self.device,
+            prompt=prompt,
+            temperature=temperature,
+            system_prompt=system_prompt,
+            max_new_tokens=max_new_tokens or self.max_new_tokens,
+        )
+
+
 def render_graph_context(graph: LocalCausalGraph, max_events: int = 8, max_edges: int = 10) -> str:
     event_lines = []
     for event in graph.events[:max_events]:
@@ -141,7 +224,7 @@ class LocalQwenGenerator:
         self.tokenizer = auto_tokenizer_cls.from_pretrained(tokenizer_source, trust_remote_code=False)
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
-        self.model = auto_model_cls.from_pretrained(model_path, trust_remote_code=False)
+        self.model = auto_model_cls.from_pretrained(model_path, **_inference_model_kwargs(torch))
         if adapter_path is not None:
             try:
                 from local_qwen_lora import _disable_incompatible_torchao_for_peft
@@ -172,36 +255,13 @@ class LocalQwenGenerator:
         system_prompt: str | None = None,
         max_new_tokens: int | None = None,
     ) -> str:
-        if hasattr(self.tokenizer, "apply_chat_template") and getattr(self.tokenizer, "chat_template", None):
-            messages = [
-                {
-                    "role": "system",
-                    "content": system_prompt
-                    or "You forecast events from a local causal graph and must follow JSON output exactly.",
-                },
-                {"role": "user", "content": prompt},
-            ]
-            input_ids = self.tokenizer.apply_chat_template(
-                messages,
-                add_generation_prompt=True,
-                return_tensors="pt",
-            )
-        else:
-            input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids
-
-        input_ids = input_ids.to(self.device)
-        attention_mask = self._torch.ones_like(input_ids)
-
-        with self._torch.no_grad():
-            outputs = self.model.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                max_new_tokens=max_new_tokens or self.max_new_tokens,
-                do_sample=temperature > 0,
-                temperature=temperature if temperature > 0 else None,
-                pad_token_id=self.tokenizer.eos_token_id,
-                eos_token_id=self.tokenizer.eos_token_id,
-            )
-
-        generated_ids = outputs[0][input_ids.shape[-1] :]
-        return self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+        return _generate_text(
+            model=self.model,
+            tokenizer=self.tokenizer,
+            torch=self._torch,
+            device=self.device,
+            prompt=prompt,
+            temperature=temperature,
+            system_prompt=system_prompt,
+            max_new_tokens=max_new_tokens or self.max_new_tokens,
+        )
