@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from causal_graph import CoarseCausalEdge
 from causal_graph import CoarseCausalGraph
 from causal_graph import EvidenceSpan
 from causal_graph import EventNode
@@ -86,9 +87,23 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--max-sentence-gap", type=int, default=3, help="Maximum same-document sentence gap for coarse candidate pairs.")
     parser.add_argument("--max-pairs", type=int, default=64, help="Maximum coarse event pairs. Use 0 for all candidates.")
+    parser.add_argument(
+        "--coarse-inference-mode",
+        choices=["pairwise", "whole-graph"],
+        default="pairwise",
+        help="pairwise classifies candidate pairs independently; whole-graph predicts all edges for the fixed event set in one generation.",
+    )
+    parser.add_argument(
+        "--coarse-document-max-chars",
+        type=int,
+        default=1200,
+        help="Maximum characters per document shown to whole-graph coarse inference.",
+    )
     parser.add_argument("--coarse-batch-size", type=int, default=8, help="Batch size for Qwen LoRA pair generation.")
     parser.add_argument("--coarse-max-length", type=int, default=1024, help="Maximum coarse pair prompt length.")
     parser.add_argument("--coarse-max-new-tokens", type=int, default=128, help="Maximum generated tokens for coarse relation JSON.")
+    parser.add_argument("--coarse-graph-max-length", type=int, default=4096, help="Maximum whole-graph prompt length.")
+    parser.add_argument("--coarse-graph-max-new-tokens", type=int, default=384, help="Maximum whole-graph JSON generation length.")
     parser.add_argument(
         "--coarse-thinking",
         action="store_true",
@@ -338,6 +353,218 @@ def build_document_sample_from_events(
             "event_source": event_source,
         },
     )
+
+
+def build_whole_graph_prompt(document_sample: DocumentGraphSample, max_document_chars: int) -> str:
+    """Build one graph-generation prompt for the fixed event set."""
+
+    document_blocks: list[str] = []
+    for document in document_sample.documents:
+        document_blocks.append(
+            "\n".join(
+                [
+                    f"[Document {document.document_id}]",
+                    f"Title: {compact_text(document.title, 180)}",
+                    f"Date: {document.publish_time or '-'}",
+                    f"Text: {compact_text(document.text, max_document_chars)}",
+                ]
+            )
+        )
+
+    event_lines: list[str] = []
+    for event in document_sample.events:
+        trigger = str(event.metadata.get("trigger", "")).strip()
+        event_context = str(event.metadata.get("event_context", event.text)).strip()
+        participants = ", ".join(event.participants) if event.participants else "-"
+        event_lines.append(
+            " | ".join(
+                [
+                    f"event_id={event.event_id}",
+                    f"doc={event.document_id}",
+                    f"sent={event.sentence_index}",
+                    f"trigger={trigger or '-'}",
+                    f"event={event_context}",
+                    f"participants={participants}",
+                ]
+            )
+        )
+
+    document_block = "\n\n".join(document_blocks) if document_blocks else "- none"
+    event_block = "\n".join(f"- {line}" for line in event_lines) if event_lines else "- none"
+    return (
+        "Construct a directed coarse event relation graph over the provided observed event IDs.\n"
+        "The event IDs are authoritative: do not add, delete, merge, or rename events.\n"
+        "Use the documents as evidence, but output only relations between the provided event IDs.\n"
+        "Allowed relation_type values: precedes, causes, escalates, mitigates.\n"
+        "Omit unrelated or unsupported event pairs instead of outputting relation_type=none.\n"
+        "Direction is source_event_id -> target_event_id.\n"
+        "Confidence must be a number between 0 and 1.\n"
+        "Return strict JSON only with this schema:\n"
+        "{\n"
+        '  "edges": [\n'
+        "    {\n"
+        '      "source_event_id": "e1",\n'
+        '      "target_event_id": "e2",\n'
+        '      "relation_type": "causes",\n'
+        '      "confidence": 0.82,\n'
+        '      "evidence": "short supporting text"\n'
+        "    }\n"
+        "  ]\n"
+        "}\n\n"
+        f"Query: {document_sample.query.text}\n"
+        f"Target/Cutoff date: {document_sample.query.cutoff_time or '-'}\n\n"
+        f"Documents:\n{document_block}\n\n"
+        f"Observed events:\n{event_block}"
+    )
+
+
+def format_whole_graph_prompt(prompt: str, *, enable_thinking: bool = False) -> str:
+    thinking_suffix = "" if enable_thinking else "\n/no_think"
+    return (
+        "<|im_start|>system\nYou construct a coarse event graph and return JSON only.<|im_end|>\n"
+        f"<|im_start|>user\n{prompt}{thinking_suffix}<|im_end|>\n"
+        "<|im_start|>assistant\n"
+    )
+
+
+def parse_whole_graph_payload(
+    raw: str,
+    valid_event_ids: set[str],
+) -> list[dict[str, Any]] | None:
+    payload = extract_first_json_object(raw)
+    if payload is None:
+        return None
+    raw_edges = payload.get("edges", [])
+    if not isinstance(raw_edges, list):
+        return None
+
+    allowed_relations = {"precedes", "causes", "escalates", "mitigates"}
+    parsed: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for item in raw_edges:
+        if not isinstance(item, dict):
+            continue
+        source = str(item.get("source_event_id", "")).strip()
+        target = str(item.get("target_event_id", "")).strip()
+        relation = str(item.get("relation_type", "")).strip().lower()
+        if (
+            not source
+            or not target
+            or source == target
+            or source not in valid_event_ids
+            or target not in valid_event_ids
+            or relation not in allowed_relations
+        ):
+            continue
+        try:
+            confidence = float(item.get("confidence", item.get("score", 0.5)))
+        except (TypeError, ValueError):
+            confidence = 0.5
+        key = (source, target, relation)
+        if key in seen:
+            continue
+        seen.add(key)
+        parsed.append(
+            {
+                "source_event_id": source,
+                "target_event_id": target,
+                "relation_type": relation,
+                "confidence": max(0.0, min(confidence, 1.0)),
+                "evidence": str(item.get("evidence", "")).strip(),
+            }
+        )
+    return parsed
+
+
+def build_graph_from_whole_graph_prediction(
+    document_sample: DocumentGraphSample,
+    predictions: list[dict[str, Any]],
+    keep_threshold: float,
+) -> CoarseCausalGraph:
+    event_lookup = {event.event_id: event for event in document_sample.events}
+    edges: list[CoarseCausalEdge] = []
+    for edge_index, prediction in enumerate(predictions):
+        confidence = float(prediction.get("confidence", 0.0))
+        relation = str(prediction.get("relation_type", "")).strip().lower()
+        source_id = str(prediction.get("source_event_id", "")).strip()
+        target_id = str(prediction.get("target_event_id", "")).strip()
+        if (
+            source_id not in event_lookup
+            or target_id not in event_lookup
+            or source_id == target_id
+            or relation not in {"precedes", "causes", "escalates", "mitigates"}
+            or confidence < keep_threshold
+        ):
+            continue
+        source_event = event_lookup[source_id]
+        target_event = event_lookup[target_id]
+        edges.append(
+            CoarseCausalEdge(
+                edge_id=f"pred_edge_{edge_index}",
+                source_event_id=source_id,
+                target_event_id=target_id,
+                relation_type=relation,
+                score=confidence,
+                evidence=source_event.evidence + target_event.evidence,
+                feature_scores={},
+                metadata={
+                    "generated_by": "qwen_whole_graph",
+                    "confidence": confidence,
+                    "model_evidence": str(prediction.get("evidence", "")),
+                },
+            )
+        )
+    return CoarseCausalGraph(
+        query=document_sample.query,
+        documents=document_sample.documents,
+        events=document_sample.events,
+        edges=edges,
+    )
+
+
+def generate_whole_graph_prediction(
+    model,
+    tokenizer,
+    torch,
+    device,
+    document_sample: DocumentGraphSample,
+    args: argparse.Namespace,
+) -> tuple[list[dict[str, Any]] | None, str]:
+    prompt = format_whole_graph_prompt(
+        build_whole_graph_prompt(
+            document_sample,
+            max_document_chars=args.coarse_document_max_chars,
+        ),
+        enable_thinking=args.coarse_thinking,
+    )
+    encoded = tokenizer(
+        [prompt],
+        return_tensors="pt",
+        truncation=True,
+        max_length=args.coarse_graph_max_length,
+        padding=True,
+    )
+    input_ids = encoded["input_ids"].to(device)
+    attention_mask = encoded["attention_mask"].to(device)
+    eos_token_id = resolve_generation_eos_ids(tokenizer)
+    with torch.no_grad():
+        outputs = model.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=args.coarse_graph_max_new_tokens,
+            do_sample=False,
+            pad_token_id=tokenizer.eos_token_id,
+            eos_token_id=eos_token_id,
+        )
+    raw = tokenizer.decode(
+        outputs[0][input_ids.shape[-1]:],
+        skip_special_tokens=True,
+    ).strip()
+    parsed = parse_whole_graph_payload(
+        raw,
+        valid_event_ids={event.event_id for event in document_sample.events},
+    )
+    return parsed, raw
 
 
 def format_pair_prompt(prompt: str, *, enable_thinking: bool = False) -> str:
@@ -760,33 +987,65 @@ def main() -> None:
                 events,
                 event_source=args.event_source,
             )
-            pair_samples = build_event_pair_inference_samples(
-                sample=document_sample,
-                max_sentence_gap=args.max_sentence_gap,
-                max_pairs=args.max_pairs,
-            )
-            pair_predictions, pair_raw_generations = generate_coarse_predictions(
-                model=coarse_model,
-                tokenizer=coarse_tokenizer,
-                torch=torch,
-                device=device,
-                pair_samples=pair_samples,
-                args=args,
-            )
-            coarse_graph = build_graph_from_pair_predictions(
-                document_sample=document_sample,
-                pair_samples=pair_samples,
-                pair_predictions=pair_predictions,
-                keep_threshold=args.coarse_keep_threshold,
-            )
+            if args.coarse_inference_mode == "whole-graph":
+                pair_samples = []
+                whole_graph_predictions, whole_graph_raw = generate_whole_graph_prediction(
+                    model=coarse_model,
+                    tokenizer=coarse_tokenizer,
+                    torch=torch,
+                    device=device,
+                    document_sample=document_sample,
+                    args=args,
+                )
+                coarse_graph = build_graph_from_whole_graph_prediction(
+                    document_sample=document_sample,
+                    predictions=whole_graph_predictions or [],
+                    keep_threshold=args.coarse_keep_threshold,
+                )
+                coarse_candidate_pairs = len(events) * max(len(events) - 1, 0)
+                coarse_parse_rate = 1.0 if whole_graph_predictions is not None else 0.0
+                coarse_raw_generations = [whole_graph_raw]
+                coarse_generation_mode = f"whole_graph:{coarse_mode}"
+            else:
+                pair_samples = build_event_pair_inference_samples(
+                    sample=document_sample,
+                    max_sentence_gap=args.max_sentence_gap,
+                    max_pairs=args.max_pairs,
+                )
+                pair_predictions, pair_raw_generations = generate_coarse_predictions(
+                    model=coarse_model,
+                    tokenizer=coarse_tokenizer,
+                    torch=torch,
+                    device=device,
+                    pair_samples=pair_samples,
+                    args=args,
+                )
+                coarse_graph = build_graph_from_pair_predictions(
+                    document_sample=document_sample,
+                    pair_samples=pair_samples,
+                    pair_predictions=pair_predictions,
+                    keep_threshold=args.coarse_keep_threshold,
+                )
+                coarse_candidate_pairs = len(pair_samples)
+                coarse_parse_rate = safe_div(
+                    sum(1 for item in pair_predictions if item is not None),
+                    len(pair_predictions),
+                )
+                coarse_raw_generations = pair_raw_generations
+                coarse_generation_mode = f"pairwise_candidate_batching:{coarse_mode}"
+
             trajectory.add_step(
                 "coarse_graph",
-                observation={"event_count": len(events), "candidate_pairs": len(pair_samples)},
-                action={"keep_threshold": args.coarse_keep_threshold, "max_pairs": args.max_pairs},
+                observation={"event_count": len(events), "candidate_pairs": coarse_candidate_pairs},
+                action={
+                    "inference_mode": args.coarse_inference_mode,
+                    "keep_threshold": args.coarse_keep_threshold,
+                    "max_pairs": args.max_pairs,
+                },
                 metadata={
-                    "parse_rate": safe_div(sum(1 for item in pair_predictions if item is not None), len(pair_predictions)),
+                    "parse_rate": coarse_parse_rate,
                     "coarse_edge_count": len(coarse_graph.edges),
-                    "raw_preview": pair_raw_generations[:3],
+                    "raw_preview": coarse_raw_generations[:3],
                 },
             )
 
@@ -875,9 +1134,9 @@ def main() -> None:
                     "document_count": len(documents),
                     "event_input": event_input_metadata,
                     "coarse": {
-                        "generation_mode": f"pairwise_candidate_batching:{coarse_mode}",
-                        "candidate_pairs": len(pair_samples),
-                        "parse_rate": safe_div(sum(1 for item in pair_predictions if item is not None), len(pair_predictions)),
+                        "generation_mode": coarse_generation_mode,
+                        "candidate_pairs": coarse_candidate_pairs,
+                        "parse_rate": coarse_parse_rate,
                         "edge_count": len(coarse_graph.edges),
                     },
                     "refinement": {
@@ -981,9 +1240,9 @@ def main() -> None:
                 "document_count": len(documents),
                 "event_input": event_input_metadata,
                 "coarse": {
-                    "generation_mode": f"pairwise_candidate_batching:{coarse_mode}",
-                    "candidate_pairs": len(pair_samples),
-                    "parse_rate": safe_div(sum(1 for item in pair_predictions if item is not None), len(pair_predictions)),
+                    "generation_mode": coarse_generation_mode,
+                    "candidate_pairs": coarse_candidate_pairs,
+                    "parse_rate": coarse_parse_rate,
                     "edge_count": len(coarse_graph.edges),
                 },
                 "refinement": {
@@ -1086,7 +1345,7 @@ def main() -> None:
             "precomputed_events": str(precomputed_events_path) if precomputed_events_path is not None else None,
             "policy": policy.name,
             "choice_count": len(choice_pool),
-            "coarse_generation_mode": f"pairwise_candidate_batching:{coarse_mode}",
+            "coarse_generation_mode": coarse_generation_mode,
         },
         "samples": len(rows),
         "event_input_success_rate": safe_div(sum(1 for row in rows if row["event_input"]["valid"]), len(rows)),
