@@ -49,8 +49,8 @@ python -u src/evaluate_local_qwen_pipeline.py \
   --event-source precomputed \
   --precomputed-events datasets/mirai_event_inputs_rule/mirai_event_input_train.jsonl \
   --queries-from-precomputed-events \
-  --model-path models/Qwen2.5-0.5B \
-  --coarse-base-model-path models/Qwen2.5-0.5B \
+  --model-path models/Qwen3-4B \
+  --coarse-base-model-path models/Qwen3-4B \
   --coarse-adapter-path outputs/coarse_graph_qwen_lora_run1/best_adapter \
   --skip-refinement \
   --prediction-mode forecast-trace \
