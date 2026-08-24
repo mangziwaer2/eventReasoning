@@ -53,7 +53,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--dataset", default=str(REPO_ROOT / "datasets" / "MIRAI_data.zip"), help="Path to MIRAI_data.zip.")
     parser.add_argument("--split", default="test", help="MIRAI split name.")
-    parser.add_argument("--limit", type=int, default=0, help="Maximum query examples. Use 0 for the full split.")
+    parser.add_argument("--limit", type=int, default=8, help="Maximum query examples. Use 0 for the full split.")
     parser.add_argument("--query-id", default=None, help="Optional single MIRAI QueryId.")
 
     parser.add_argument("--model-path", default=str(REPO_ROOT / "models" / "Qwen2.5-0.5B"), help="Native local Qwen model path for optional event extraction and default forecasting.")
@@ -88,7 +88,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-pairs", type=int, default=64, help="Maximum coarse event pairs. Use 0 for all candidates.")
     parser.add_argument("--coarse-batch-size", type=int, default=8, help="Batch size for Qwen LoRA pair generation.")
     parser.add_argument("--coarse-max-length", type=int, default=1024, help="Maximum coarse pair prompt length.")
-    parser.add_argument("--coarse-max-new-tokens", type=int, default=1024, help="Maximum generated tokens for coarse relation JSON.")
+    parser.add_argument("--coarse-max-new-tokens", type=int, default=128, help="Maximum generated tokens for coarse relation JSON.")
+    parser.add_argument(
+        "--coarse-thinking",
+        action="store_true",
+        help="Allow Qwen3 thinking for coarse relation classification. Disabled by default; relation JSON should be short.",
+    )
     parser.add_argument("--coarse-keep-threshold", type=float, default=0.5, help="Minimum coarse relation confidence kept as an edge.")
 
     parser.add_argument("--include-completion-candidates", dest="include_completion_candidates", action="store_true", default=True, help="Add heuristic completion candidates before refinement.")
@@ -335,10 +340,13 @@ def build_document_sample_from_events(
     )
 
 
-def format_pair_prompt(prompt: str) -> str:
+def format_pair_prompt(prompt: str, *, enable_thinking: bool = False) -> str:
+    # Qwen3 recognizes /no_think in the user message. Pair classification only
+    # needs a short JSON decision, so reasoning is disabled by default.
+    thinking_suffix = "" if enable_thinking else "\n/no_think"
     return (
         "<|im_start|>system\nYou classify directed relations between event pairs.<|im_end|>\n"
-        f"<|im_start|>user\n{prompt}<|im_end|>\n"
+        f"<|im_start|>user\n{prompt}{thinking_suffix}<|im_end|>\n"
         "<|im_start|>assistant\n"
     )
 
@@ -357,7 +365,7 @@ def generate_coarse_predictions(model, tokenizer, torch, device, pair_samples, a
             prompts = []
             for pair_sample in batch:
                 item = pair_sample.to_instruction_example(include_query=False, document_mode="title")
-                prompts.append(format_pair_prompt(item["prompt"]))
+                prompts.append(format_pair_prompt(item["prompt"], enable_thinking=args.coarse_thinking))
             encoded = tokenizer(
                 prompts,
                 return_tensors="pt",
