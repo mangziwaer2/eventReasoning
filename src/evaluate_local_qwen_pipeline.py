@@ -110,6 +110,12 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument("--prediction-mode", choices=["forecast-trace", "legacy"], default="forecast-trace", help="forecast-trace emits structured trace + final_answer; legacy emits the older flat JSON.")
+    parser.add_argument(
+        "--stage",
+        choices=["evaluate", "prepare-grpo-context"],
+        default="evaluate",
+        help="evaluate generates a forecast; prepare-grpo-context writes prompt-only GRPO contexts for online sampling.",
+    )
     parser.add_argument("--forecast-temperature", type=float, default=0.7, help="Native Qwen temperature for final forecasting.")
     parser.add_argument("--forecast-max-new-tokens", type=int, default=320, help="Maximum native Qwen tokens for forecast JSON.")
     parser.add_argument("--max-graph-events-in-prompt", type=int, default=24, help="Maximum graph events shown to forecast Qwen.")
@@ -538,9 +544,11 @@ def format_seconds(seconds: float) -> str:
 
 def main() -> None:
     args = parse_args()
+    if args.stage == "prepare-grpo-context" and args.prediction_mode != "forecast-trace":
+        raise ValueError("--stage prepare-grpo-context requires --prediction-mode forecast-trace")
     output_dir = resolve_repo_path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    predictions_path = output_dir / "predictions.jsonl"
+    predictions_path = output_dir / ("grpo_context.jsonl" if args.stage == "prepare-grpo-context" else "predictions.jsonl")
     metrics_path = output_dir / "metrics.json"
     if predictions_path.exists():
         predictions_path.unlink()
@@ -628,7 +636,9 @@ def main() -> None:
     except LoraUnavailable as exc:
         raise RuntimeError(str(exc)) from exc
 
-    if share_forecast_with_coarse:
+    if args.stage == "prepare-grpo-context":
+        forecast_qwen = None
+    elif share_forecast_with_coarse:
         forecast_qwen = LoadedQwenGenerator(
             coarse_model,
             coarse_tokenizer,
@@ -655,7 +665,7 @@ def main() -> None:
                 f"samples={len(examples)}",
                 f"event_source={args.event_source}",
                 f"native_device={native_qwen.device if native_qwen is not None else 'not-loaded'}",
-                f"forecast_device={forecast_qwen.device}",
+                f"forecast_device={forecast_qwen.device if forecast_qwen is not None else 'not-loaded'}",
                 f"coarse_device={device}",
                 f"coarse_mode={coarse_mode}",
                 f"refinement={'skipped' if args.skip_refinement else 'enabled'}",
@@ -811,6 +821,85 @@ def main() -> None:
                     },
                 )
 
+            if args.stage == "prepare-grpo-context":
+                prompt_bundle = build_structured_forecast_prompt(
+                    query=query,
+                    documents=documents,
+                    refined_graph=refined_graph,
+                    choices=choice_pool,
+                    max_graph_events=args.max_graph_events_in_prompt,
+                    max_graph_edges=args.max_graph_edges_in_prompt,
+                    max_document_chars=args.forecast_max_document_chars,
+                )
+                forecast_prompt = prompt_bundle.prompt
+                compact_graph = {
+                    "events": [{"event_id": event.event_id} for event in refined_graph.events],
+                    "edges": [
+                        {
+                            "edge_id": edge.edge_id,
+                            "source_event_id": edge.source_event_id,
+                            "target_event_id": edge.target_event_id,
+                            "relation_type": edge.relation_type,
+                            "score": edge.score,
+                        }
+                        for edge in refined_graph.edges
+                    ],
+                }
+                forecast_context = {
+                    "prediction_mode": "forecast-trace",
+                    "choices": [],
+                    "event_ref_to_id": prompt_bundle.event_ref_to_id,
+                    "edge_ref_to_id": prompt_bundle.edge_ref_to_id,
+                    "refined_graph": compact_graph,
+                }
+                trajectory.metadata.update(forecast_context)
+                trajectory.add_step(
+                    "forecast",
+                    observation={"event_count": len(refined_graph.events), "edge_count": len(refined_graph.edges)},
+                    action={"prompt_chars": len(forecast_prompt), "online_sampling": True},
+                    metadata=forecast_context,
+                )
+                row = {
+                    "schema_version": "forecast-trace-grpo-context-v1",
+                    "stage": "prepare-grpo-context",
+                    "query_id": example.query_id,
+                    "mirai_query": json.loads(export_mirai_query_snapshot(example)),
+                    "document_count": len(documents),
+                    "event_input": event_input_metadata,
+                    "coarse": {
+                        "generation_mode": f"pairwise_candidate_batching:{coarse_mode}",
+                        "candidate_pairs": len(pair_samples),
+                        "parse_rate": safe_div(sum(1 for item in pair_predictions if item is not None), len(pair_predictions)),
+                        "edge_count": len(coarse_graph.edges),
+                    },
+                    "refinement": {
+                        "skipped": bool(args.skip_refinement),
+                        "edge_count": len(refined_graph.edges),
+                        "graph_source": "coarse_graph" if args.skip_refinement else "refinement_model",
+                    },
+                    "choices": [],
+                    "trajectory": trajectory.to_dict(),
+                    "forecast_prompt": forecast_prompt,
+                    "forecast_system_prompt": FORECAST_TRACE_SYSTEM_PROMPT,
+                }
+                rows.append(row)
+                with predictions_path.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+                if args.log_every > 0 and (index % args.log_every == 0 or index == len(examples)):
+                    print(
+                        " | ".join(
+                            [
+                                f"prepared {index}/{len(examples)}",
+                                f"events={len(events)}",
+                                f"coarse_edges={len(coarse_graph.edges)}",
+                                f"refined_edges={len(refined_graph.edges)}",
+                                "forecast_samples=0",
+                                f"time={format_seconds(time.time() - started)}",
+                            ]
+                        ),
+                        flush=True,
+                    )
+                continue
             if args.prediction_mode == "forecast-trace":
                 prompt_bundle = build_structured_forecast_prompt(
                     query=query,
@@ -928,6 +1017,30 @@ def main() -> None:
                     flush=True,
                 )
 
+    if args.stage == "prepare-grpo-context":
+        metrics = {
+            "config": {
+                **vars(args),
+                "dataset": str(dataset_path),
+                "coarse_base_model_path": str(coarse_base_model_path),
+                "coarse_adapter_path": str(coarse_adapter_path) if coarse_adapter_path is not None else None,
+                "coarse_mode": coarse_mode,
+                "refinement_model_path": None if args.skip_refinement else str(resolve_repo_path(args.refinement_model_path)),
+                "skip_refinement": bool(args.skip_refinement),
+                "precomputed_events": str(precomputed_events_path) if precomputed_events_path is not None else None,
+                "online_forecast_sampling": True,
+            },
+            "samples": len(rows),
+            "forecast_samples": 0,
+            "average_event_count": safe_div(sum(int(row["event_input"]["event_count"]) for row in rows), len(rows)),
+            "average_coarse_edge_count": safe_div(sum(int(row["coarse"]["edge_count"]) for row in rows), len(rows)),
+            "average_refined_edge_count": safe_div(sum(int(row["refinement"]["edge_count"]) for row in rows), len(rows)),
+            "outputs": {"grpo_context": str(predictions_path), "metrics": str(metrics_path)},
+            "elapsed_seconds": round(time.time() - started, 3),
+        }
+        metrics_path.write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"saved GRPO context to {predictions_path} | samples={len(rows)}", flush=True)
+        return
     reward_keys = sorted({key for row in rows for key in row.get("reward_breakdown", {})})
     average_reward_breakdown = {
         key: safe_div(sum(float(row.get("reward_breakdown", {}).get(key, 0.0)) for row in rows), len(rows))

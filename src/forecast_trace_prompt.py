@@ -9,7 +9,7 @@ from causal_graph import NewsDocument
 from causal_graph import QuerySpec
 
 
-FORECAST_TRACE_SYSTEM_PROMPT = "You output a grounded forecast_trace followed by a final event_code JSON only."
+FORECAST_TRACE_SYSTEM_PROMPT = "You output a grounded forecast_trace followed by a final_answer JSON only."
 
 
 @dataclass(slots=True)
@@ -122,13 +122,14 @@ def build_structured_forecast_prompt(
     event_block, event_ref_to_id, id_to_event_ref = _render_events(refined_graph, max_graph_events)
     edge_block, edge_ref_to_id = _render_edges(refined_graph, max_graph_edges, id_to_event_ref)
     prompt = (
-        "You are LoRA B for future event forecasting.\n"
+        "You are a future event forecasting model.\n"
         "Input includes query, cutoff-before documents, observed events, and a coarse causal graph.\n"
         "First output a structured forecast_trace, then output a final_answer with one event_code.\n"
         "No candidate choices are provided. Do not output choice_id or copy a candidate list.\n"
         "The event_code is the closed-set target learned during training; output the valid code directly.\n"
         "Use only visible historical events and coarse-graph edges as support. Do not invent historical support.\n"
         "Intermediate trace events may be new future hypotheses before the target time, but their support must point to visible events/edges.\n"
+        "Keep the trace compact, concrete, and grounded; prefer a few well-supported steps over verbose speculation.\n"
         "The final trace event should explain why the final event_code is likely.\n"
         "Return strict JSON only with this schema:\n"
         "{\n"

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from forecast_trace_schema import parse_structured_forecast
@@ -213,11 +214,16 @@ class ForecastTraceGRPOReward:
         policy_name: str = "forecast_trace_reward",
         reward_key: str = "total",
         error_reward: float = DEFAULT_ERROR_REWARD,
+        audit_path: Path | str | None = None,
+        audit_every: int = 1,
     ) -> None:
         self.policy_name = policy_name
         self.reward_key = reward_key
         self.error_reward = float(error_reward)
         self.policy = build_pipeline_policy(policy_name)
+        self.audit_path = Path(audit_path) if audit_path else None
+        self.audit_every = max(1, int(audit_every))
+        self.call_count = 0
         self.last_breakdowns: list[dict[str, float]] = []
 
     def score_completion(
@@ -262,6 +268,33 @@ class ForecastTraceGRPOReward:
             rewards.append(reward)
             breakdowns.append(breakdown)
         self.last_breakdowns = breakdowns
+        self.call_count += 1
+        if self.audit_path is not None and self.call_count % self.audit_every == 0:
+            numeric_keys = sorted({key for breakdown in breakdowns for key in breakdown})
+            averages = {
+                key: round(
+                    sum(float(breakdown.get(key, 0.0)) for breakdown in breakdowns) / max(1, len(breakdowns)),
+                    6,
+                )
+                for key in numeric_keys
+            }
+            self.audit_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.audit_path.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(
+                        {
+                            "reward_call": self.call_count,
+                            "batch_size": len(batch),
+                            "reward_mean": round(sum(rewards) / max(1, len(rewards)), 6),
+                            "reward_min": round(min(rewards), 6) if rewards else 0.0,
+                            "reward_max": round(max(rewards), 6) if rewards else 0.0,
+                            "breakdown_mean": averages,
+                            "error_count": sum(1 for breakdown in breakdowns if breakdown.get("error_reward")),
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
         return rewards
 
 
@@ -286,6 +319,8 @@ def rollout_row_to_grpo_sample(row: dict[str, Any], *, chat_prompt: bool = True)
     else:
         prompt = prompt_text
     reward_context = {
+        "schema_version": str(row.get("schema_version", "forecast-trace-grpo-context-v1")),
+        "stage": str(row.get("stage", "prompt-context")),
         "query_id": str(row.get("query_id", row.get("sample_id", ""))),
         "mirai_query": row.get("mirai_query", {}),
         "trajectory": row.get("trajectory", {}),

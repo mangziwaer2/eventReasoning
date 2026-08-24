@@ -94,19 +94,20 @@ Metadata:
 system：
 
 ```text
-You output a grounded forecast_trace followed by a final event_code JSON only.
+You output a grounded forecast_trace followed by a final_answer JSON only.
 ```
 
 user 模板：
 
 ```text
-You are LoRA B for future event forecasting.
+You are a future event forecasting model.
 Input includes query, cutoff-before documents, observed events, and a coarse causal graph.
 First output a structured forecast_trace, then output a final_answer with one event_code.
 No candidate choices are provided. Do not output choice_id or copy a candidate list.
 The event_code is the closed-set target learned during training; output the valid code directly.
 Use only visible historical events and coarse-graph edges as support. Do not invent historical support.
 Intermediate trace events may be new future hypotheses before the target time, but their support must point to visible events/edges.
+Keep the trace compact, concrete, and grounded; prefer a few well-supported steps over verbose speculation.
 The final trace event should explain why the final event_code is likely.
 Return strict JSON only with this schema:
 {
@@ -157,7 +158,7 @@ Coarse causal edges:
 ## 5. 训练时的使用方式
 
 - `src/train_forecast_trace_rl.py` 读取 predictions JSONL 中保存的 `forecast_prompt` 和 `forecast_system_prompt`，训练完整 forecast completion。
-- `src/train_forecast_trace_grpo.py` 使用相同的 prompt，并将 `reward_context` 传给 `ForecastTraceGRPOReward`。
+- `src/evaluate_local_qwen_pipeline.py --stage prepare-grpo-context` 只生成 prompt 和固定图环境，写入 `grpo_context.jsonl`。`src/train_forecast_trace_grpo.py` 在训练时采样 completion，并将 `reward_context` 传给 `ForecastTraceGRPOReward`。
 - reward 使用 `answer_list` 检查 `event_code`，同时检查 trace 的 JSON 合法性、历史事件/边引用、时间约束和 trace 到最终答案的连接。
 
 因此训练数据可以带有标准答案，但标准答案只约束闭集 `event_code`；开放式 `forecast_trace` 不与 choices 做字符串匹配，而由结构化 reward 和后续 RL 探索约束。
