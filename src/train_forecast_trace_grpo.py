@@ -62,6 +62,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--policy", default="forecast_trace_reward")
     parser.add_argument("--reward-key", default="total", help="Reward breakdown key passed to GRPO.")
     parser.add_argument("--reward-log-every", type=int, default=1, help="Write one aggregate reward audit row every N reward calls.")
+    parser.add_argument("--sample-log-every", type=int, default=1, help="Write sampled prompt/completion rows every N reward calls.")
+    parser.add_argument("--sample-log-count", type=int, default=2, help="Maximum generated samples written per sampled reward call.")
     parser.add_argument("--error-reward", type=float, default=-0.25, help="Finite fallback reward for malformed reward inputs.")
     parser.add_argument("--max-samples", type=int, default=0, help="Use 0 for all rows.")
     parser.add_argument("--seed", type=int, default=42)
@@ -252,6 +254,9 @@ def main() -> None:
                 error_reward=args.error_reward,
                 audit_path=output_dir / "reward_history.jsonl",
                 audit_every=args.reward_log_every,
+                sample_audit_path=output_dir / "rollout_samples.jsonl",
+                sample_audit_every=args.sample_log_every,
+                sample_audit_limit=args.sample_log_count,
             )
             config = build_training_config(GRPOConfig, args)
             trainer = build_trainer(GRPOTrainer, model, tokenizer, config, dataset, reward_fn)
@@ -286,6 +291,8 @@ def main() -> None:
                     "input_paths": [str(path) for path in input_paths],
                     "output_dir": str(output_dir),
                     "final_adapter": str(final_adapter),
+                    "reward_history": str(output_dir / "reward_history.jsonl"),
+                    "rollout_samples": str(output_dir / "rollout_samples.jsonl"),
                     "history_entries": len(history),
                     "train_result_metrics": train_metrics,
                     "elapsed_seconds": round(time.time() - started, 3),

@@ -8,6 +8,7 @@ from typing import Any
 
 from forecast_trace_schema import parse_structured_forecast
 from forecast_trace_prompt import FORECAST_TRACE_SYSTEM_PROMPT
+from forecast_trace_prompt import append_no_think
 from rl_pipeline_hooks import PipelineStep
 from rl_pipeline_hooks import PipelineTrajectory
 from rl_pipeline_hooks import build_pipeline_policy
@@ -110,6 +111,15 @@ def completion_to_text(completion: Any) -> str:
             return completion_to_text(message)
         return " ".join(completion_to_text(item) for item in completion).strip()
     return str(completion).strip()
+
+
+def value_to_log_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        return str(value)
 
 
 def pipeline_trajectory_from_payload(payload: Any, sample_id: str = "") -> PipelineTrajectory:
@@ -216,6 +226,9 @@ class ForecastTraceGRPOReward:
         error_reward: float = DEFAULT_ERROR_REWARD,
         audit_path: Path | str | None = None,
         audit_every: int = 1,
+        sample_audit_path: Path | str | None = None,
+        sample_audit_every: int = 1,
+        sample_audit_limit: int = 2,
     ) -> None:
         self.policy_name = policy_name
         self.reward_key = reward_key
@@ -223,6 +236,9 @@ class ForecastTraceGRPOReward:
         self.policy = build_pipeline_policy(policy_name)
         self.audit_path = Path(audit_path) if audit_path else None
         self.audit_every = max(1, int(audit_every))
+        self.sample_audit_path = Path(sample_audit_path) if sample_audit_path else None
+        self.sample_audit_every = max(1, int(sample_audit_every))
+        self.sample_audit_limit = max(0, int(sample_audit_limit))
         self.call_count = 0
         self.last_breakdowns: list[dict[str, float]] = []
 
@@ -249,7 +265,10 @@ class ForecastTraceGRPOReward:
         batch_size = len(batch)
         rewards: list[float] = []
         breakdowns: list[dict[str, float]] = []
+        contexts: list[ForecastTraceGRPOContext | None] = []
+
         for index, completion in enumerate(batch):
+            context: ForecastTraceGRPOContext | None = None
             try:
                 context = build_grpo_context(kwargs, index, batch_size)
                 breakdown = self.score_completion(
@@ -267,8 +286,11 @@ class ForecastTraceGRPOReward:
                 breakdown = {self.reward_key: reward, "error_reward": 1.0}
             rewards.append(reward)
             breakdowns.append(breakdown)
+            contexts.append(context)
+
         self.last_breakdowns = breakdowns
         self.call_count += 1
+
         if self.audit_path is not None and self.call_count % self.audit_every == 0:
             numeric_keys = sorted({key for breakdown in breakdowns for key in breakdown})
             averages = {
@@ -295,6 +317,60 @@ class ForecastTraceGRPOReward:
                     )
                     + "\n"
                 )
+
+        if (
+            self.sample_audit_path is not None
+            and self.sample_audit_limit > 0
+            and self.call_count % self.sample_audit_every == 0
+        ):
+            self.sample_audit_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.sample_audit_path.open("a", encoding="utf-8") as handle:
+                for index in range(min(self.sample_audit_limit, batch_size)):
+                    context = contexts[index]
+                    prompt_value = _value_at(prompts, index, batch_size) if prompts is not None else ""
+                    completion_text = completion_to_text(batch[index])
+                    parsed_prediction = parse_structured_forecast(
+                        completion_text,
+                        choices=context.choices if context is not None else [],
+                    )
+                    query_id = context.trajectory.sample_id if context is not None else str(
+                        _kw_value(kwargs, ("query_id",), index, batch_size, "")
+                    )
+                    graph_summary: dict[str, Any] = {}
+                    if context is not None:
+                        coarse_step = next(
+                            (step for step in context.trajectory.steps if step.name == "coarse_graph"),
+                            None,
+                        )
+                        if coarse_step is not None:
+                            graph_summary = {
+                                "observation": coarse_step.observation,
+                                "metadata": {
+                                    key: coarse_step.metadata.get(key)
+                                    for key in ("parse_rate", "coarse_edge_count")
+                                    if key in coarse_step.metadata
+                                },
+                            }
+                    handle.write(
+                        json.dumps(
+                            {
+                                "reward_call": self.call_count,
+                                "batch_index": index,
+                                "query_id": query_id,
+                                "prompt": value_to_log_text(prompt_value),
+                                "completion": completion_text,
+                                "parsed_prediction": parsed_prediction,
+                                "gold": context.gold if context is not None else {},
+                                "reward": rewards[index],
+                                "reward_breakdown": breakdowns[index],
+                                "graph_summary": graph_summary,
+                            },
+                            ensure_ascii=False,
+                            default=str,
+                        )
+                        + "\n"
+                    )
+
         return rewards
 
 
@@ -309,7 +385,7 @@ def make_forecast_trace_grpo_reward_func(
 def rollout_row_to_grpo_sample(row: dict[str, Any], *, chat_prompt: bool = True) -> dict[str, Any]:
     """Convert one pipeline rollout row into a GRPOTrainer dataset row."""
 
-    prompt_text = str(row.get("forecast_prompt", "")).strip()
+    prompt_text = append_no_think(str(row.get("forecast_prompt", "")).strip())
     system_prompt = str(row.get("forecast_system_prompt", DEFAULT_FORECAST_SYSTEM_PROMPT)).strip()
     if chat_prompt:
         prompt: Any = [

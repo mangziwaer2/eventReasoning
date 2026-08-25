@@ -27,6 +27,13 @@ def compact_text(text: str, max_chars: int) -> str:
     return compact[: max(0, max_chars - 3)].rstrip() + "..."
 
 
+def append_no_think(prompt: str) -> str:
+    text = str(prompt).rstrip()
+    if text.endswith("/no_think"):
+        return text
+    return f"{text}\n/no_think"
+
+
 def _event_trigger(event: EventNode) -> str:
     trigger = str(event.metadata.get("trigger", "")).strip()
     if trigger:
