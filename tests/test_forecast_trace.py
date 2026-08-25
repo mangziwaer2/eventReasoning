@@ -19,6 +19,7 @@ from coarse_graph_dataset import parse_pair_payload
 from forecast_trace_grpo_rewards import ForecastTraceGRPOReward
 from forecast_trace_grpo_rewards import completion_to_text
 from forecast_trace_grpo_rewards import rollout_row_to_grpo_sample
+from forecast_trace_graph import graph_bridge_score
 from train_forecast_trace_grpo import filter_rollout_rows_by_edge_count
 from rl_pipeline_hooks import ForecastTraceReward
 from rl_pipeline_hooks import PipelineTrajectory
@@ -64,8 +65,8 @@ class ForecastTraceTests(unittest.TestCase):
 
         self.assertEqual(bundle.choices, [])
         self.assertNotIn("Choices:\n", bundle.prompt)
-        self.assertIn('"event_code": "<3-digit-event-code>"', bundle.prompt)
-        self.assertIn("No candidate choices are provided", bundle.prompt)
+        self.assertIn('"answers": [{"event_code": "<3-digit-event-code>"', bundle.prompt)
+        self.assertIn("Predict every likely closed-set event_code", bundle.prompt)
 
         compact_bundle = build_structured_forecast_prompt(
             query=query,
@@ -85,6 +86,38 @@ class ForecastTraceTests(unittest.TestCase):
         )
         self.assertEqual(prediction["predicted_event_base_code"], "036")
         self.assertEqual(prediction["final_answer"]["choice_id"], "")
+
+    def test_structured_forecast_parser_keeps_multi_label_answers(self) -> None:
+        prediction = parse_structured_forecast(
+            '{"answers":[{"event_code":"036","event_description":"arrest or detain"},'
+            '{"event_code":"190","event_description":"use conventional military force"}]}'
+        )
+        self.assertEqual(prediction["predicted_event_base_codes"], ["036", "190"])
+        self.assertEqual(prediction["answers"][1]["event"], "use conventional military force")
+        reward = ForecastTraceReward()(prediction, {"answer_list": ["036", "190"]}, PipelineTrajectory("q"))
+        self.assertEqual(reward["answer"], 1.0)
+
+    def test_multi_label_answers_support_the_trace_bridge(self) -> None:
+        prediction = parse_structured_forecast(
+            """
+            {
+              "forecast_trace": {
+                "intermediate_events": [{"trace_event_id": "ft_1", "supporting_event_ids": ["e1"]}],
+                "trace_edges": [
+                  {"source_id": "e1", "target_id": "ft_1", "confidence": 1.0},
+                  {"source_id": "ft_1", "target_id": "answers", "confidence": 0.8}
+                ]
+              },
+              "answers": [
+                {"event_code": "036", "event_description": "arrest or detain"},
+                {"event_code": "190", "event_description": "use conventional military force"}
+              ]
+            }
+            """
+        )
+        score = graph_bridge_score({"events": [{"event_id": "e1"}], "edges": []}, prediction)
+        self.assertEqual(prediction["predicted_event_base_codes"], ["036", "190"])
+        self.assertGreater(score, 0.0)
 
     def test_structured_forecast_parser_accepts_refs_and_choice_id(self) -> None:
         raw = """

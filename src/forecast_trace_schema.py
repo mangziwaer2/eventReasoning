@@ -212,7 +212,7 @@ def normalize_final_answer(payload: Any, choices: list[dict[str, Any]] | None = 
     return {
         "choice_id": choice_id,
         "event_code": event_code,
-        "event": str(payload.get("event", payload.get("forecast_event", ""))).strip(),
+        "event": str(payload.get("event", payload.get("forecast_event", payload.get("event_description", "")))).strip(),
         "confidence": _clamp01(payload.get("confidence", 0.0)),
         "supporting_event_ids": support_event_ids,
         "supporting_edge_ids": support_edge_ids,
@@ -249,9 +249,23 @@ def parse_structured_forecast(raw_response: str, choices: list[dict[str, Any]] |
 
     forecast_trace = normalize_forecast_trace(forecast_trace_payload)
     final_answer = normalize_final_answer(final_answer_payload, choices=choices)
+    answer_items = payload.get("answers", [])
+    normalized_answers = [
+        normalize_final_answer(item, choices=choices)
+        for item in answer_items
+        if isinstance(item, dict)
+    ] if isinstance(answer_items, list) else []
+    normalized_answers = [item for item in normalized_answers if item["event_code"]]
+    if normalized_answers:
+        final_answer = normalized_answers[0]
+    elif final_answer["event_code"]:
+        normalized_answers = [final_answer]
     alternatives = _as_string_list(payload.get("alternative_event_base_codes", []))
-    if final_answer["event_code"]:
-        alternatives = [item for item in alternatives if item != final_answer["event_code"]]
+    alternatives.extend(item["event_code"] for item in normalized_answers[1:])
+    predicted_codes = _dedupe_preserve_order(
+        [final_answer["event_code"]] + alternatives
+    )
+    alternatives = [item for item in predicted_codes if item != final_answer["event_code"]]
     support_event_ids = _dedupe_preserve_order(
         final_answer["supporting_event_ids"]
         + [
@@ -266,7 +280,9 @@ def parse_structured_forecast(raw_response: str, choices: list[dict[str, Any]] |
         "forecast_trace": forecast_trace,
         "final_answer": final_answer,
         "predicted_event_base_code": final_answer["event_code"],
+        "predicted_event_base_codes": predicted_codes,
         "alternative_event_base_codes": alternatives,
+        "answers": normalized_answers,
         "predicted_relation_name": str(payload.get("predicted_relation_name", "")).strip(),
         "forecast_event": final_answer["event"]
         or "; ".join(event["event"] for event in forecast_trace["intermediate_events"] if event.get("event")),

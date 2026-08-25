@@ -61,6 +61,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=5e-5)
     parser.add_argument("--max-prompt-length", type=int, default=2048)
     parser.add_argument("--max-completion-length", type=int, default=768)
+    parser.add_argument("--max-sequence-length", type=int, default=2304, help="Maximum prompt plus target tokens used for SFT.")
     parser.add_argument("--logging-steps", type=int, default=10)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--target-modules", nargs="+", default=["q_proj", "k_proj", "v_proj", "o_proj"])
@@ -160,8 +161,11 @@ def message_ids(tokenizer, messages: list[dict[str, str]], generation: bool) -> 
     return list(tokenizer.encode(text, add_special_tokens=True))
 
 
-def encode(tokenizer, item: Example, system: str, max_prompt: int, max_completion: int) -> dict[str, Any]:
-    messages = [{"role": "system", "content": system}, {"role": "user", "content": item.prompt}]
+def encode(tokenizer, item: Example, system: str, max_prompt: int, max_completion: int, max_sequence: int) -> dict[str, Any]:
+    user_prompt = item.prompt.rstrip()
+    if not user_prompt.endswith("/no_think"):
+        user_prompt += "\n/no_think"
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": user_prompt}]
     prefix = message_ids(tokenizer, messages, True)
     full = message_ids(tokenizer, messages + [{"role": "assistant", "content": item.completion}], False)
     if full[: len(prefix)] == prefix:
@@ -172,7 +176,8 @@ def encode(tokenizer, item: Example, system: str, max_prompt: int, max_completio
             answer.append(tokenizer.eos_token_id)
     original_length = len(answer)
     answer = answer[:max_completion]
-    prompt = prefix[-max_prompt:]
+    prompt_budget = min(max_prompt, max(1, max_sequence - len(answer)))
+    prompt = prefix[-prompt_budget:]
     return {
         "input_ids": prompt + answer,
         "labels": [-100] * len(prompt) + answer,
@@ -218,8 +223,10 @@ def main() -> None:
     args = parse_args()
     if args.stage == "forecast" and not args.adapter_path:
         raise ValueError("--stage forecast requires --adapter-path from codebook SFT.")
-    if args.max_prompt_length < 1 or args.max_completion_length < 1 or args.num_train_epochs < 1:
+    if args.max_prompt_length < 1 or args.max_completion_length < 1 or args.max_sequence_length < 2 or args.num_train_epochs < 1:
         raise ValueError("Token limits and epochs must be positive.")
+    if args.max_completion_length >= args.max_sequence_length:
+        raise ValueError("--max-sequence-length must exceed --max-completion-length.")
     dataset_path = resolve_repo_path(args.dataset)
     codebook = load_codebook(dataset_path)
     input_paths = [resolve_repo_path(value) for value in args.input]
@@ -231,7 +238,8 @@ def main() -> None:
         system = FORECAST_SYSTEM
     if args.max_samples > 0:
         examples = examples[: args.max_samples]
-    train, validation = split_examples(examples, args.validation_ratio, args.seed)
+    validation_ratio = 0.0 if args.stage == "codebook" else args.validation_ratio
+    train, validation = split_examples(examples, validation_ratio, args.seed)
     if not train:
         raise RuntimeError("No usable SFT examples.")
     output_dir = resolve_repo_path(args.output_dir)
@@ -254,8 +262,8 @@ def main() -> None:
             )
             model.config.use_cache = False
             device = next(model.parameters()).device
-            train_items = [encode(tokenizer, item, system, args.max_prompt_length, args.max_completion_length) for item in train]
-            validation_items = [encode(tokenizer, item, system, args.max_prompt_length, args.max_completion_length) for item in validation]
+            train_items = [encode(tokenizer, item, system, args.max_prompt_length, args.max_completion_length, args.max_sequence_length) for item in train]
+            validation_items = [encode(tokenizer, item, system, args.max_prompt_length, args.max_completion_length, args.max_sequence_length) for item in validation]
             all_items = train_items + validation_items
             truncated = sum(int(item["truncated"]) for item in all_items)
             if truncated:
@@ -308,6 +316,7 @@ def main() -> None:
                 "examples": len(examples),
                 "train_examples": len(train),
                 "validation_examples": len(validation),
+                "effective_validation_ratio": validation_ratio,
                 "codebook_size": len(codebook),
                 "skipped_unknown_code_rows": skipped,
                 "max_target_completion_tokens": max(item["completion_tokens"] for item in all_items),

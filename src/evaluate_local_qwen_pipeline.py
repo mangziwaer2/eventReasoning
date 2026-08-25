@@ -537,15 +537,29 @@ def parse_forecast_json(raw_response: str) -> dict[str, Any]:
 def score_prediction(prediction: dict[str, Any], gold: dict[str, Any]) -> dict[str, Any]:
     gold_codes = {str(item).strip() for item in gold.get("answer_list", []) if str(item).strip()}
     primary_code = str(prediction.get("predicted_event_base_code", "")).strip()
-    alternatives = prediction.get("alternative_event_base_codes", [])
-    if not isinstance(alternatives, list):
-        alternatives = []
-    all_codes = [primary_code] + [str(item).strip() for item in alternatives if str(item).strip()]
+    predicted_codes = prediction.get("predicted_event_base_codes", [])
+    if not isinstance(predicted_codes, list):
+        predicted_codes = []
+    if not predicted_codes:
+        alternatives = prediction.get("alternative_event_base_codes", [])
+        predicted_codes = [primary_code] + (
+            [str(item).strip() for item in alternatives if str(item).strip()]
+            if isinstance(alternatives, list) else []
+        )
+    predicted_set = {str(item).strip() for item in predicted_codes if str(item).strip()}
+    hits = len(predicted_set & gold_codes)
+    precision = safe_div(hits, len(predicted_set))
+    recall = safe_div(hits, len(gold_codes))
+    answer_f1 = safe_div(2.0 * precision * recall, precision + recall) if precision + recall else 0.0
     return {
         "gold_codes": sorted(gold_codes),
         "predicted_code": primary_code,
+        "predicted_codes": sorted(predicted_set),
         "code_hit": bool(primary_code and primary_code in gold_codes),
-        "code_hit_with_alternatives": any(code in gold_codes for code in all_codes),
+        "code_hit_with_alternatives": bool(predicted_set & gold_codes),
+        "answer_precision": precision,
+        "answer_recall": recall,
+        "answer_f1": answer_f1,
     }
 
 
@@ -1126,6 +1140,9 @@ def main() -> None:
             sum(1 for row in rows if row["score"]["code_hit_with_alternatives"]),
             len(rows),
         ),
+        "answer_set_precision": safe_div(sum(float(row["score"]["answer_precision"]) for row in rows), len(rows)),
+        "answer_set_recall": safe_div(sum(float(row["score"]["answer_recall"]) for row in rows), len(rows)),
+        "answer_set_f1": safe_div(sum(float(row["score"]["answer_f1"]) for row in rows), len(rows)),
         "average_reward": safe_div(sum(float(row["reward"]) for row in rows), len(rows)),
         "average_reward_breakdown": average_reward_breakdown,
         "average_trace_event_count": average_trace_event_count,

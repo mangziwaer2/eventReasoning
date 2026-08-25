@@ -9,7 +9,7 @@ from causal_graph import NewsDocument
 from causal_graph import QuerySpec
 
 
-FORECAST_TRACE_SYSTEM_PROMPT = "You output a grounded forecast_trace followed by a final_answer JSON only."
+FORECAST_TRACE_SYSTEM_PROMPT = "You output a grounded forecast_trace followed by an answers JSON list only."
 
 
 @dataclass(slots=True)
@@ -156,13 +156,12 @@ def build_structured_forecast_prompt(
         else ""
     )
     instructions = (
-        "First output a structured forecast_trace, then output a final_answer with one event_code.\n"
-        "No candidate choices are provided. Do not output choice_id or copy a candidate list.\n"
-        "The event_code is the closed-set target learned during training; output the valid code directly.\n"
+        "First output a structured forecast_trace, then output an answers list.\n"
+        "Predict every likely closed-set event_code, with its canonical event_description. Do not output choice_id.\n"
         "Use only visible historical events and coarse-graph edges as support. Do not invent historical support.\n"
         "Intermediate trace events may be new future hypotheses before the target time, but their support must point to visible events/edges.\n"
         "Keep the trace compact, concrete, and grounded; prefer a few well-supported steps over verbose speculation.\n"
-        "The final trace event should explain why the final event_code is likely.\n"
+        "The final trace event should explain why the predicted answer set is likely.\n"
         "Return strict JSON only with this schema:\n"
         "{\n"
         '  "forecast_trace": {\n'
@@ -178,10 +177,10 @@ def build_structured_forecast_prompt(
         "    ],\n"
         '    "trace_edges": [\n'
         '      {"source_ref": "H01", "target_ref": "ft_1", "relation_type": "causes", "confidence": 0.0},\n'
-        '      {"source_ref": "ft_1", "target_ref": "answer_<event_code>", "relation_type": "raises_likelihood", "confidence": 0.0}\n'
+        '      {"source_ref": "ft_1", "target_ref": "answers", "relation_type": "raises_likelihood", "confidence": 0.0}\n'
         "    ]\n"
         "  },\n"
-        '  "final_answer": {"event_code": "<3-digit-event-code>", "event": "event description", "confidence": 0.0}\n'
+        '  "answers": [{"event_code": "<3-digit-event-code>", "event_description": "canonical event description"}]\n'
         "}\n\n"
         "Invalid outputs: nonexistent event_ref/edge_ref, placeholder event codes such as <3-digit-event-code>, generic events like 'tensions rise', invalid event_code, or cutoff-after facts as observed history.\n\n"
     )

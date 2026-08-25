@@ -93,20 +93,23 @@ class MiraiCodeReward:
 
     def __call__(self, prediction: dict[str, Any], gold: dict[str, Any]) -> float:
         gold_codes = {str(item).strip() for item in gold.get("answer_list", []) if str(item).strip()}
-        predicted_codes = []
-        primary_code = str(prediction.get("predicted_event_base_code", "")).strip()
-        if primary_code:
-            predicted_codes.append(primary_code)
-        alternatives = prediction.get("alternative_event_base_codes", [])
-        if isinstance(alternatives, list):
-            predicted_codes.extend(str(item).strip() for item in alternatives if str(item).strip())
-        if not gold_codes:
+        predicted_codes = prediction.get("predicted_event_base_codes", [])
+        if not isinstance(predicted_codes, list):
+            predicted_codes = []
+        if not predicted_codes:
+            primary_code = str(prediction.get("predicted_event_base_code", "")).strip()
+            alternatives = prediction.get("alternative_event_base_codes", [])
+            predicted_codes = [primary_code] + (
+                [str(item).strip() for item in alternatives if str(item).strip()]
+                if isinstance(alternatives, list) else []
+            )
+        predicted_set = {str(code).strip() for code in predicted_codes if str(code).strip()}
+        if not gold_codes or not predicted_set:
             return 0.0
-        if primary_code in gold_codes:
-            return 1.0
-        if any(code in gold_codes for code in predicted_codes):
-            return 0.5
-        return 0.0
+        hits = len(predicted_set & gold_codes)
+        precision = hits / len(predicted_set)
+        recall = hits / len(gold_codes)
+        return 2.0 * precision * recall / (precision + recall) if precision + recall else 0.0
 
 
 class MiraiCodeRewardPolicy(NoOpPipelinePolicy):

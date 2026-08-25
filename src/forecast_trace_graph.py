@@ -42,11 +42,14 @@ def resolve_edge_ref(ref: str, edge_ref_to_id: dict[str, str] | None = None) -> 
     return text
 
 
-def answer_aliases(final_answer: dict[str, Any]) -> set[str]:
-    aliases: set[str] = set()
-    choice_id = str(final_answer.get("choice_id", "")).strip()
-    event_code = str(final_answer.get("event_code", "")).strip()
-    for value in (choice_id, event_code):
+def answer_aliases(final_answer: dict[str, Any], answers: list[dict[str, Any]] | None = None) -> set[str]:
+    aliases: set[str] = {"answers"} if answers else set()
+    values = [final_answer.get("choice_id", ""), final_answer.get("event_code", "")]
+    for answer in answers or []:
+        if isinstance(answer, dict):
+            values.extend([answer.get("choice_id", ""), answer.get("event_code", "")])
+    for raw_value in values:
+        value = str(raw_value).strip()
         if not value:
             continue
         aliases.update({value, f"answer_{value}", f"choice_{value}", f"code_{value}"})
@@ -152,7 +155,8 @@ def graph_bridge_score(
     if not start_nodes:
         start_nodes = graph_event_ids(graph)
 
-    targets = answer_aliases(final_answer)
+    answers = prediction.get("answers", [])
+    targets = answer_aliases(final_answer, answers if isinstance(answers, list) else [])
     if not targets:
         return 0.0
     adjacency = build_augmented_adjacency(graph, forecast_trace, event_ref_to_id=event_ref_to_id)
