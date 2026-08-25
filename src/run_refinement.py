@@ -107,6 +107,7 @@ def build_refined_graph(
         events=coarse_graph.events,
         edges=refined_edges,
         trace=coarse_graph.trace,
+        metadata=dict(coarse_graph.metadata),
     )
 
 

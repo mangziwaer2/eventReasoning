@@ -151,6 +151,7 @@ class CoarseCausalGraph:
     events: list[EventNode]
     edges: list[CoarseCausalEdge]
     trace: GraphBuildTrace = field(default_factory=GraphBuildTrace)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -159,6 +160,7 @@ class CoarseCausalGraph:
             "events": [item.to_dict() for item in self.events],
             "edges": [item.to_dict() for item in self.edges],
             "trace": self.trace.to_dict(),
+            "metadata": self.metadata,
         }
 
 

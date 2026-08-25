@@ -336,6 +336,96 @@ def _dedupe_edges(edges: list[CoarseCausalEdge]) -> list[CoarseCausalEdge]:
     return deduped
 
 
+def _edge_candidate_score(edge: CoarseCausalEdge) -> float:
+    try:
+        return max(0.0, min(float(edge.metadata.get("candidate_score", 0.0)), 1.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _temporal_direction_score(edge: CoarseCausalEdge, event_lookup: dict[str, EventNode]) -> int:
+    source = event_lookup.get(edge.source_event_id)
+    target = event_lookup.get(edge.target_event_id)
+    if source is None or target is None or source.document_id != target.document_id:
+        return 0
+    if source.sentence_index < target.sentence_index:
+        return 1
+    if source.sentence_index > target.sentence_index:
+        return -1
+    return 0
+
+
+def _edge_priority(edge: CoarseCausalEdge, event_lookup: dict[str, EventNode]) -> tuple[float, float, int, int, str, str, str]:
+    """Sort key for graph constraints; lower values are retained first."""
+
+    return (
+        -float(edge.score),
+        -_edge_candidate_score(edge),
+        -_temporal_direction_score(edge, event_lookup),
+        -RELATION_PRIORITY.get(edge.relation_type, 0),
+        edge.source_event_id,
+        edge.target_event_id,
+        edge.edge_id,
+    )
+
+
+def _reaches(adjacency: dict[str, set[str]], start: str, target: str) -> bool:
+    pending = [start]
+    seen: set[str] = set()
+    while pending:
+        current = pending.pop()
+        if current == target:
+            return True
+        if current in seen:
+            continue
+        seen.add(current)
+        pending.extend(neighbor for neighbor in adjacency.get(current, set()) if neighbor not in seen)
+    return False
+
+
+def _build_temporal_dag(
+    edges: list[CoarseCausalEdge],
+    event_lookup: dict[str, EventNode],
+) -> tuple[list[CoarseCausalEdge], dict[str, int | str]]:
+    """Resolve reciprocal textual relations and retain an acyclic directed backbone.
+
+    Textual event relations are not observational causal discovery. This is a
+    structural consistency pass used only after pairwise relation inference.
+    """
+
+    deduplicated = _dedupe_edges(edges)
+    pair_groups: dict[tuple[str, str], list[CoarseCausalEdge]] = {}
+    for edge in deduplicated:
+        pair_key = tuple(sorted((edge.source_event_id, edge.target_event_id)))
+        pair_groups.setdefault(pair_key, []).append(edge)
+
+    reciprocal_pruned = 0
+    reciprocal_resolved: list[CoarseCausalEdge] = []
+    for group_edges in pair_groups.values():
+        ordered = sorted(group_edges, key=lambda edge: _edge_priority(edge, event_lookup))
+        reciprocal_resolved.append(ordered[0])
+        reciprocal_pruned += max(0, len(ordered) - 1)
+
+    adjacency: dict[str, set[str]] = {}
+    retained: list[CoarseCausalEdge] = []
+    cycle_pruned = 0
+    for edge in sorted(reciprocal_resolved, key=lambda item: _edge_priority(item, event_lookup)):
+        if _reaches(adjacency, edge.target_event_id, edge.source_event_id):
+            cycle_pruned += 1
+            continue
+        retained.append(edge)
+        adjacency.setdefault(edge.source_event_id, set()).add(edge.target_event_id)
+
+    return retained, {
+        "mode": "temporal-dag",
+        "input_edge_count": len(edges),
+        "deduplicated_edge_count": len(deduplicated),
+        "reciprocal_pruned_count": reciprocal_pruned,
+        "cycle_pruned_count": cycle_pruned,
+        "output_edge_count": len(retained),
+    }
+
+
 def _event_degrees(graph: CoarseCausalGraph) -> dict[str, int]:
     degrees: dict[str, int] = {event.event_id: 0 for event in graph.events}
     for edge in graph.edges:
@@ -391,6 +481,7 @@ def truncate_graph_events(graph: CoarseCausalGraph, max_events: int | None = Non
         events=filtered_events,
         edges=_dedupe_edges(filtered_edges),
         trace=graph.trace,
+        metadata=dict(graph.metadata),
     )
 
 
@@ -931,7 +1022,12 @@ def build_graph_from_pair_predictions(
     pair_samples: list[EventPairSample],
     pair_predictions: list[dict[str, Any] | None],
     keep_threshold: float = 0.5,
+    topology_mode: str = "none",
 ) -> CoarseCausalGraph:
+    normalized_topology_mode = str(topology_mode).strip().lower().replace("_", "-")
+    if normalized_topology_mode not in {"none", "temporal-dag"}:
+        raise ValueError("topology_mode must be 'none' or 'temporal-dag'")
+
     event_lookup = {event.event_id: event for event in document_sample.events}
     edges: list[CoarseCausalEdge] = []
     for edge_index, (pair_sample, prediction) in enumerate(zip(pair_samples, pair_predictions)):
@@ -959,14 +1055,34 @@ def build_graph_from_pair_predictions(
                 },
             )
         )
+
+    if normalized_topology_mode == "temporal-dag":
+        graph_edges, topology = _build_temporal_dag(edges, event_lookup)
+    else:
+        graph_edges = _dedupe_edges(edges)
+        topology = {
+            "mode": "none",
+            "input_edge_count": len(edges),
+            "deduplicated_edge_count": len(graph_edges),
+            "reciprocal_pruned_count": 0,
+            "cycle_pruned_count": 0,
+            "output_edge_count": len(graph_edges),
+        }
+    trace = GraphBuildTrace()
+    if normalized_topology_mode == "temporal-dag":
+        trace.event_notes.append(
+            "temporal-dag postprocess "
+            f"reciprocal_pruned={topology['reciprocal_pruned_count']} "
+            f"cycle_pruned={topology['cycle_pruned_count']}"
+        )
     return CoarseCausalGraph(
         query=document_sample.query,
         documents=document_sample.documents,
         events=document_sample.events,
-        edges=_dedupe_edges(edges),
-        trace=GraphBuildTrace(),
+        edges=graph_edges,
+        trace=trace,
+        metadata={"topology": topology},
     )
-
 
 def _parse_query(data: dict[str, Any]) -> QuerySpec:
     return QuerySpec(
@@ -1034,6 +1150,7 @@ def load_coarse_graph(path: Path) -> CoarseCausalGraph:
         events=[_parse_event(item) for item in graph_data.get("events", [])],
         edges=[_parse_edge(item) for item in graph_data.get("edges", [])],
         trace=GraphBuildTrace(),
+        metadata=dict(graph_data.get("metadata", {})),
     )
 
 

@@ -66,6 +66,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample-log-count", type=int, default=2, help="Maximum generated samples written per sampled reward call.")
     parser.add_argument("--error-reward", type=float, default=-0.25, help="Finite fallback reward for malformed reward inputs.")
     parser.add_argument("--max-samples", type=int, default=0, help="Use 0 for all rows.")
+    parser.add_argument("--min-coarse-edges", type=int, default=0, help="Optional minimum refined/coarse graph edge count. 0 keeps every prompt context.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-generations", type=int, default=4, help="Completions sampled per prompt for GRPO groups.")
     parser.add_argument("--num-train-epochs", type=int, default=10)
@@ -113,6 +114,7 @@ def load_grpo_samples(
     *,
     chat_prompt: bool = True,
     allow_legacy_rollout_input: bool = False,
+    min_coarse_edges: int = 0,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for input_path in normalize_input_paths(input_paths):
@@ -123,12 +125,40 @@ def load_grpo_samples(
             "Online GRPO requires prompt-only context rows. Found precomputed forecast/reward fields; "
             "run --stage prepare-grpo-context or pass --allow-legacy-rollout-input explicitly."
         )
+    rows, _ = filter_rollout_rows_by_edge_count(rows, min_coarse_edges)
     samples = rollout_rows_to_grpo_samples(rows, chat_prompt=chat_prompt)
     if max_samples > 0:
         samples = samples[:max_samples]
     return samples
 
 
+def rollout_row_edge_count(row: dict[str, Any]) -> int:
+    trajectory = row.get("trajectory", {})
+    if not isinstance(trajectory, dict):
+        return 0
+    metadata = trajectory.get("metadata", {})
+    if not isinstance(metadata, dict):
+        metadata = {}
+    graph = metadata.get("refined_graph")
+    if isinstance(graph, dict):
+        edges = graph.get("edges")
+        if isinstance(edges, list):
+            return len(edges)
+    for section in ("refinement", "coarse"):
+        summary = row.get(section, {})
+        if isinstance(summary, dict) and "edge_count" in summary:
+            try:
+                return max(0, int(summary["edge_count"]))
+            except (TypeError, ValueError):
+                continue
+    return 0
+
+
+def filter_rollout_rows_by_edge_count(rows: list[dict[str, Any]], min_coarse_edges: int) -> tuple[list[dict[str, Any]], int]:
+    if min_coarse_edges <= 0:
+        return rows, 0
+    kept = [row for row in rows if rollout_row_edge_count(row) >= min_coarse_edges]
+    return kept, len(rows) - len(kept)
 def build_training_config(config_cls: Any, args: argparse.Namespace) -> Any:
     """Build GRPOConfig across TRL releases with different optional fields."""
 
@@ -170,6 +200,8 @@ def build_trainer(trainer_cls: Any, model: Any, tokenizer: Any, config: Any, dat
 
 def main() -> None:
     args = parse_args()
+    if args.min_coarse_edges < 0:
+        raise ValueError("--min-coarse-edges must be non-negative.")
     if args.num_generations < 2:
         raise ValueError("--num-generations must be at least 2 for GRPO group-relative advantages.")
     if args.per_device_train_batch_size < args.num_generations:
@@ -188,6 +220,10 @@ def main() -> None:
     log_path = output_dir / "training.log"
     if log_path.exists():
         log_path.unlink()
+    for audit_name in ("reward_history.jsonl", "rollout_samples.jsonl"):
+        audit_path = output_dir / audit_name
+        if audit_path.exists():
+            audit_path.unlink()
 
     input_paths = normalize_input_paths(args.input)
     started = time.time()
@@ -205,14 +241,24 @@ def main() -> None:
                         f"chat_prompt={args.chat_prompt}",
                         f"num_generations={args.num_generations}",
                         f"batch_size={args.per_device_train_batch_size}",
+                        f"min_coarse_edges={args.min_coarse_edges}",
+                        f"sample_log_every={args.sample_log_every}",
+                        f"sample_log_count={args.sample_log_count}",
                     ]
                 )
+            )
+            source_rows = [row for input_path in input_paths for row in load_jsonl(input_path)]
+            source_row_count = len(source_rows)
+            _, low_edge_filtered_rows = filter_rollout_rows_by_edge_count(
+                source_rows,
+                args.min_coarse_edges,
             )
             samples = load_grpo_samples(
                 input_paths,
                 max_samples=args.max_samples,
                 chat_prompt=args.chat_prompt,
                 allow_legacy_rollout_input=args.allow_legacy_rollout_input,
+                min_coarse_edges=args.min_coarse_edges,
             )
             if not samples:
                 raise RuntimeError("No usable rows found. Ensure GRPO context JSONL contains forecast_prompt and trajectory.")
@@ -221,14 +267,21 @@ def main() -> None:
                 output_dir / "sample_summary.json",
                 {
                     "input_paths": [str(path) for path in input_paths],
+                    "source_rows": source_row_count,
+                    "low_edge_filtered_rows": low_edge_filtered_rows,
                     "samples": len(samples),
                     "chat_prompt": bool(args.chat_prompt),
                     "max_samples": int(args.max_samples),
+                    "min_coarse_edges": int(args.min_coarse_edges),
                     "policy": args.policy,
                     "reward_key": args.reward_key,
                 },
             )
-            log_line(f"loaded prompt rows | samples={len(samples)} | inputs={len(input_paths)}")
+            log_line(
+                f"loaded prompt rows | source_rows={source_row_count} | samples={len(samples)} | "
+                f"low_edge_filtered={low_edge_filtered_rows} | inputs={len(input_paths)} | "
+                f"min_coarse_edges={args.min_coarse_edges}"
+            )
 
             try:
                 from datasets import Dataset

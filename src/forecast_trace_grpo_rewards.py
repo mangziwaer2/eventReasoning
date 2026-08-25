@@ -347,7 +347,7 @@ class ForecastTraceGRPOReward:
                                 "observation": coarse_step.observation,
                                 "metadata": {
                                     key: coarse_step.metadata.get(key)
-                                    for key in ("parse_rate", "coarse_edge_count")
+                                    for key in ("parse_rate", "coarse_edge_count", "topology")
                                     if key in coarse_step.metadata
                                 },
                             }

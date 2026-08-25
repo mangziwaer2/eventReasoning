@@ -32,6 +32,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-sentence-gap", type=int, default=3, help="Maximum sentence gap for same-document candidate pairs.")
     parser.add_argument("--max-pairs", type=int, default=64, help="Maximum number of candidate pairs classified.")
     parser.add_argument("--keep-threshold", type=float, default=0.5, help="Minimum pair confidence required to keep an edge.")
+    parser.add_argument("--topology-mode", choices=["none", "temporal-dag"], default="temporal-dag", help="Post-process pairwise edges; temporal-dag resolves reverse pairs and removes directed cycles.")
     parser.add_argument("--base-model-path", default=str(REPO_ROOT / "models" / "Qwen2.5-0.5B"), help="Base Qwen model directory.")
     parser.add_argument("--adapter-path", default=None, help="Optional LoRA adapter directory. Omit to run the coarse stage as a frozen model.")
     parser.add_argument("--max-length", type=int, default=1024, help="Maximum prompt length.")
@@ -157,6 +158,7 @@ def main() -> None:
         pair_samples=pair_samples,
         pair_predictions=predictions,
         keep_threshold=args.keep_threshold,
+        topology_mode=args.topology_mode,
     )
     result = {
         "sample_id": document_sample.sample_id,

@@ -96,6 +96,12 @@ def parse_args() -> argparse.Namespace:
         help="Allow Qwen3 thinking for coarse relation classification. Disabled by default; relation JSON should be short.",
     )
     parser.add_argument("--coarse-keep-threshold", type=float, default=0.5, help="Minimum coarse relation confidence kept as an edge.")
+    parser.add_argument(
+        "--coarse-topology-mode",
+        choices=["none", "temporal-dag"],
+        default="temporal-dag",
+        help="Post-process pairwise edges; temporal-dag resolves reverse pairs and removes directed cycles.",
+    )
 
     parser.add_argument("--include-completion-candidates", dest="include_completion_candidates", action="store_true", default=True, help="Add heuristic completion candidates before refinement.")
     parser.add_argument("--no-completion-candidates", dest="include_completion_candidates", action="store_false", help="Disable refinement completion candidates.")
@@ -124,9 +130,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--forecast-temperature", type=float, default=0.7, help="Native Qwen temperature for final forecasting.")
     parser.add_argument("--forecast-max-new-tokens", type=int, default=320, help="Maximum native Qwen tokens for forecast JSON.")
-    parser.add_argument("--max-graph-events-in-prompt", type=int, default=24, help="Maximum graph events shown to forecast Qwen.")
-    parser.add_argument("--max-graph-edges-in-prompt", type=int, default=48, help="Maximum graph edges shown to forecast Qwen.")
-    parser.add_argument("--forecast-max-document-chars", type=int, default=700, help="Maximum characters per document shown to LoRA B.")
+    parser.add_argument("--max-graph-events-in-prompt", type=int, default=14, help="Maximum graph events shown to forecast Qwen.")
+    parser.add_argument("--max-graph-edges-in-prompt", type=int, default=24, help="Maximum graph edges shown to forecast Qwen.")
+    parser.add_argument("--forecast-max-document-chars", type=int, default=700, help="Maximum characters per document when documents are included.")
+    parser.add_argument("--forecast-context-mode", choices=["events-graph", "documents-events-graph"], default="events-graph", help="Use compact event mentions plus graph by default; documents-events-graph is an ablation.")
+    parser.add_argument("--forecast-max-event-chars", type=int, default=100, help="Maximum characters retained for each visible event mention.")
     parser.add_argument(
         "--max-choice-codes",
         type=int,
@@ -779,14 +787,20 @@ def main() -> None:
                 pair_samples=pair_samples,
                 pair_predictions=pair_predictions,
                 keep_threshold=args.coarse_keep_threshold,
+                topology_mode=args.coarse_topology_mode,
             )
             trajectory.add_step(
                 "coarse_graph",
                 observation={"event_count": len(events), "candidate_pairs": len(pair_samples)},
-                action={"keep_threshold": args.coarse_keep_threshold, "max_pairs": args.max_pairs},
+                action={
+                    "keep_threshold": args.coarse_keep_threshold,
+                    "max_pairs": args.max_pairs,
+                    "topology_mode": args.coarse_topology_mode,
+                },
                 metadata={
                     "parse_rate": safe_div(sum(1 for item in pair_predictions if item is not None), len(pair_predictions)),
                     "coarse_edge_count": len(coarse_graph.edges),
+                    "topology": coarse_graph.metadata.get("topology", {}),
                     "raw_preview": pair_raw_generations[:3],
                 },
             )
@@ -839,6 +853,8 @@ def main() -> None:
                     max_graph_events=args.max_graph_events_in_prompt,
                     max_graph_edges=args.max_graph_edges_in_prompt,
                     max_document_chars=args.forecast_max_document_chars,
+                    context_mode=args.forecast_context_mode,
+                    max_event_chars=args.forecast_max_event_chars,
                 )
                 forecast_prompt = append_no_think(prompt_bundle.prompt)
                 compact_graph = {
@@ -865,7 +881,11 @@ def main() -> None:
                 trajectory.add_step(
                     "forecast",
                     observation={"event_count": len(refined_graph.events), "edge_count": len(refined_graph.edges)},
-                    action={"prompt_chars": len(forecast_prompt), "online_sampling": True},
+                    action={
+                        "prompt_chars": len(forecast_prompt),
+                        "online_sampling": True,
+                        "context_mode": args.forecast_context_mode,
+                    },
                     metadata=forecast_context,
                 )
                 row = {
@@ -874,12 +894,14 @@ def main() -> None:
                     "query_id": example.query_id,
                     "mirai_query": json.loads(export_mirai_query_snapshot(example)),
                     "document_count": len(documents),
+                    "forecast_context_mode": args.forecast_context_mode,
                     "event_input": event_input_metadata,
                     "coarse": {
                         "generation_mode": f"pairwise_candidate_batching:{coarse_mode}",
                         "candidate_pairs": len(pair_samples),
                         "parse_rate": safe_div(sum(1 for item in pair_predictions if item is not None), len(pair_predictions)),
                         "edge_count": len(coarse_graph.edges),
+                        "topology": coarse_graph.metadata.get("topology", {}),
                     },
                     "refinement": {
                         "skipped": bool(args.skip_refinement),
@@ -918,6 +940,8 @@ def main() -> None:
                     max_graph_events=args.max_graph_events_in_prompt,
                     max_graph_edges=args.max_graph_edges_in_prompt,
                     max_document_chars=args.forecast_max_document_chars,
+                    context_mode=args.forecast_context_mode,
+                    max_event_chars=args.forecast_max_event_chars,
                 )
                 forecast_prompt = prompt_bundle.prompt
                 raw_forecast = forecast_qwen.generate(

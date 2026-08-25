@@ -16,6 +16,8 @@ from event_input import load_event_input_index
 from event_input import materialize_event_input
 from event_input import parse_event_input_record
 from coarse_graph_dataset import build_event_pair_inference_samples
+from coarse_graph_dataset import build_graph_from_pair_predictions
+from coarse_graph_dataset import DocumentGraphSample
 from coarse_graph_dataset import load_preextracted_document_graph_sample
 
 
@@ -98,6 +100,30 @@ class EventInputTests(unittest.TestCase):
         self.assertEqual(sample.metadata["event_source"], "precomputed")
         pairs = build_event_pair_inference_samples(sample, max_sentence_gap=3, max_pairs=8)
         self.assertEqual(len(pairs), 2)
+
+    def test_temporal_dag_resolves_reciprocal_pair(self) -> None:
+        query, documents, events = materialize_event_input(parse_event_input_record(valid_payload()))
+        sample = DocumentGraphSample(
+            sample_id="sample_1",
+            query=query,
+            documents=documents,
+            events=events,
+            gold_graph=None,
+            metadata={},
+        )
+        pair_samples = build_event_pair_inference_samples(sample, max_sentence_gap=3, max_pairs=8)
+        predictions = [{"relation_type": "causes", "confidence": 0.9} for _ in pair_samples]
+        graph = build_graph_from_pair_predictions(
+            document_sample=sample,
+            pair_samples=pair_samples,
+            pair_predictions=predictions,
+            keep_threshold=0.5,
+            topology_mode="temporal-dag",
+        )
+        self.assertEqual(len(graph.edges), 1)
+        self.assertEqual(graph.edges[0].source_event_id, "e1")
+        self.assertEqual(graph.edges[0].target_event_id, "e2")
+        self.assertEqual(graph.metadata["topology"]["reciprocal_pruned_count"], 1)
 
     def test_jsonl_is_indexed_by_query_id(self) -> None:
         second = valid_payload()

@@ -511,6 +511,7 @@ def perturb_gold_graph_to_coarse(
         events=graph.events,
         edges=_dedupe_edges(kept_edges),
         trace=graph.trace,
+        metadata=dict(graph.metadata),
     )
 
 

@@ -58,7 +58,11 @@ def _render_documents(documents: list[NewsDocument], max_document_chars: int) ->
     return "\n\n".join(lines) if lines else "- none"
 
 
-def _render_events(graph: CoarseCausalGraph, max_events: int) -> tuple[str, dict[str, str], dict[str, str]]:
+def _render_events(
+    graph: CoarseCausalGraph,
+    max_events: int,
+    max_event_chars: int = 220,
+) -> tuple[str, dict[str, str], dict[str, str]]:
     event_ref_to_id: dict[str, str] = {}
     id_to_event_ref: dict[str, str] = {}
     lines: list[str] = []
@@ -67,6 +71,11 @@ def _render_events(graph: CoarseCausalGraph, max_events: int) -> tuple[str, dict
         event_ref_to_id[event_ref] = event.event_id
         id_to_event_ref[event.event_id] = event_ref
         participants = ", ".join(event.participants) if event.participants else "-"
+        mention = str(
+            event.metadata.get("event_context")
+            or event.metadata.get("event_mention")
+            or event.text
+        ).strip()
         lines.append(
             " | ".join(
                 [
@@ -75,13 +84,12 @@ def _render_events(graph: CoarseCausalGraph, max_events: int) -> tuple[str, dict
                     f"doc={event.document_id}",
                     f"sent={event.sentence_index}",
                     f"trigger={_event_trigger(event)}",
-                    f"event={event.text}",
+                    f"mention={compact_text(mention, max_event_chars)}",
                     f"participants={participants}",
                 ]
             )
         )
     return ("\n".join(f"- {line}" for line in lines) if lines else "- none", event_ref_to_id, id_to_event_ref)
-
 
 def _render_edges(
     graph: CoarseCausalGraph,
@@ -120,17 +128,34 @@ def build_structured_forecast_prompt(
     max_graph_events: int = 24,
     max_graph_edges: int = 48,
     max_document_chars: int = 700,
+    context_mode: str = "documents-events-graph",
+    max_event_chars: int = 220,
 ) -> ForecastPromptBundle:
     # The no-refinement research path deliberately does not expose the global
     # event-code inventory. The finite answer space is learned from labels and
     # enforced by decoding/reward outside the prompt.
     del choices
     normalized_choices: list[dict[str, Any]] = []
-    event_block, event_ref_to_id, id_to_event_ref = _render_events(refined_graph, max_graph_events)
+    normalized_context_mode = str(context_mode).strip().lower().replace("_", "-")
+    if normalized_context_mode not in {"documents-events-graph", "events-graph"}:
+        raise ValueError("context_mode must be 'documents-events-graph' or 'events-graph'")
+    event_block, event_ref_to_id, id_to_event_ref = _render_events(
+        refined_graph,
+        max_graph_events,
+        max_event_chars=max_event_chars,
+    )
     edge_block, edge_ref_to_id = _render_edges(refined_graph, max_graph_edges, id_to_event_ref)
-    prompt = (
-        "You are a future event forecasting model.\n"
-        "Input includes query, cutoff-before documents, observed events, and a coarse causal graph.\n"
+    context_intro = (
+        "Documents are included as additional grounding evidence.\n"
+        if normalized_context_mode == "documents-events-graph"
+        else "Event mentions are the only historical evidence; do not assume unseen document text.\n"
+    )
+    document_section = (
+        "Documents:\n" f"{_render_documents(documents, max_document_chars)}\n\n"
+        if normalized_context_mode == "documents-events-graph"
+        else ""
+    )
+    instructions = (
         "First output a structured forecast_trace, then output a final_answer with one event_code.\n"
         "No candidate choices are provided. Do not output choice_id or copy a candidate list.\n"
         "The event_code is the closed-set target learned during training; output the valid code directly.\n"
@@ -159,16 +184,21 @@ def build_structured_forecast_prompt(
         '  "final_answer": {"event_code": "000", "event": "event description", "confidence": 0.0}\n'
         "}\n\n"
         "Invalid outputs: nonexistent event_ref/edge_ref, generic events like 'tensions rise', invalid event_code, or cutoff-after facts as observed history.\n\n"
-        f"QueryId: {query.query_id}\n"
-        f"Query: {query.text}\n"
-        f"Target/Cutoff date: {query.cutoff_time or '-'}\n"
-        f"Focus actors: {', '.join(query.focus_entities) or '-'}\n\n"
-        "Documents:\n"
-        f"{_render_documents(documents, max_document_chars)}\n\n"
-        "Visible historical events:\n"
-        f"{event_block}\n\n"
-        "Coarse causal edges:\n"
-        f"{edge_block}\n"
+    )
+    prompt = (
+        "You are a future event forecasting model.\n"
+        "Input includes query, observed events, and a coarse causal graph.\n"
+        + context_intro
+        + instructions
+        + f"QueryId: {query.query_id}\n"
+        + f"Query: {query.text}\n"
+        + f"Target/Cutoff date: {query.cutoff_time or '-'}\n"
+        + f"Focus actors: {', '.join(query.focus_entities) or '-'}\n\n"
+        + document_section
+        + "Visible historical events:\n"
+        + f"{event_block}\n\n"
+        + "Coarse causal edges:\n"
+        + f"{edge_block}\n"
     )
     return ForecastPromptBundle(
         prompt=prompt,

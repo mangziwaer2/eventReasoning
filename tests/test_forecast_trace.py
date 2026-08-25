@@ -19,6 +19,7 @@ from coarse_graph_dataset import parse_pair_payload
 from forecast_trace_grpo_rewards import ForecastTraceGRPOReward
 from forecast_trace_grpo_rewards import completion_to_text
 from forecast_trace_grpo_rewards import rollout_row_to_grpo_sample
+from train_forecast_trace_grpo import filter_rollout_rows_by_edge_count
 from rl_pipeline_hooks import ForecastTraceReward
 from rl_pipeline_hooks import PipelineTrajectory
 
@@ -65,6 +66,18 @@ class ForecastTraceTests(unittest.TestCase):
         self.assertNotIn("Choices:\n", bundle.prompt)
         self.assertIn('"event_code": "000"', bundle.prompt)
         self.assertIn("No candidate choices are provided", bundle.prompt)
+
+        compact_bundle = build_structured_forecast_prompt(
+            query=query,
+            documents=documents,
+            refined_graph=graph,
+            choices=[],
+            context_mode="events-graph",
+            max_event_chars=24,
+        )
+        self.assertNotIn("Documents:\n", compact_bundle.prompt)
+        self.assertIn("mention=", compact_bundle.prompt)
+
 
         prediction = parse_structured_forecast(
             '{"forecast_trace": {"intermediate_events": [], "trace_edges": []}, '
@@ -237,6 +250,24 @@ class ForecastTraceTests(unittest.TestCase):
         )
         self.assertEqual(rewards, [1.05])
         self.assertEqual(reward_fn.last_breakdowns[0]["answer"], 1.0)
+
+    def test_grpo_low_edge_filter_is_optional(self) -> None:
+        rows = [
+            {"query_id": "zero", "trajectory": {"metadata": {"refined_graph": {"edges": []}}}},
+            {"query_id": "one", "trajectory": {"metadata": {"refined_graph": {"edges": [{"edge_id": "r1"}]}}}},
+            {"query_id": "two", "trajectory": {"metadata": {"refined_graph": {"edges": [{"edge_id": "r1"}, {"edge_id": "r2"}]}}}},
+        ]
+        kept, dropped = filter_rollout_rows_by_edge_count(rows, min_coarse_edges=2)
+        self.assertEqual([row["query_id"] for row in kept], ["two"])
+        self.assertEqual(dropped, 2)
+        kept, dropped = filter_rollout_rows_by_edge_count(rows, min_coarse_edges=0)
+        self.assertEqual(len(kept), 3)
+        self.assertEqual(dropped, 0)
+
+        fallback_rows = [{"trajectory": {"metadata": {}}, "coarse": {"edge_count": 2}}]
+        kept, dropped = filter_rollout_rows_by_edge_count(fallback_rows, min_coarse_edges=2)
+        self.assertEqual(kept, fallback_rows)
+        self.assertEqual(dropped, 0)
 
     def test_coarse_pair_parser_prefers_confidence_and_accepts_score(self) -> None:
         parsed = parse_pair_payload('{"relation_type": "none", "confidence": 1.0}')
