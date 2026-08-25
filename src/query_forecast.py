@@ -21,7 +21,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset", default="datasets/MIRAI_data.zip", help="Path to MIRAI zip file.")
     parser.add_argument("--query-id", required=True, help="MIRAI QueryId.")
     parser.add_argument("--split", default="test", help="MIRAI split name: test or test_subset.")
-    parser.add_argument("--model-path", default="models/Qwen2.5-0.5B", help="Local Hugging Face model directory.")
+    parser.add_argument("--model-path", default="models/Qwen3-4B", help="Local Hugging Face model directory.")
     parser.add_argument("--output", default=None, help="Optional JSON output path.")
     parser.add_argument("--max-docs", type=int, default=6, help="Maximum retrieved documents kept in the graph.")
     parser.add_argument("--max-events-per-doc", type=int, default=4, help="Maximum events kept per document.")

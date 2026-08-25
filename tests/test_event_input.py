@@ -19,6 +19,12 @@ from coarse_graph_dataset import build_event_pair_inference_samples
 from coarse_graph_dataset import build_graph_from_pair_predictions
 from coarse_graph_dataset import DocumentGraphSample
 from coarse_graph_dataset import load_preextracted_document_graph_sample
+from causal_graph import CoarseCausalEdge
+from causal_graph import CoarseCausalGraph
+from causal_graph import GraphBuildTrace
+from refinement_dataset import RELATION_TO_ID
+from refinement_dataset import gold_and_coarse_graph_to_refinement_sample
+from refinement_dataset import refinement_sample_from_dict
 
 
 def valid_payload() -> dict:
@@ -124,6 +130,52 @@ class EventInputTests(unittest.TestCase):
         self.assertEqual(graph.edges[0].source_event_id, "e1")
         self.assertEqual(graph.edges[0].target_event_id, "e2")
         self.assertEqual(graph.metadata["topology"]["reciprocal_pruned_count"], 1)
+
+    def test_qwen_refinement_candidates_do_not_inject_missing_gold_edges(self) -> None:
+        query, documents, events = materialize_event_input(parse_event_input_record(valid_payload()))
+        gold_graph = CoarseCausalGraph(
+            query=query,
+            documents=documents,
+            events=events,
+            edges=[
+                CoarseCausalEdge(
+                    edge_id="gold_0",
+                    source_event_id="e1",
+                    target_event_id="e2",
+                    relation_type="causes",
+                    score=1.0,
+                )
+            ],
+            trace=GraphBuildTrace(),
+        )
+        qwen_graph = CoarseCausalGraph(
+            query=query,
+            documents=documents,
+            events=events,
+            edges=[
+                CoarseCausalEdge(
+                    edge_id="qwen_0",
+                    source_event_id="e2",
+                    target_event_id="e1",
+                    relation_type="precedes",
+                    score=0.7,
+                )
+            ],
+            trace=GraphBuildTrace(),
+        )
+        refinement_sample = gold_and_coarse_graph_to_refinement_sample(
+            sample_id="sample_1",
+            gold_graph=gold_graph,
+            coarse_graph=qwen_graph,
+            negative_completion_ratio=0.0,
+            include_missing_gold_pairs=False,
+        )
+        self.assertEqual(refinement_sample.edge_index, [[1, 0]])
+        self.assertEqual(refinement_sample.edge_labels, [0])
+        self.assertFalse(refinement_sample.metadata["gold_completion_candidates_enabled"])
+        restored = refinement_sample_from_dict(refinement_sample.to_dict())
+        self.assertEqual(restored.edge_type_labels, [0])
+        self.assertEqual(RELATION_TO_ID["causes"], 1)
 
     def test_jsonl_is_indexed_by_query_id(self) -> None:
         second = valid_payload()

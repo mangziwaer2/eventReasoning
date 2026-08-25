@@ -21,7 +21,7 @@ from path_utils import resolve_repo_path
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a Qwen LoRA event-pair relation classifier.")
     parser.add_argument("--dataset", default=str(REPO_ROOT / "datasets" / "MAVEN_ERE.zip"), help="Path to MAVEN-ERE zip file.")
-    parser.add_argument("--model-path", default=str(REPO_ROOT / "models" / "Qwen2.5-0.5B"), help="Local Qwen model directory.")
+    parser.add_argument("--model-path", default=str(REPO_ROOT / "models" / "Qwen3-4B"), help="Local Qwen model directory.")
     parser.add_argument("--train-split", default="train", help="Training split name from the dataset.")
     parser.add_argument("--validation-split", default="valid", help="Validation split name from the dataset.")
     parser.add_argument("--train-limit", type=int, default=4, help="Maximum number of training rows.")

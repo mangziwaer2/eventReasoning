@@ -15,6 +15,7 @@ from refinement_dataset import EDGE_FEATURE_DIM
 from refinement_dataset import RefinementSample
 from refinement_dataset import RefinementTensorDataset
 from refinement_dataset import generate_synthetic_refinement_samples
+from refinement_dataset import load_cached_refinement_samples
 from refinement_dataset import load_maven_refinement_samples
 from path_utils import REPO_ROOT
 from path_utils import resolve_repo_path
@@ -520,12 +521,22 @@ def save_checkpoint(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train the refinement model on coarse-graph samples.")
-    parser.add_argument("--dataset-mode", choices=["synthetic", "maven"], default="maven", help="Training dataset mode.")
+    parser.add_argument(
+        "--dataset-mode",
+        choices=["synthetic", "maven", "maven-qwen-cache"],
+        default="maven",
+        help="Training source: synthetic, gold-perturbed MAVEN, or cached Qwen coarse graphs supervised by MAVEN-ERE.",
+    )
     parser.add_argument("--maven-dataset", default=str(REPO_ROOT / "datasets" / "MAVEN_ERE.zip"), help="Path to MAVEN-ERE zip file.")
     parser.add_argument("--split", default="train", help="MAVEN split when dataset-mode=maven.")
+    parser.add_argument(
+        "--qwen-refinement-cache",
+        default=str(REPO_ROOT / "outputs" / "maven_qwen_refinement_cache" / "samples.jsonl"),
+        help="JSONL created by build_maven_qwen_refinement_cache.py when dataset-mode=maven-qwen-cache.",
+    )
     parser.add_argument("--epochs", type=int, default=30, help="Number of training epochs.")
     parser.add_argument("--num-samples", type=int, default=512, help="Number of synthetic training samples.")
-    parser.add_argument("--limit", type=int, default=4, help="Maximum number of MAVEN samples when dataset-mode=maven.")
+    parser.add_argument("--limit", type=int, default=4, help="Maximum source samples when dataset-mode=maven or maven-qwen-cache. Use 0 for all.")
     parser.add_argument("--max-events", type=int, default=16, help="Maximum events kept in each MAVEN graph sample.")
     parser.add_argument("--negative-completion-ratio", type=float, default=0.75, help="Extra non-gold completion candidates per gold edge.")
     parser.add_argument("--max-completion-edges", type=int, default=0, help="Optional cap on added completion candidates per graph.")
@@ -578,15 +589,25 @@ def main() -> None:
 
     if args.dataset_mode == "synthetic":
         all_samples = generate_synthetic_refinement_samples(num_samples=args.num_samples, seed=args.seed)
-    else:
+    elif args.dataset_mode == "maven":
         all_samples = load_maven_refinement_samples(
             dataset_path=resolve_repo_path(args.maven_dataset),
             split=args.split,
-            limit=args.limit,
+            limit=args.limit if args.limit > 0 else None,
             max_events=args.max_events,
             negative_completion_ratio=args.negative_completion_ratio,
             max_completion_edges=args.max_completion_edges or None,
             seed=args.seed,
+        )
+    else:
+        all_samples = load_cached_refinement_samples(
+            cache_path=resolve_repo_path(args.qwen_refinement_cache),
+            limit=args.limit if args.limit > 0 else None,
+        )
+    if not all_samples:
+        raise RuntimeError(
+            f"No usable refinement samples for dataset-mode={args.dataset_mode!r}. "
+            "For maven-qwen-cache, generate the cache before training."
         )
     train_samples, validation_samples = split_samples(all_samples, args.validation_ratio, args.seed)
     train_stats = summarize_samples(train_samples)

@@ -67,6 +67,44 @@ class RefinementSample:
         }
 
 
+def refinement_sample_from_dict(data: dict[str, Any]) -> RefinementSample:
+    """Deserialize a cached refinement sample without rebuilding candidates."""
+
+    required_fields = (
+        "sample_id",
+        "node_features",
+        "edge_index",
+        "edge_features",
+        "edge_labels",
+        "edge_type_labels",
+        "edge_strengths",
+        "query_features",
+    )
+    missing = [name for name in required_fields if name not in data]
+    if missing:
+        raise ValueError(f"Refinement sample is missing fields: {missing}")
+
+    edge_count = len(data["edge_index"])
+    aligned_fields = ("edge_features", "edge_labels", "edge_type_labels", "edge_strengths")
+    misaligned = [name for name in aligned_fields if len(data[name]) != edge_count]
+    if misaligned:
+        raise ValueError(
+            f"Refinement sample {data['sample_id']!r} has {edge_count} edges but misaligned fields: {misaligned}"
+        )
+
+    return RefinementSample(
+        sample_id=str(data["sample_id"]),
+        node_features=[[float(value) for value in row] for row in data["node_features"]],
+        edge_index=[[int(value) for value in row] for row in data["edge_index"]],
+        edge_features=[[float(value) for value in row] for row in data["edge_features"]],
+        edge_labels=[int(value) for value in data["edge_labels"]],
+        edge_type_labels=[int(value) for value in data["edge_type_labels"]],
+        edge_strengths=[float(value) for value in data["edge_strengths"]],
+        query_features=[float(value) for value in data["query_features"]],
+        metadata=dict(data.get("metadata", {})),
+    )
+
+
 class RefinementTensorDataset(Dataset):
     def __init__(self, samples: list[RefinementSample]) -> None:
         self.samples = samples
@@ -391,6 +429,7 @@ def add_completion_candidates(
     negative_ratio: float = 0.75,
     max_completion_edges: int | None = None,
     seed: int = 7,
+    include_missing_gold_pairs: bool = True,
 ) -> list[CoarseCausalEdge]:
     rng = random.Random(seed)
     event_lookup = {event.event_id: event for event in gold_graph.events}
@@ -399,24 +438,29 @@ def add_completion_candidates(
     gold_pairs = {(edge.source_event_id, edge.target_event_id) for edge in gold_graph.edges}
 
     completion_edges: list[CoarseCausalEdge] = []
-    missing_gold_pairs = [pair for pair in gold_pairs if pair not in coarse_pairs]
-    rng.shuffle(missing_gold_pairs)
-    for source_id, target_id in missing_gold_pairs:
-        source_event = event_lookup.get(source_id)
-        target_event = event_lookup.get(target_id)
-        if source_event is None or target_event is None:
-            continue
-        completion_edges.append(
-            _completion_edge(
-                edge_id=f"completion_gold_{len(completion_edges)}",
-                source_event=source_event,
-                target_event=target_event,
-                query_text=gold_graph.query.text,
-                event_time_values=event_time_values,
+    if include_missing_gold_pairs:
+        missing_gold_pairs = [pair for pair in gold_pairs if pair not in coarse_pairs]
+        rng.shuffle(missing_gold_pairs)
+        for source_id, target_id in missing_gold_pairs:
+            source_event = event_lookup.get(source_id)
+            target_event = event_lookup.get(target_id)
+            if source_event is None or target_event is None:
+                continue
+            completion_edges.append(
+                _completion_edge(
+                    edge_id=f"completion_gold_{len(completion_edges)}",
+                    source_event=source_event,
+                    target_event=target_event,
+                    query_text=gold_graph.query.text,
+                    event_time_values=event_time_values,
+                )
             )
-        )
 
-    target_negative_count = max(1, int(max(len(gold_pairs), 1) * max(negative_ratio, 0.0)))
+    target_negative_count = (
+        max(1, int(max(len(gold_pairs), 1) * negative_ratio))
+        if negative_ratio > 0
+        else 0
+    )
     forbidden_pairs = set(coarse_pairs) | set(gold_pairs)
     ranked_negatives = _rank_completion_pairs(gold_graph.events, gold_graph.query.text, forbidden_pairs)
     for _, source_event, target_event in ranked_negatives[:target_negative_count]:
@@ -522,6 +566,7 @@ def gold_and_coarse_graph_to_refinement_sample(
     negative_completion_ratio: float = 0.75,
     max_completion_edges: int | None = None,
     seed: int = 7,
+    include_missing_gold_pairs: bool = True,
 ) -> RefinementSample:
     node_id_to_index = {event.event_id: index for index, event in enumerate(gold_graph.events)}
     event_lookup = {event.event_id: event for event in gold_graph.events}
@@ -546,6 +591,7 @@ def gold_and_coarse_graph_to_refinement_sample(
         negative_ratio=negative_completion_ratio,
         max_completion_edges=max_completion_edges,
         seed=seed,
+        include_missing_gold_pairs=include_missing_gold_pairs,
     )
     event_degrees = _event_degrees(
         coarse_graph.edges,
@@ -627,6 +673,8 @@ def gold_and_coarse_graph_to_refinement_sample(
             "coarse_edge_count": len(coarse_graph.edges),
             "completion_candidate_count": completion_count,
             "candidate_edge_count": len(edge_index),
+            "gold_completion_candidates_enabled": include_missing_gold_pairs,
+            "coarse_graph_metadata": dict(coarse_graph.metadata),
         },
     )
 
@@ -662,6 +710,52 @@ def load_maven_refinement_samples(
         )
         if sample.edge_index:
             samples.append(sample)
+    return samples
+
+
+def load_cached_refinement_samples(
+    cache_path: Path,
+    limit: int | None = None,
+) -> list[RefinementSample]:
+    """Load Qwen-generated coarse-graph supervision cached as JSONL or JSON."""
+
+    resolved_path = cache_path
+    if resolved_path.is_dir():
+        for filename in ("samples.jsonl", "refinement_samples.jsonl"):
+            candidate = resolved_path / filename
+            if candidate.exists():
+                resolved_path = candidate
+                break
+        else:
+            raise FileNotFoundError(
+                f"No refinement cache JSONL found under {resolved_path}. "
+                "Expected samples.jsonl or refinement_samples.jsonl."
+            )
+    if not resolved_path.exists():
+        raise FileNotFoundError(f"Refinement cache not found: {resolved_path}")
+
+    raw_text = resolved_path.read_text(encoding="utf-8").strip()
+    if not raw_text:
+        return []
+
+    if resolved_path.suffix.lower() == ".json":
+        loaded = json.loads(raw_text)
+        rows = loaded if isinstance(loaded, list) else [loaded]
+    else:
+        rows = [json.loads(line) for line in raw_text.splitlines() if line.strip()]
+
+    samples: list[RefinementSample] = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise ValueError(f"Cache row {index} is not a JSON object.")
+        sample_payload = row.get("refinement_sample", row)
+        if not isinstance(sample_payload, dict):
+            raise ValueError(f"Cache row {index} has no object-valued refinement_sample.")
+        sample = refinement_sample_from_dict(sample_payload)
+        if sample.edge_index:
+            samples.append(sample)
+        if limit is not None and limit > 0 and len(samples) >= limit:
+            break
     return samples
 
 

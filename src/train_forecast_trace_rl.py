@@ -43,7 +43,7 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("--input", nargs="+", required=True, help="One or more predictions.jsonl / rescored JSONL files.")
-    parser.add_argument("--model-path", default=str(REPO_ROOT / "models" / "Qwen2.5-0.5B"), help="Base Qwen model path for LoRA B.")
+    parser.add_argument("--model-path", default=str(REPO_ROOT / "models" / "Qwen3-4B"), help="Base Qwen model path for LoRA B.")
     parser.add_argument("--adapter-path", default=None, help="Optional existing LoRA B adapter to continue from.")
     parser.add_argument("--output-dir", default=str(REPO_ROOT / "outputs" / "forecast_trace_rl_lora"), help="Output directory.")
     parser.add_argument("--policy", default="forecast_trace_reward", help="Reward policy used when recomputing rewards.")

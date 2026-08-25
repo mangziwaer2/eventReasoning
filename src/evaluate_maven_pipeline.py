@@ -38,11 +38,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=0, help="Maximum MAVEN rows. Use 0 for full split.")
     parser.add_argument("--max-events", type=int, default=16, help="Maximum events kept per document graph.")
 
-    parser.add_argument("--base-model-path", default=str(REPO_ROOT / "models" / "Qwen2.5-0.5B"), help="Base Qwen model directory.")
+    parser.add_argument("--base-model-path", default=str(REPO_ROOT / "models" / "Qwen3-4B"), help="Base Qwen model directory.")
     parser.add_argument("--coarse-adapter-path", default=None, help="Optional coarse Qwen LoRA adapter directory. Omit to run the coarse stage frozen.")
     parser.add_argument("--max-sentence-gap", type=int, default=3, help="Maximum same-document sentence gap for coarse candidate pairs.")
     parser.add_argument("--max-pairs", type=int, default=64, help="Maximum coarse candidate pairs per document. Use 0 for all generated candidates.")
     parser.add_argument("--coarse-keep-threshold", type=float, default=0.5, help="Minimum coarse relation confidence to keep an edge.")
+    parser.add_argument("--coarse-topology-mode", choices=["none", "temporal-dag"], default="temporal-dag", help="Postprocess pairwise Qwen edges into a consistent graph.")
     parser.add_argument("--coarse-batch-size", type=int, default=1, help="Batch size for Qwen generation during evaluation.")
     parser.add_argument("--coarse-max-length", type=int, default=1024, help="Maximum coarse prompt length.")
     parser.add_argument("--coarse-max-new-tokens", type=int, default=48, help="Maximum generated tokens for coarse JSON.")
@@ -52,8 +53,8 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--refinement-model-path", default=str(REPO_ROOT / "outputs" / "refinement_graph_4090_full" / "refinement_model.pt"), help="Trained refinement model path.")
     parser.add_argument("--refinement-keep-threshold", type=float, default=0.5, help="Minimum refinement keep probability for an edge.")
-    parser.add_argument("--include-completion-candidates", dest="include_completion_candidates", action="store_true", default=True, help="Add heuristic completion candidates for refinement.")
-    parser.add_argument("--no-completion-candidates", dest="include_completion_candidates", action="store_false", help="Only refine Qwen coarse edges.")
+    parser.add_argument("--include-completion-candidates", dest="include_completion_candidates", action="store_true", default=False, help="Add heuristic completion candidates for refinement.")
+    parser.add_argument("--no-completion-candidates", dest="include_completion_candidates", action="store_false", help="Only refine Qwen coarse edges (default).")
     parser.add_argument("--max-completion-edges", type=int, default=0, help="Maximum refinement completion candidates. Use 0 for no cap.")
 
     parser.add_argument("--output", default=str(REPO_ROOT / "outputs" / "maven_pipeline_eval" / "metrics.json"), help="Path for aggregate metrics JSON.")
@@ -432,6 +433,7 @@ def main() -> None:
                 pair_samples=pair_samples,
                 pair_predictions=pair_predictions,
                 keep_threshold=args.coarse_keep_threshold,
+                topology_mode=args.coarse_topology_mode,
             )
             coarse_unlabeled, coarse_labeled = graph_edge_sets(coarse_graph, sample_id)
             coarse_unlabeled_global.update(coarse_unlabeled)

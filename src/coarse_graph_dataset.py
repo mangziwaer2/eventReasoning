@@ -1141,9 +1141,12 @@ def _parse_edge(data: dict[str, Any]) -> CoarseCausalEdge:
     )
 
 
-def load_coarse_graph(path: Path) -> CoarseCausalGraph:
-    payload = json.loads(path.read_text(encoding="utf-8"))
+def coarse_graph_from_payload(payload: dict[str, Any]) -> CoarseCausalGraph:
+    if not isinstance(payload, dict):
+        raise ValueError("Coarse graph payload must be an object.")
     graph_data = payload.get("coarse_graph", payload)
+    if not isinstance(graph_data, dict):
+        raise ValueError("coarse_graph must be an object.")
     return CoarseCausalGraph(
         query=_parse_query(graph_data.get("query", {})),
         documents=[_parse_document(item) for item in graph_data.get("documents", [])],
@@ -1152,6 +1155,11 @@ def load_coarse_graph(path: Path) -> CoarseCausalGraph:
         trace=GraphBuildTrace(),
         metadata=dict(graph_data.get("metadata", {})),
     )
+
+
+def load_coarse_graph(path: Path) -> CoarseCausalGraph:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    return coarse_graph_from_payload(payload)
 
 
 def parse_args() -> argparse.Namespace:

@@ -56,7 +56,7 @@ def parse_args() -> argparse.Namespace:
         help="Prompt-only GRPO context JSONL files from the prepare-grpo-context stage.",
     )
     parser.add_argument("--allow-legacy-rollout-input", action="store_true", help="Allow old predictions.jsonl rows; disabled by default for online-only training.")
-    parser.add_argument("--model-path", default=str(REPO_ROOT / "models" / "Qwen2.5-0.5B"))
+    parser.add_argument("--model-path", default=str(REPO_ROOT / "models" / "Qwen3-4B"))
     parser.add_argument("--adapter-path", default=None, help="Existing trainable LoRA adapter to continue from.")
     parser.add_argument("--output-dir", default=str(REPO_ROOT / "outputs" / "forecast_trace_grpo"))
     parser.add_argument("--policy", default="forecast_trace_reward")

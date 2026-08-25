@@ -57,11 +57,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=8, help="Maximum query examples. Use 0 for the full split.")
     parser.add_argument("--query-id", default=None, help="Optional single MIRAI QueryId.")
 
-    parser.add_argument("--model-path", default=str(REPO_ROOT / "models" / "Qwen2.5-0.5B"), help="Native local Qwen model path for optional event extraction and default forecasting.")
-    parser.add_argument("--coarse-base-model-path", default=str(REPO_ROOT / "models" / "Qwen2.5-0.5B"), help="Base Qwen model for the coarse stage. Defaults to --model-path.")
+    parser.add_argument("--model-path", default=str(REPO_ROOT / "models" / "Qwen3-4B"), help="Native local Qwen model path for optional event extraction and default forecasting.")
+    parser.add_argument("--coarse-base-model-path", default=str(REPO_ROOT / "models" / "Qwen3-4B"), help="Base Qwen model for the coarse stage. Defaults to --model-path.")
     parser.add_argument("--coarse-adapter-path", default=None, help="Optional coarse LoRA adapter path. Omit to run the coarse stage frozen.")
     parser.add_argument("--refinement-model-path", default=str(REPO_ROOT / "outputs" / "refinement_graph_4090_full" / "refinement_model.pt"), help="Refinement model path.")
-    parser.add_argument("--forecast-base-model-path", default=str(REPO_ROOT / "models" / "Qwen2.5-0.5B"), help="Base Qwen model for LoRA B. Defaults to --model-path.")
+    parser.add_argument("--forecast-base-model-path", default=str(REPO_ROOT / "models" / "Qwen3-4B"), help="Base Qwen model for LoRA B. Defaults to --model-path.")
     parser.add_argument("--forecast-adapter-path", default=None, help="Optional LoRA B adapter path for structured forecasting.")
 
     parser.add_argument("--event-source", choices=["precomputed", "qwen"], default="precomputed", help="Event input source. precomputed is the research setting; qwen is an optional frozen-extractor baseline.")

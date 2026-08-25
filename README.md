@@ -17,7 +17,7 @@ gold/frozen upstream extractor (outside our method)
 -> deterministic reward / offline RL / GRPO
 ```
 
-- 粗图模型：默认 `Qwen2.5-0.5B + LoRA`，负责高频事件对关系评分。
+- 粗图模型：默认 `Qwen3-4B + LoRA`，负责高频事件对关系评分。
 - Refinement：当前默认关闭；no-refinement 方法验证可行后，再接入 time-aware relational GNN 做对照。
 - 最终预测模型：读取 coarse graph，联合输出开放式 `forecast_trace` 与闭集监督目标 `event_code`。
 - 主数据集：MAVEN-ERE 用于图监督，MIRAI 用于最终未来事件预测评测。
@@ -84,7 +84,7 @@ python src/event_input.py --input examples/event_input.example.json
 python src/run_coarse_graph_qwen.py \
   --input-mode events \
   --input examples/event_input.example.json \
-  --base-model-path models/Qwen2.5-0.5B \
+  --base-model-path models/Qwen3-4B \
   --adapter-path outputs/coarse_graph_qwen_lora_4090_full/best_adapter \
   --output outputs/example_coarse_graph.json
 ```
@@ -121,7 +121,7 @@ python src/train_refinement.py \
   --output-dir outputs/refinement_graph_4090_full
 ```
 
-云端完整参数和续训命令见 [cloud_training.txt](cloud_training.txt)。
+云端 no-refinement 与 ERE-refinement 完整命令见 [Cloud GRPO Runbook](docs/cloud_rl_no_refinement.md)。
 
 ## 评测
 
@@ -131,7 +131,7 @@ MAVEN 两阶段图指标：
 python src/evaluate_maven_pipeline.py \
   --split test \
   --limit 0 \
-  --base-model-path models/Qwen2.5-0.5B \
+  --base-model-path models/Qwen3-4B \
   --coarse-adapter-path outputs/coarse_graph_qwen_lora_4090_full/best_adapter \
   --refinement-model-path outputs/refinement_graph_4090_full/refinement_model.pt
 ```
@@ -143,8 +143,8 @@ python src/evaluate_local_qwen_pipeline.py \
   --limit 8 \
   --event-source precomputed \
   --precomputed-events datasets/mirai_event_inputs_rule/mirai_event_input_test.jsonl \
-  --model-path models/Qwen2.5-4B \
-  --coarse-base-model-path models/Qwen2.5-0.5B \
+  --model-path models/Qwen3-4B \
+  --coarse-base-model-path models/Qwen3-4B \
   --coarse-adapter-path outputs/coarse_graph_qwen_lora_4090_full/best_adapter \
   --output-dir outputs/local_qwen_pipeline_eval
 ```
