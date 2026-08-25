@@ -46,7 +46,7 @@ def parse_args() -> argparse.Namespace:
 def _format_prompt(prompt: str) -> str:
     return (
         "<|im_start|>system\nYou classify directed relations between event pairs.<|im_end|>\n"
-        f"<|im_start|>user\n{prompt}<|im_end|>\n"
+        f"<|im_start|>user\n{prompt}\n/no_think<|im_end|>\n"
         "<|im_start|>assistant\n"
     )
 

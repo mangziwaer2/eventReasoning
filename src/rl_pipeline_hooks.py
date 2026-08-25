@@ -237,7 +237,7 @@ class ForecastTraceReward:
         graph_bridge_weight: float = 0.3,
         generic_penalty_weight: float = 0.15,
         density_penalty_weight: float = 0.15,
-        wrong_answer_trace_cap: float = 0.2,
+        wrong_answer_trace_scale: float = 0.2,
     ) -> None:
         self.answer_reward = MiraiCodeReward()
         self.answer_weight = answer_weight
@@ -247,7 +247,7 @@ class ForecastTraceReward:
         self.graph_bridge_weight = graph_bridge_weight
         self.generic_penalty_weight = generic_penalty_weight
         self.density_penalty_weight = density_penalty_weight
-        self.wrong_answer_trace_cap = wrong_answer_trace_cap
+        self.wrong_answer_trace_scale = max(0.0, min(float(wrong_answer_trace_scale), 1.0))
 
     def __call__(self, prediction: dict[str, Any], gold: dict[str, Any], trajectory: PipelineTrajectory) -> dict[str, float]:
         forecast_step = _latest_step(trajectory, "forecast")
@@ -288,7 +288,7 @@ class ForecastTraceReward:
         temporal = _trace_temporal_score(prediction)
         generic_penalty = _generic_penalty(prediction)
         density_penalty = _density_penalty(prediction)
-        trace_component = (
+        trace_unscaled = (
             self.format_weight * fmt
             + self.grounding_weight * grounding
             + self.temporal_weight * temporal
@@ -296,8 +296,10 @@ class ForecastTraceReward:
             - self.generic_penalty_weight * generic_penalty
             - self.density_penalty_weight * density_penalty
         )
+        trace_component = trace_unscaled
         if answer <= 0.0:
-            trace_component = min(trace_component, self.wrong_answer_trace_cap)
+            # Keep answer reward dominant without flattening all incorrect rollouts.
+            trace_component *= self.wrong_answer_trace_scale
         total = self.answer_weight * answer + trace_component
         return {
             "answer": round(answer, 6),
@@ -309,6 +311,8 @@ class ForecastTraceReward:
             "graph_bridge": round(bridge, 6),
             "generic_penalty": round(generic_penalty, 6),
             "density_penalty": round(density_penalty, 6),
+            "trace_unscaled": round(trace_unscaled, 6),
+            "trace": round(trace_component, 6),
             "total": round(total, 6),
         }
 

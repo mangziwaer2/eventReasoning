@@ -33,7 +33,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--coarse-adapter-path", default=None)
     parser.add_argument("--coarse-batch-size", type=int, default=1)
     parser.add_argument("--coarse-max-length", type=int, default=1024)
-    parser.add_argument("--coarse-max-new-tokens", type=int, default=48)
+    parser.add_argument("--coarse-max-new-tokens", type=int, default=48, help="Generation cap for the short relation JSON. Use --coarse-thinking with a much larger cap only for an explicit ablation.")
+    parser.add_argument("--coarse-thinking", action="store_true", help="Allow Qwen3 reasoning in pair classification. Disabled by default so JSON generation is short and not truncated.")
     parser.add_argument("--include-query", action="store_true")
     parser.add_argument("--document-mode", choices=["none", "title", "snippet", "summary", "full"], default="title")
     parser.add_argument("--max-document-chars", type=int, default=240)
@@ -45,6 +46,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-completion-edges", type=int, default=0)
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--log-every", type=int, default=1, help="Print cache progress every N source rows. Use 0 to suppress per-row progress after startup.")
     parser.add_argument("--overwrite", action="store_true", help="Replace an existing samples.jsonl in output-dir.")
     parser.add_argument(
         "--output-dir",
@@ -54,11 +56,12 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def format_prompt(prompt: str) -> str:
+def format_prompt(prompt: str, *, enable_thinking: bool = False) -> str:
+    thinking_suffix = "" if enable_thinking else "\n/no_think"
     return (
-        "<|im_start|>system\nYou classify directed relations between event pairs."
-        "<|im_end|>\n<|im_start|>user\n"
-        f"{prompt}<|im_end|>\n<|im_start|>assistant\n"
+        "<|im_start|>system\nYou classify directed relations between event pairs.<|im_end|>\n"
+        f"<|im_start|>user\n{prompt}{thinking_suffix}<|im_end|>\n"
+        "<|im_start|>assistant\n"
     )
 
 
@@ -74,11 +77,26 @@ def resolve_generation_eos_ids(tokenizer) -> list[int] | int | None:
     return eos_ids if len(eos_ids) > 1 else eos_ids[0]
 
 
+def _has_nonempty_thinking(raw_generation: str) -> bool:
+    start = raw_generation.find("<think>")
+    end = raw_generation.find("</think>")
+    return start >= 0 and end > start and bool(raw_generation[start + len("<think>") : end].strip())
+
+
 def generate_pair_predictions(model, tokenizer, torch, device, pair_samples, args):
     predictions: list[dict[str, Any] | None] = []
     raw_generations: list[str] = []
+    generation_stats = {
+        "generated_pairs": 0,
+        "generated_tokens": 0,
+        "truncated_generations": 0,
+        "thinking_generations": 0,
+        "nonempty_thinking_generations": 0,
+        "thinking_truncated_generations": 0,
+    }
     tokenizer.padding_side = "left"
     eos_token_id = resolve_generation_eos_ids(tokenizer)
+    eos_ids = {int(item) for item in eos_token_id} if isinstance(eos_token_id, list) else ({int(eos_token_id)} if eos_token_id is not None else set())
     batch_size = max(1, int(args.coarse_batch_size))
     with torch.no_grad():
         for start in range(0, len(pair_samples), batch_size):
@@ -89,7 +107,8 @@ def generate_pair_predictions(model, tokenizer, torch, device, pair_samples, arg
                         include_query=args.include_query,
                         document_mode=args.document_mode,
                         max_document_chars=args.max_document_chars,
-                    )["prompt"]
+                    )["prompt"],
+                    enable_thinking=args.coarse_thinking,
                 )
                 for pair in batch
             ]
@@ -112,16 +131,31 @@ def generate_pair_predictions(model, tokenizer, torch, device, pair_samples, arg
             )
             prompt_width = input_ids.shape[-1]
             for row_index in range(len(batch)):
-                generated = tokenizer.decode(
-                    outputs[row_index][prompt_width:], skip_special_tokens=True
-                ).strip()
+                generated_ids = outputs[row_index][prompt_width:]
+                generated_token_ids = [int(token_id) for token_id in generated_ids.tolist()]
+                generated = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+                truncated = (
+                    len(generated_token_ids) >= args.coarse_max_new_tokens
+                    and not any(token_id in eos_ids for token_id in generated_token_ids)
+                )
+                has_thinking = "<think>" in generated
+                generation_stats["generated_pairs"] += 1
+                generation_stats["generated_tokens"] += len(generated_token_ids)
+                generation_stats["truncated_generations"] += int(truncated)
+                generation_stats["thinking_generations"] += int(has_thinking)
+                generation_stats["nonempty_thinking_generations"] += int(_has_nonempty_thinking(generated))
+                generation_stats["thinking_truncated_generations"] += int(
+                    truncated and (has_thinking or args.coarse_thinking)
+                )
                 raw_generations.append(generated)
                 predictions.append(parse_pair_payload(generated))
-    return predictions, raw_generations
+    return predictions, raw_generations, generation_stats
 
 
 def main() -> None:
     args = parse_args()
+    if args.coarse_thinking and args.coarse_max_new_tokens < 1024:
+        raise ValueError("--coarse-thinking requires --coarse-max-new-tokens >= 1024; omit --coarse-thinking for short relation JSON generation.")
     output_dir = resolve_repo_path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     samples_path = output_dir / "samples.jsonl"
@@ -162,10 +196,30 @@ def main() -> None:
         "coarse_pairs": 0,
         "coarse_parse_success": 0,
         "coarse_edges": 0,
+        "coarse_generated_tokens": 0,
+        "coarse_truncated_generations": 0,
+        "coarse_thinking_generations": 0,
+        "coarse_nonempty_thinking_generations": 0,
+        "coarse_thinking_truncated_generations": 0,
         "refinement_candidates": 0,
         "refinement_positive_edges": 0,
     }
     started = time.time()
+    print(
+        " | ".join(
+            [
+                "maven qwen refinement cache",
+                f"split={args.split}",
+                f"source_rows={len(document_samples)}",
+                f"device={device}",
+                f"batch_size={args.coarse_batch_size}",
+                f"max_pairs={args.max_pairs}",
+                f"thinking={args.coarse_thinking}",
+                f"max_new_tokens={args.coarse_max_new_tokens}",
+            ]
+        ),
+        flush=True,
+    )
 
     with samples_path.open("w", encoding="utf-8") as handle:
         for row_index, document_sample in enumerate(document_samples, start=1):
@@ -180,11 +234,23 @@ def main() -> None:
             if not pair_samples:
                 stats["skipped_no_pairs"] += 1
                 continue
-            predictions, raw_generations = generate_pair_predictions(
+            if args.log_every > 0 and (row_index % args.log_every == 0 or row_index == 1):
+                print(
+                    f"cache row {row_index}/{len(document_samples)} starting | "
+                    f"events={len(document_sample.events)} | pairs={len(pair_samples)} | "
+                    f"cached={stats['cached_samples']} | elapsed={time.time() - started:.1f}s",
+                    flush=True,
+                )
+            predictions, raw_generations, generation_stats = generate_pair_predictions(
                 model, tokenizer, torch, device, pair_samples, args
             )
             stats["coarse_pairs"] += len(pair_samples)
             stats["coarse_parse_success"] += sum(item is not None for item in predictions)
+            stats["coarse_generated_tokens"] += generation_stats["generated_tokens"]
+            stats["coarse_truncated_generations"] += generation_stats["truncated_generations"]
+            stats["coarse_thinking_generations"] += generation_stats["thinking_generations"]
+            stats["coarse_nonempty_thinking_generations"] += generation_stats["nonempty_thinking_generations"]
+            stats["coarse_thinking_truncated_generations"] += generation_stats["thinking_truncated_generations"]
             coarse_graph = build_graph_from_pair_predictions(
                 document_sample,
                 pair_samples,
@@ -242,10 +308,12 @@ def main() -> None:
                 stats["trainable_samples"] += 1
             else:
                 stats["zero_candidate_samples"] += 1
-            if row_index % 10 == 0 or row_index == len(document_samples):
+            if args.log_every > 0 and (row_index % args.log_every == 0 or row_index == len(document_samples)):
                 print(
-                    f"cached {row_index}/{len(document_samples)} | "
-                    f"rows={stats['cached_samples']} | trainable={stats['trainable_samples']} | "
+                    f"cache row {row_index}/{len(document_samples)} done | "
+                    f"edges={len(coarse_graph.edges)} | parsed={sum(item is not None for item in predictions)}/{len(pair_samples)} | "
+                    f"truncated={generation_stats['truncated_generations']} | "
+                    f"cached={stats['cached_samples']} | trainable={stats['trainable_samples']} | "
                     f"elapsed={time.time() - started:.1f}s",
                     flush=True,
                 )
@@ -260,6 +328,18 @@ def main() -> None:
             **stats,
             "coarse_parse_rate": (
                 stats["coarse_parse_success"] / stats["coarse_pairs"]
+                if stats["coarse_pairs"] else 0.0
+            ),
+            "coarse_mean_generated_tokens": (
+                stats["coarse_generated_tokens"] / stats["coarse_pairs"]
+                if stats["coarse_pairs"] else 0.0
+            ),
+            "coarse_truncated_rate": (
+                stats["coarse_truncated_generations"] / stats["coarse_pairs"]
+                if stats["coarse_pairs"] else 0.0
+            ),
+            "coarse_nonempty_thinking_rate": (
+                stats["coarse_nonempty_thinking_generations"] / stats["coarse_pairs"]
                 if stats["coarse_pairs"] else 0.0
             ),
         },

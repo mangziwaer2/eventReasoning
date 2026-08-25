@@ -49,6 +49,18 @@ def _move_to_device(model, torch):
     return model
 
 
+def _require_local_adapter(adapter_path: Path) -> str:
+    adapter = Path(adapter_path)
+    config_path = adapter / "adapter_config.json"
+    if not adapter.is_dir() or not config_path.is_file():
+        raise LoraUnavailable(
+            f"LoRA adapter directory is incomplete: {adapter}. Expected {config_path}. "
+            "Use a best_adapter/latest_adapter directory created by train_coarse_graph_qwen.py, "
+            "or omit the adapter flag to run frozen Qwen3-4B."
+        )
+    return str(adapter)
+
+
 def load_qwen_with_lora(
     model_path: Path,
     adapter_path: Path | None = None,
@@ -59,6 +71,7 @@ def load_qwen_with_lora(
 ):
     torch, auto_model_cls, auto_tokenizer_cls, lora_config_cls, get_peft_model, peft_model_cls = import_qwen_lora_stack()
 
+    adapter_id = _require_local_adapter(adapter_path) if adapter_path is not None else None
     tokenizer_source = adapter_path if adapter_path is not None and (adapter_path / "tokenizer_config.json").exists() else model_path
     tokenizer = auto_tokenizer_cls.from_pretrained(tokenizer_source, trust_remote_code=False)
     if tokenizer.pad_token_id is None:
@@ -67,9 +80,9 @@ def load_qwen_with_lora(
     model = auto_model_cls.from_pretrained(model_path, **_inference_model_kwargs(torch))
     if adapter_path is not None:
         try:
-            model = peft_model_cls.from_pretrained(model, adapter_path, is_trainable=True)
+            model = peft_model_cls.from_pretrained(model, adapter_id, is_trainable=True)
         except TypeError:
-            model = peft_model_cls.from_pretrained(model, adapter_path)
+            model = peft_model_cls.from_pretrained(model, adapter_id)
             for name, parameter in model.named_parameters():
                 if "lora_" in name:
                     parameter.requires_grad = True
@@ -93,13 +106,14 @@ def load_trained_qwen_lora(
 ):
     torch, auto_model_cls, auto_tokenizer_cls, _, _, peft_model_cls = import_qwen_lora_stack()
 
+    adapter_id = _require_local_adapter(adapter_path)
     tokenizer_source = adapter_path if (adapter_path / "tokenizer_config.json").exists() else base_model_path
     tokenizer = auto_tokenizer_cls.from_pretrained(tokenizer_source, trust_remote_code=False)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
     model = auto_model_cls.from_pretrained(base_model_path, **_inference_model_kwargs(torch))
-    model = peft_model_cls.from_pretrained(model, adapter_path)
+    model = peft_model_cls.from_pretrained(model, adapter_id)
     model = _move_to_device(model, torch)
     return model, tokenizer, torch
 
@@ -118,6 +132,7 @@ def load_qwen_for_inference(
             "Inference requires `torch` and `transformers`."
         ) from exc
 
+    adapter_id = _require_local_adapter(adapter_path) if adapter_path is not None else None
     tokenizer_source = adapter_path if adapter_path is not None and (adapter_path / "tokenizer_config.json").exists() else base_model_path
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, trust_remote_code=False)
     if tokenizer.pad_token_id is None:
@@ -132,6 +147,6 @@ def load_qwen_for_inference(
             raise LoraUnavailable(
                 "Loading a coarse LoRA adapter requires `peft`."
             ) from exc
-        model = PeftModel.from_pretrained(model, adapter_path)
+        model = PeftModel.from_pretrained(model, adapter_id)
     model = _move_to_device(model, torch)
     return model, tokenizer, torch

@@ -57,7 +57,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--allow-legacy-rollout-input", action="store_true", help="Allow old predictions.jsonl rows; disabled by default for online-only training.")
     parser.add_argument("--model-path", default=str(REPO_ROOT / "models" / "Qwen3-4B"))
-    parser.add_argument("--adapter-path", default=None, help="Existing trainable LoRA adapter to continue from.")
+    parser.add_argument("--adapter-path", default=None, help="Required SFT LoRA adapter from train_forecast_code_sft.py stage forecast.")
     parser.add_argument("--output-dir", default=str(REPO_ROOT / "outputs" / "forecast_trace_grpo"))
     parser.add_argument("--policy", default="forecast_trace_reward")
     parser.add_argument("--reward-key", default="total", help="Reward breakdown key passed to GRPO.")
@@ -202,6 +202,8 @@ def main() -> None:
     args = parse_args()
     if args.min_coarse_edges < 0:
         raise ValueError("--min-coarse-edges must be non-negative.")
+    if not args.adapter_path:
+        raise ValueError("--adapter-path is required: start GRPO from the completed stage-forecast SFT adapter.")
     if args.num_generations < 2:
         raise ValueError("--num-generations must be at least 2 for GRPO group-relative advantages.")
     if args.per_device_train_batch_size < args.num_generations:

@@ -64,7 +64,7 @@ class ForecastTraceTests(unittest.TestCase):
 
         self.assertEqual(bundle.choices, [])
         self.assertNotIn("Choices:\n", bundle.prompt)
-        self.assertIn('"event_code": "000"', bundle.prompt)
+        self.assertIn('"event_code": "<3-digit-event-code>"', bundle.prompt)
         self.assertIn("No candidate choices are provided", bundle.prompt)
 
         compact_bundle = build_structured_forecast_prompt(
@@ -268,6 +268,49 @@ class ForecastTraceTests(unittest.TestCase):
         kept, dropped = filter_rollout_rows_by_edge_count(fallback_rows, min_coarse_edges=2)
         self.assertEqual(kept, fallback_rows)
         self.assertEqual(dropped, 0)
+
+    def test_wrong_answer_trace_reward_retains_trace_ranking(self) -> None:
+        graph = {
+            "events": [{"event_id": "e1", "text": "police warned organizers"}],
+            "edges": [{"edge_id": "r1", "source_event_id": "e1", "target_event_id": "e1", "score": 0.9}],
+        }
+        trajectory = PipelineTrajectory(
+            sample_id="sample_1",
+            metadata={
+                "refined_graph": graph,
+                "event_ref_to_id": {"H01": "e1"},
+                "edge_ref_to_id": {"R01": "r1"},
+            },
+        )
+        grounded = parse_structured_forecast(
+            "\n".join(
+                [
+                    "{",
+                    '  "forecast_trace": {"intermediate_events": [{"trace_event_id": "ft_1", "event": "security forces deploy near capital", "relative_time": "t-1", "supporting_event_ids": ["H01"], "supporting_edge_ids": ["R01"]}],',
+                    '                     "trace_edges": [{"source_id": "H01", "target_id": "ft_1", "relation_type": "causes", "confidence": 0.8}, {"source_id": "ft_1", "target_id": "answer_999", "relation_type": "raises_likelihood", "confidence": 0.9}]},',
+                    '  "final_answer": {"event_code": "999", "confidence": 0.8}',
+                    "}",
+                ]
+            )
+        )
+        ungrounded = parse_structured_forecast(
+            "\n".join(
+                [
+                    "{",
+                    '  "forecast_trace": {"intermediate_events": [{"trace_event_id": "ft_1", "event": "security forces deploy near capital", "relative_time": "t-1"}],',
+                    '                     "trace_edges": [{"source_id": "H99", "target_id": "ft_1", "relation_type": "causes", "confidence": 0.8}, {"source_id": "ft_1", "target_id": "answer_999", "relation_type": "raises_likelihood", "confidence": 0.9}]},',
+                    '  "final_answer": {"event_code": "999", "confidence": 0.8}',
+                    "}",
+                ]
+            )
+        )
+        reward_fn = ForecastTraceReward()
+        grounded_reward = reward_fn(grounded, {"answer_list": ["036"]}, trajectory)
+        ungrounded_reward = reward_fn(ungrounded, {"answer_list": ["036"]}, trajectory)
+        self.assertEqual(grounded_reward["answer"], 0.0)
+        self.assertEqual(ungrounded_reward["answer"], 0.0)
+        self.assertGreater(grounded_reward["total"], ungrounded_reward["total"])
+        self.assertLess(grounded_reward["trace"], grounded_reward["trace_unscaled"])
 
     def test_coarse_pair_parser_prefers_confidence_and_accepts_score(self) -> None:
         parsed = parse_pair_payload('{"relation_type": "none", "confidence": 1.0}')

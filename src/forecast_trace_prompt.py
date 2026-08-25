@@ -178,12 +178,12 @@ def build_structured_forecast_prompt(
         "    ],\n"
         '    "trace_edges": [\n'
         '      {"source_ref": "H01", "target_ref": "ft_1", "relation_type": "causes", "confidence": 0.0},\n'
-        '      {"source_ref": "ft_1", "target_ref": "answer_173", "relation_type": "raises_likelihood", "confidence": 0.0}\n'
+        '      {"source_ref": "ft_1", "target_ref": "answer_<event_code>", "relation_type": "raises_likelihood", "confidence": 0.0}\n'
         "    ]\n"
         "  },\n"
-        '  "final_answer": {"event_code": "000", "event": "event description", "confidence": 0.0}\n'
+        '  "final_answer": {"event_code": "<3-digit-event-code>", "event": "event description", "confidence": 0.0}\n'
         "}\n\n"
-        "Invalid outputs: nonexistent event_ref/edge_ref, generic events like 'tensions rise', invalid event_code, or cutoff-after facts as observed history.\n\n"
+        "Invalid outputs: nonexistent event_ref/edge_ref, placeholder event codes such as <3-digit-event-code>, generic events like 'tensions rise', invalid event_code, or cutoff-after facts as observed history.\n\n"
     )
     prompt = (
         "You are a future event forecasting model.\n"
