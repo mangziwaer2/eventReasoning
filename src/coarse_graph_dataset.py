@@ -129,7 +129,7 @@ class EventPairSample:
     def to_instruction_example(
         self,
         include_query: bool = False,
-        document_mode: str = "title",
+        document_mode: str = "none",
         max_document_chars: int = 240,
     ) -> dict[str, str]:
         event_lookup = {event.event_id: event for event in self.events}
@@ -138,6 +138,8 @@ class EventPairSample:
         target_event = event_lookup[self.target_event_id]
         source_document = document_lookup.get(source_event.document_id)
         target_document = document_lookup.get(target_event.document_id)
+        normalized_document_mode = _normalize_document_mode(document_mode)
+        include_event_context = normalized_document_mode != "none"
 
         prompt_lines = [
             "You classify the relation between two candidate events.",
@@ -152,10 +154,20 @@ class EventPairSample:
             [
                 "",
                 "Source Event:",
-                self._render_event_block(source_event, source_document),
+                self._render_event_block(
+                    source_event,
+                    source_document,
+                    include_document_title=include_event_context,
+                    include_event_context=include_event_context,
+                ),
                 "",
                 "Target Event:",
-                self._render_event_block(target_event, target_document),
+                self._render_event_block(
+                    target_event,
+                    target_document,
+                    include_document_title=include_event_context,
+                    include_event_context=include_event_context,
+                ),
             ]
         )
 
@@ -181,7 +193,14 @@ class EventPairSample:
             "metadata": self.metadata,
         }
 
-    def _render_event_block(self, event: EventNode, document: NewsDocument | None) -> str:
+    def _render_event_block(
+        self,
+        event: EventNode,
+        document: NewsDocument | None,
+        *,
+        include_document_title: bool,
+        include_event_context: bool,
+    ) -> str:
         trigger = str(event.metadata.get("trigger", "")).strip()
         lines = [
             f"id={event.event_id}",
@@ -190,11 +209,11 @@ class EventPairSample:
         ]
         if trigger:
             lines.append(f"trigger={trigger}")
-        if document is not None and document.title:
+        if include_document_title and document is not None and document.title:
             lines.append(f"title={document.title}")
         lines.append(f"event={event.text}")
         context = str(event.metadata.get("event_context") or event.metadata.get("sentence_text") or "").strip()
-        if context and context != event.text:
+        if include_event_context and context and context != event.text:
             lines.append(f"context={context}")
         return "\n".join(lines)
 
@@ -249,6 +268,15 @@ def _normalize_document_mode(mode: str) -> str:
     if normalized == "summary":
         return "snippet"
     return normalized
+
+
+def events_mentions_instruction_example(pair: EventPairSample) -> dict[str, str]:
+    """Render the shared coarse-graph input without query or document content."""
+    return pair.to_instruction_example(
+        include_query=False,
+        document_mode="none",
+        max_document_chars=0,
+    )
 
 
 def _compact_text(text: str, max_chars: int = 320) -> str:

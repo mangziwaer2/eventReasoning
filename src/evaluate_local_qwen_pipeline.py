@@ -14,6 +14,7 @@ from causal_graph import EventNode
 from coarse_graph_dataset import DocumentGraphSample
 from coarse_graph_dataset import build_event_pair_inference_samples
 from coarse_graph_dataset import build_graph_from_pair_predictions
+from coarse_graph_dataset import events_mentions_instruction_example
 from coarse_graph_dataset import parse_pair_payload
 from event_extraction import format_event_mention
 from event_extraction import normalize_text
@@ -373,7 +374,7 @@ def generate_coarse_predictions(model, tokenizer, torch, device, pair_samples, a
             batch = pair_samples[start : start + batch_size]
             prompts = []
             for pair_sample in batch:
-                item = pair_sample.to_instruction_example(include_query=False, document_mode="title")
+                item = events_mentions_instruction_example(pair_sample)
                 prompts.append(format_pair_prompt(item["prompt"], enable_thinking=args.coarse_thinking))
             encoded = tokenizer(
                 prompts,

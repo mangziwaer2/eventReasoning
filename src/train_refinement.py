@@ -603,6 +603,7 @@ def main() -> None:
         all_samples = load_cached_refinement_samples(
             cache_path=resolve_repo_path(args.qwen_refinement_cache),
             limit=args.limit if args.limit > 0 else None,
+            require_complete_maven_cache=True,
         )
     if not all_samples:
         raise RuntimeError(

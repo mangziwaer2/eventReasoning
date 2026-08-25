@@ -8,6 +8,7 @@ from typing import Any
 
 from coarse_graph_dataset import build_event_pair_inference_samples
 from coarse_graph_dataset import build_graph_from_pair_predictions
+from coarse_graph_dataset import events_mentions_instruction_example
 from coarse_graph_dataset import load_maven_document_graph_samples
 from coarse_graph_dataset import parse_pair_payload
 from local_qwen_lora import LoraUnavailable
@@ -35,9 +36,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--coarse-max-length", type=int, default=1024)
     parser.add_argument("--coarse-max-new-tokens", type=int, default=48, help="Generation cap for the short relation JSON. Use --coarse-thinking with a much larger cap only for an explicit ablation.")
     parser.add_argument("--coarse-thinking", action="store_true", help="Allow Qwen3 reasoning in pair classification. Disabled by default so JSON generation is short and not truncated.")
-    parser.add_argument("--include-query", action="store_true")
-    parser.add_argument("--document-mode", choices=["none", "title", "snippet", "summary", "full"], default="title")
-    parser.add_argument("--max-document-chars", type=int, default=240)
     parser.add_argument(
         "--negative-completion-ratio",
         type=float,
@@ -103,11 +101,7 @@ def generate_pair_predictions(model, tokenizer, torch, device, pair_samples, arg
             batch = pair_samples[start : start + batch_size]
             prompts = [
                 format_prompt(
-                    pair.to_instruction_example(
-                        include_query=args.include_query,
-                        document_mode=args.document_mode,
-                        max_document_chars=args.max_document_chars,
-                    )["prompt"],
+                    events_mentions_instruction_example(pair)["prompt"],
                     enable_thinking=args.coarse_thinking,
                 )
                 for pair in batch
@@ -152,6 +146,45 @@ def generate_pair_predictions(model, tokenizer, torch, device, pair_samples, arg
     return predictions, raw_generations, generation_stats
 
 
+def build_cache_manifest(
+    args: argparse.Namespace,
+    *,
+    adapter_path: Path | None,
+    device: Any,
+    stats: dict[str, int],
+    complete: bool,
+) -> dict[str, Any]:
+    return {
+        "schema_version": "maven-ere-qwen-refinement-v2",
+        "coarse_input_contract": "events-mentions-v1",
+        "complete": complete,
+        "config": vars(args),
+        "resolved_base_model_path": str(resolve_repo_path(args.base_model_path)),
+        "resolved_coarse_adapter_path": str(adapter_path) if adapter_path else None,
+        "resolved_dataset": str(resolve_repo_path(args.dataset)),
+        "device": str(device),
+        "stats": {
+            **stats,
+            "coarse_parse_rate": (
+                stats["coarse_parse_success"] / stats["coarse_pairs"]
+                if stats["coarse_pairs"] else 0.0
+            ),
+            "coarse_mean_generated_tokens": (
+                stats["coarse_generated_tokens"] / stats["coarse_pairs"]
+                if stats["coarse_pairs"] else 0.0
+            ),
+            "coarse_truncated_rate": (
+                stats["coarse_truncated_generations"] / stats["coarse_pairs"]
+                if stats["coarse_pairs"] else 0.0
+            ),
+            "coarse_nonempty_thinking_rate": (
+                stats["coarse_nonempty_thinking_generations"] / stats["coarse_pairs"]
+                if stats["coarse_pairs"] else 0.0
+            ),
+        },
+    }
+
+
 def main() -> None:
     args = parse_args()
     if args.coarse_thinking and args.coarse_max_new_tokens < 1024:
@@ -166,6 +199,8 @@ def main() -> None:
                 f"Cache already exists: {samples_path}. Pass --overwrite to replace it."
             )
         samples_path.unlink()
+    if manifest_path.exists():
+        manifest_path.unlink()
 
     document_samples = load_maven_document_graph_samples(
         dataset_path=resolve_repo_path(args.dataset),
@@ -189,6 +224,7 @@ def main() -> None:
     device = next(model.parameters()).device
     stats = {
         "source_rows": len(document_samples),
+        "processed_source_rows": 0,
         "cached_samples": 0,
         "trainable_samples": 0,
         "skipped_no_pairs": 0,
@@ -209,6 +245,7 @@ def main() -> None:
         " | ".join(
             [
                 "maven qwen refinement cache",
+                "coarse_input=events-mentions",
                 f"split={args.split}",
                 f"source_rows={len(document_samples)}",
                 f"device={device}",
@@ -221,8 +258,22 @@ def main() -> None:
         flush=True,
     )
 
+    def write_manifest(*, complete: bool) -> dict[str, Any]:
+        manifest = build_cache_manifest(
+            args,
+            adapter_path=adapter_path,
+            device=device,
+            stats=stats,
+            complete=complete,
+        )
+        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        return manifest
+
+    write_manifest(complete=False)
     with samples_path.open("w", encoding="utf-8") as handle:
         for row_index, document_sample in enumerate(document_samples, start=1):
+            stats["processed_source_rows"] = row_index
+            write_manifest(complete=False)
             gold_graph = document_sample.gold_graph
             if gold_graph is None or len(document_sample.events) < 2:
                 continue
@@ -282,7 +333,7 @@ def main() -> None:
                     }
                 )
             entry = {
-                "schema_version": "maven-ere-qwen-refinement-v1",
+                "schema_version": "maven-ere-qwen-refinement-v2",
                 "sample_id": document_sample.sample_id,
                 "gold_graph": gold_graph.to_dict(),
                 "coarse_graph": coarse_graph.to_dict(),
@@ -296,6 +347,7 @@ def main() -> None:
                     "coarse_adapter_path": str(adapter_path) if adapter_path else None,
                     "coarse_keep_threshold": args.coarse_keep_threshold,
                     "coarse_topology_mode": args.coarse_topology_mode,
+                    "coarse_input_contract": "events-mentions-v1",
                     "gold_completion_candidates_enabled": False,
                 },
             }
@@ -317,34 +369,7 @@ def main() -> None:
                     f"elapsed={time.time() - started:.1f}s",
                     flush=True,
                 )
-
-    manifest = {
-        "schema_version": "maven-ere-qwen-refinement-v1",
-        "config": vars(args),
-        "resolved_base_model_path": str(resolve_repo_path(args.base_model_path)),
-        "resolved_dataset": str(resolve_repo_path(args.dataset)),
-        "device": str(device),
-        "stats": {
-            **stats,
-            "coarse_parse_rate": (
-                stats["coarse_parse_success"] / stats["coarse_pairs"]
-                if stats["coarse_pairs"] else 0.0
-            ),
-            "coarse_mean_generated_tokens": (
-                stats["coarse_generated_tokens"] / stats["coarse_pairs"]
-                if stats["coarse_pairs"] else 0.0
-            ),
-            "coarse_truncated_rate": (
-                stats["coarse_truncated_generations"] / stats["coarse_pairs"]
-                if stats["coarse_pairs"] else 0.0
-            ),
-            "coarse_nonempty_thinking_rate": (
-                stats["coarse_nonempty_thinking_generations"] / stats["coarse_pairs"]
-                if stats["coarse_pairs"] else 0.0
-            ),
-        },
-    }
-    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    manifest = write_manifest(complete=True)
     print(json.dumps(manifest["stats"], ensure_ascii=False, indent=2))
 
 

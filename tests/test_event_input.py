@@ -17,6 +17,7 @@ from event_input import materialize_event_input
 from event_input import parse_event_input_record
 from coarse_graph_dataset import build_event_pair_inference_samples
 from coarse_graph_dataset import build_graph_from_pair_predictions
+from coarse_graph_dataset import events_mentions_instruction_example
 from coarse_graph_dataset import DocumentGraphSample
 from coarse_graph_dataset import load_preextracted_document_graph_sample
 from causal_graph import CoarseCausalEdge
@@ -106,6 +107,26 @@ class EventInputTests(unittest.TestCase):
         self.assertEqual(sample.metadata["event_source"], "precomputed")
         pairs = build_event_pair_inference_samples(sample, max_sentence_gap=3, max_pairs=8)
         self.assertEqual(len(pairs), 2)
+
+    def test_events_mentions_pair_prompt_excludes_query_and_document_content(self) -> None:
+        query, documents, events = materialize_event_input(parse_event_input_record(valid_payload()))
+        sample = DocumentGraphSample(
+            sample_id="sample_1",
+            query=query,
+            documents=documents,
+            events=events,
+            gold_graph=None,
+            metadata={},
+        )
+        pair = build_event_pair_inference_samples(sample, max_sentence_gap=3, max_pairs=1)[0]
+        prompt = events_mentions_instruction_example(pair)["prompt"]
+        self.assertIn("trigger=attacked; mention=A attacked B", prompt)
+        self.assertIn("trigger=retreated; mention=B retreated", prompt)
+        self.assertIn("same_document=1", prompt)
+        self.assertNotIn("What happens next?", prompt)
+        self.assertNotIn("title=Example", prompt)
+        self.assertNotIn("A attacked B. B retreated.", prompt)
+        self.assertNotIn("context=", prompt)
 
     def test_temporal_dag_resolves_reciprocal_pair(self) -> None:
         query, documents, events = materialize_event_input(parse_event_input_record(valid_payload()))

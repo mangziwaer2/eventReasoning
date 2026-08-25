@@ -37,7 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--adapter-path", default=None, help="Optional LoRA adapter directory. Omit to run the coarse stage as a frozen model.")
     parser.add_argument("--max-length", type=int, default=1024, help="Maximum prompt length.")
     parser.add_argument("--include-query", action="store_true", help="Include query text in the prompt.")
-    parser.add_argument("--document-mode", choices=["none", "title", "snippet", "summary", "full"], default="title", help="How much document text to include in the prompt.")
+    parser.add_argument("--document-mode", choices=["none", "title", "snippet", "summary", "full"], default="none", help="How much document text to include in the prompt.")
     parser.add_argument("--max-document-chars", type=int, default=240, help="Maximum characters kept per document snippet when document-mode=snippet.")
     parser.add_argument("--output", default=None, help="Optional output JSON path.")
     return parser.parse_args()

@@ -716,6 +716,7 @@ def load_maven_refinement_samples(
 def load_cached_refinement_samples(
     cache_path: Path,
     limit: int | None = None,
+    require_complete_maven_cache: bool = False,
 ) -> list[RefinementSample]:
     """Load Qwen-generated coarse-graph supervision cached as JSONL or JSON."""
 
@@ -733,6 +734,34 @@ def load_cached_refinement_samples(
             )
     if not resolved_path.exists():
         raise FileNotFoundError(f"Refinement cache not found: {resolved_path}")
+
+    if require_complete_maven_cache:
+        manifest_path = resolved_path.parent / "cache_manifest.json"
+        if not manifest_path.exists():
+            raise RuntimeError(
+                f"MAVEN Qwen cache manifest is missing: {manifest_path}. "
+                "Rebuild the cache with build_maven_qwen_refinement_cache.py --overwrite."
+            )
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(manifest, dict):
+            raise ValueError(f"MAVEN Qwen cache manifest is not a JSON object: {manifest_path}")
+        if manifest.get("schema_version") != "maven-ere-qwen-refinement-v2":
+            raise RuntimeError(
+                "MAVEN Qwen cache uses an unsupported schema. Rebuild it so the "
+                "events-mentions-v1 input contract is recorded."
+            )
+        if manifest.get("coarse_input_contract") != "events-mentions-v1":
+            raise RuntimeError(
+                "MAVEN Qwen cache was not built with the events-mentions-v1 coarse input. "
+                "Rebuild it before refinement training."
+            )
+        if manifest.get("complete") is not True:
+            processed = manifest.get("stats", {}).get("processed_source_rows", 0)
+            total = manifest.get("stats", {}).get("source_rows", 0)
+            raise RuntimeError(
+                f"MAVEN Qwen cache is incomplete ({processed}/{total} source rows). "
+                "Finish a fresh cache build before refinement training."
+            )
 
     raw_text = resolved_path.read_text(encoding="utf-8").strip()
     if not raw_text:

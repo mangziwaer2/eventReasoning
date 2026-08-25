@@ -43,7 +43,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--debug-samples", type=int, default=2, help="Number of validation samples printed and saved each epoch.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--include-query", action="store_true", help="Include query text in the training prompt.")
-    parser.add_argument("--document-mode", choices=["none", "title", "snippet", "summary", "full"], default="title", help="How much document text to include in the prompt.")
+    parser.add_argument("--document-mode", choices=["none", "title", "snippet", "summary", "full"], default="none", help="How much document text to include in the prompt.")
     parser.add_argument("--max-document-chars", type=int, default=240, help="Maximum characters kept per document snippet when document-mode=snippet.")
     parser.add_argument("--output-dir", default=str(REPO_ROOT / "outputs" / "coarse_graph_qwen_lora"), help="Training output directory.")
     parser.add_argument("--resume-from", default=None, help="Resume from an output dir, adapter dir, or latest_training_state.pt.")

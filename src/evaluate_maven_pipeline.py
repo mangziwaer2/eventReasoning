@@ -48,7 +48,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--coarse-max-length", type=int, default=1024, help="Maximum coarse prompt length.")
     parser.add_argument("--coarse-max-new-tokens", type=int, default=48, help="Maximum generated tokens for coarse JSON.")
     parser.add_argument("--include-query", action="store_true", help="Include query title in coarse Qwen prompts.")
-    parser.add_argument("--document-mode", choices=["none", "title", "snippet", "summary", "full"], default="title", help="Document context used in coarse Qwen prompts.")
+    parser.add_argument("--document-mode", choices=["none", "title", "snippet", "summary", "full"], default="none", help="Document context used in coarse Qwen prompts.")
     parser.add_argument("--max-document-chars", type=int, default=240, help="Maximum document snippet chars when document-mode=snippet.")
 
     parser.add_argument("--refinement-model-path", default=str(REPO_ROOT / "outputs" / "refinement_graph_4090_full" / "refinement_model.pt"), help="Trained refinement model path.")
