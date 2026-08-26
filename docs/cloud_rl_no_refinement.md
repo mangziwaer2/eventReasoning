@@ -116,7 +116,7 @@ forecast SFT 的 target 是 `answers`。trace 的格式、证据引用和因果�
 src/train_forecast_trace_grpo_judge.py
 ```
 
-该入口包含 frozen Qwen judge、prompt 可见的 `Hxx/Rxx` 引用对齐、judge cache、截断 JSON 的标量恢复，以及 reward/rollout 审计日志。默认 judge 是 `/no_think`，`judge_weight=0.2`，judge 输出长度为 384。`src/train_forecast_trace_grpo.py` 仅是被该入口复用的内部 GRPO trainer，不作为独立训练命令。
+该入口包含 frozen Qwen judge、prompt 可见的 `Hxx/Rxx` 引用对齐、code-description 语义一致性 judge、judge cache、截断 JSON 的标量恢复，以及 reward/rollout 审计日志。默认 trace judge 是 `/no_think`，`judge_weight=0.2`；description judge 使用 `description_weight=0.05` 和 96 token 上限，不要求 description exact match。`src/train_forecast_trace_grpo.py` 仅是被该入口复用的内部 GRPO trainer，不作为独立训练命令。
 
 先运行 16 条 smoke test：
 
@@ -126,6 +126,8 @@ PYTHONPATH=src conda run -n toolkit python src/train_forecast_trace_grpo_judge.p
   --model-path models/Qwen3-4B \
   --adapter-path outputs/mirai_forecast_sft_420/best_adapter \
   --judge-model-path models/Qwen3-4B --judge-weight 0.2 \
+  --description-weight 0.05 --description-max-new-tokens 96 \
+  --codebook-dataset-path datasets/MIRAI_data.zip \
   --judge-max-new-tokens 384 \
   --judge-cache-path outputs/trace_judge_smoke.cache.json \
   --output-dir outputs/forecast_trace_grpo_judge_smoke \
@@ -153,6 +155,8 @@ PYTHONPATH=src conda run -n toolkit python src/train_forecast_trace_grpo_judge.p
   --model-path models/Qwen3-4B \
   --adapter-path outputs/mirai_forecast_sft_420/best_adapter \
   --judge-model-path models/Qwen3-4B --judge-weight 0.2 \
+  --description-weight 0.05 --description-max-new-tokens 96 \
+  --codebook-dataset-path datasets/MIRAI_data.zip \
   --judge-max-new-tokens 384 \
   --judge-cache-path outputs/trace_judge_no_refine_420.cache.json \
   --output-dir outputs/forecast_trace_grpo_judge_no_refine_420 \
@@ -236,6 +240,8 @@ PYTHONPATH=src conda run -n toolkit python src/train_forecast_trace_grpo_judge.p
   --model-path models/Qwen3-4B \
   --adapter-path outputs/mirai_forecast_sft_420/best_adapter \
   --judge-model-path models/Qwen3-4B --judge-weight 0.2 \
+  --description-weight 0.05 --description-max-new-tokens 96 \
+  --codebook-dataset-path datasets/MIRAI_data.zip \
   --judge-max-new-tokens 384 \
   --judge-cache-path outputs/trace_judge_with_refinement.cache.json \
   --output-dir outputs/forecast_trace_grpo_judge_with_refinement \

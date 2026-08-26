@@ -12,6 +12,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--judge-model-path", default="models/Qwen3-4B")
     parser.add_argument("--judge-weight", type=float, default=0.2)
+    parser.add_argument("--description-weight", type=float, default=0.05)
+    parser.add_argument("--description-max-new-tokens", type=int, default=96)
+    parser.add_argument("--codebook-dataset-path", default="datasets/MIRAI_data.zip")
     parser.add_argument("--judge-max-new-tokens", type=int, default=384)
     parser.add_argument("--judge-thinking", action="store_true")
     parser.add_argument("--judge-cache-path", default=None)
@@ -32,6 +35,9 @@ def main() -> None:
                 reward_key=reward_key,
                 error_reward=error_reward,
                 judge_weight=judge_args.judge_weight,
+                description_weight=judge_args.description_weight,
+                description_max_new_tokens=judge_args.description_max_new_tokens,
+                codebook_dataset_path=judge_args.codebook_dataset_path,
                 judge_max_new_tokens=judge_args.judge_max_new_tokens,
                 judge_thinking=judge_args.judge_thinking,
                 judge_cache_path=judge_args.judge_cache_path,

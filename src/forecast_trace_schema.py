@@ -212,7 +212,8 @@ def normalize_final_answer(payload: Any, choices: list[dict[str, Any]] | None = 
     return {
         "choice_id": choice_id,
         "event_code": event_code,
-        "event": str(payload.get("event", payload.get("forecast_event", payload.get("event_description", "")))).strip(),
+        "event_description": str(payload.get("event_description", payload.get("description", payload.get("event", payload.get("forecast_event", ""))))).strip(),
+        "event": str(payload.get("event", payload.get("forecast_event", payload.get("event_description", payload.get("description", ""))))).strip(),
         "confidence": _clamp01(payload.get("confidence", 0.0)),
         "supporting_event_ids": support_event_ids,
         "supporting_edge_ids": support_edge_ids,
@@ -238,6 +239,7 @@ def parse_structured_forecast(raw_response: str, choices: list[dict[str, Any]] |
             "choice_id": payload.get("choice_id", payload.get("answer_choice", "")),
             "event_code": payload.get("event_code", payload.get("predicted_event_base_code", "")),
             "forecast_event": payload.get("forecast_event", ""),
+            "event_description": payload.get("event_description", payload.get("description", "")),
             "confidence": payload.get("confidence", 0.0),
             "supporting_event_ids": payload.get("supporting_event_ids", payload.get("support_event_ids", [])),
             "supporting_edge_ids": payload.get("supporting_edge_ids", []),

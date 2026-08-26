@@ -71,7 +71,7 @@ def build_judge_prompt(
     context_prompt: str = "",
     max_context_chars: int = 12000,
 ) -> str:
-    """Build the only prompt format used by the frozen Qwen judge."""
+    """Build the only prompt format used by the frozen Qwen trace judge."""
     context = str(context_prompt or "").strip()
     if len(context) > max_context_chars:
         context = context[-max_context_chars:]
@@ -92,4 +92,22 @@ def build_judge_prompt(
         "Candidate answer:\n"
         f"{_json(answer)}\n\n"
         + ("Original forecasting context:\n" + context + "\n" if context else "")
+    )
+
+
+def build_description_judge_prompt(
+    code: str,
+    canonical_description: str,
+    generated_description: str,
+) -> str:
+    """Build a semantic, non-exact-match code-description consistency prompt."""
+    return (
+        "Evaluate semantic equivalence, not exact wording. The generated description may be a "
+        "concise paraphrase, but it must describe the same event type as the canonical description. "
+        "Do not judge whether the code is correct for a query; only compare the two descriptions.\n\n"
+        "Output exactly:\n"
+        '{"match":0.0,"reason":"short reason"}\n\n'
+        f"Event code: {code}\n"
+        f"Canonical description: {canonical_description}\n"
+        f"Generated description: {generated_description}\n"
     )
