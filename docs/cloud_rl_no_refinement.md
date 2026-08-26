@@ -71,9 +71,9 @@ python -u src/train_forecast_code_sft.py \
   --dataset datasets/MIRAI_data.zip \
   --model-path models/Qwen3-4B \
   --output-dir outputs/mirai_code_sft_codebook \
-  --num-train-epochs 8 \
-  --per-device-train-batch-size 1 \
-  --gradient-accumulation-steps 8 \
+  --num-train-epochs 20 \
+  --per-device-train-batch-size 16 \
+  --gradient-accumulation-steps 1 \
   --learning-rate 5e-5 \
   --max-prompt-length 256 \
   --max-completion-length 128 \
@@ -91,9 +91,9 @@ python -u src/train_forecast_code_sft.py \
   --model-path models/Qwen3-4B \
   --adapter-path outputs/mirai_code_sft_codebook/best_adapter \
   --output-dir outputs/mirai_forecast_sft \
-  --num-train-epochs 3 \
-  --per-device-train-batch-size 1 \
-  --gradient-accumulation-steps 8 \
+  --num-train-epochs 4 \
+  --per-device-train-batch-size 2 \
+  --gradient-accumulation-steps 4 \
   --learning-rate 2e-5 \
   --max-prompt-length 2048 \
   --max-completion-length 768 \
@@ -109,7 +109,7 @@ python -u src/train_forecast_trace_grpo.py \
   --model-path models/Qwen3-4B \
   --adapter-path outputs/mirai_forecast_sft/best_adapter \
   --output-dir outputs/forecast_trace_grpo_mirai_rule_no_refine_logged \
-  --max-samples 32 \
+  --max-samples 0 \
   --min-coarse-edges 1 \
   --num-generations 4 \
   --per-device-train-batch-size 4 \
@@ -204,6 +204,7 @@ Prepare contexts with the trained graph refiner. Completion candidates stay disa
 python -u src/evaluate_local_qwen_pipeline.py \
   --stage prepare-grpo-context \
   --split test \
+  --limit 0 \
   --event-source precomputed \
   --precomputed-events datasets/mirai_event_inputs_rule/mirai_event_input_train.jsonl \
   --queries-from-precomputed-events \
@@ -215,7 +216,7 @@ python -u src/evaluate_local_qwen_pipeline.py \
   --refinement-topology-mode none \
   --prediction-mode forecast-trace \
   --coarse-topology-mode temporal-dag \
-  --max-events 16 --max-pairs 24 --coarse-batch-size 8 \
+  --max-events 16 --max-pairs 64 --coarse-batch-size 8 \
   --coarse-max-length 1024 --coarse-max-new-tokens 128 \
   --forecast-context-mode events-graph \
   --max-graph-events-in-prompt 14 --max-graph-edges-in-prompt 24 \
