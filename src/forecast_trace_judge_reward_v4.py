@@ -1,0 +1,19 @@
+from __future__ import annotations
+
+from typing import Any
+
+from forecast_trace_judge_reward_v3 import AuditedJudgeAugmentedGRPOReward
+from forecast_trace_judge_runtime_v4 import RobustRolloutAwareFrozenQwenJudge
+
+
+class RobustAuditedJudgeAugmentedGRPOReward(AuditedJudgeAugmentedGRPOReward):
+    """Audited reward using the truncation-tolerant frozen judge runtime."""
+
+    def __init__(self, model_path: str, **kwargs: Any) -> None:
+        super().__init__(model_path, **kwargs)
+        self.judge = RobustRolloutAwareFrozenQwenJudge(
+            model_path,
+            max_new_tokens=kwargs.get("max_new_tokens", 256),
+            thinking=kwargs.get("thinking", False),
+            cache_path=kwargs.get("cache_path"),
+        )
