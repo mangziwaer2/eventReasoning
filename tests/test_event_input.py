@@ -195,7 +195,6 @@ class EventInputTests(unittest.TestCase):
         self.assertEqual(refinement_sample.edge_labels, [0])
         self.assertFalse(refinement_sample.metadata["gold_completion_candidates_enabled"])
         restored = refinement_sample_from_dict(refinement_sample.to_dict())
-        self.assertEqual(restored.edge_type_labels, [0])
         self.assertEqual(RELATION_TO_ID["causes"], 1)
 
     def test_jsonl_is_indexed_by_query_id(self) -> None:

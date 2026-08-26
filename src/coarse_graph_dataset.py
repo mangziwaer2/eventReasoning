@@ -454,6 +454,28 @@ def _build_temporal_dag(
     }
 
 
+def apply_temporal_dag_topology(graph: CoarseCausalGraph) -> CoarseCausalGraph:
+    """Resolve reciprocal refined edges and decode an acyclic graph."""
+
+    event_lookup = {event.event_id: event for event in graph.events}
+    edges, topology = _build_temporal_dag(list(graph.edges), event_lookup)
+    metadata = dict(graph.metadata)
+    metadata["refinement_topology"] = topology
+    graph.trace.event_notes.append(
+        "refinement temporal-dag "
+        f"reciprocal_pruned={topology['reciprocal_pruned_count']} "
+        f"cycle_pruned={topology['cycle_pruned_count']}"
+    )
+    return CoarseCausalGraph(
+        query=graph.query,
+        documents=graph.documents,
+        events=graph.events,
+        edges=edges,
+        trace=graph.trace,
+        metadata=metadata,
+    )
+
+
 def _event_degrees(graph: CoarseCausalGraph) -> dict[str, int]:
     degrees: dict[str, int] = {event.event_id: 0 for event in graph.events}
     for edge in graph.edges:

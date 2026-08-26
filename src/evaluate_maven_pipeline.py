@@ -19,7 +19,6 @@ from local_qwen_lora import load_qwen_for_inference
 from path_utils import REPO_ROOT
 from path_utils import resolve_repo_path
 from refinement_dataset import EDGE_FEATURE_DIM
-from refinement_dataset import ID_TO_RELATION
 from refinement_dataset import load_refinement_sample_from_coarse_graph
 from run_refinement import build_refined_graph
 from run_refinement import load_model_config
@@ -53,6 +52,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--refinement-model-path", default=str(REPO_ROOT / "outputs" / "refinement_graph_4090_full" / "refinement_model.pt"), help="Trained refinement model path.")
     parser.add_argument("--refinement-keep-threshold", type=float, default=0.5, help="Minimum refinement keep probability for an edge.")
+    parser.add_argument("--refinement-topology-mode", choices=["none", "temporal-dag"], default="none", help="Optional final global decoder; normally keep none because the coarse temporal-DAG pass already ran.")
     parser.add_argument("--include-completion-candidates", dest="include_completion_candidates", action="store_true", default=False, help="Add heuristic completion candidates for refinement.")
     parser.add_argument("--no-completion-candidates", dest="include_completion_candidates", action="store_false", help="Only refine Qwen coarse edges (default).")
     parser.add_argument("--max-completion-edges", type=int, default=0, help="Maximum refinement completion candidates. Use 0 for no cap.")
@@ -260,30 +260,27 @@ def build_refinement_sample_via_inference_path(
     )
 
 
-def run_refinement_model(model, torch, device, refinement_sample, keep_threshold: float, coarse_graph: CoarseCausalGraph) -> tuple[CoarseCausalGraph, list[float], list[int], list[float]]:
+def run_refinement_model(model, torch, device, refinement_sample, keep_threshold: float, coarse_graph: CoarseCausalGraph, topology_mode: str) -> tuple[CoarseCausalGraph, list[float], list[float]]:
     node_features = torch.tensor(refinement_sample.node_features, dtype=torch.float32, device=device)
     edge_index = torch.tensor(refinement_sample.edge_index, dtype=torch.long, device=device)
     edge_features = torch.tensor(refinement_sample.edge_features, dtype=torch.float32, device=device)
-    query_features = torch.tensor(refinement_sample.query_features, dtype=torch.float32, device=device)
     with torch.no_grad():
         outputs = model(
             node_features=node_features,
             edge_index=edge_index,
             edge_features=edge_features,
-            query_features=query_features,
         )
     keep_probs = torch.sigmoid(outputs["edge_keep_logits"]).detach().cpu().tolist()
-    type_predictions = outputs["edge_type_logits"].argmax(dim=-1).detach().cpu().tolist()
     strength_predictions = outputs["edge_strengths"].detach().cpu().tolist()
     refined_graph = build_refined_graph(
         coarse_graph=coarse_graph,
         edge_descriptions=list(refinement_sample.metadata.get("edge_descriptions", [])),
         keep_probs=keep_probs,
-        type_predictions=type_predictions,
         strength_predictions=strength_predictions,
         keep_threshold=keep_threshold,
+        topology_mode=topology_mode,
     )
-    return refined_graph, keep_probs, type_predictions, strength_predictions
+    return refined_graph, keep_probs, strength_predictions
 
 
 def load_refinement_model(args: argparse.Namespace, torch, device):
@@ -455,22 +452,23 @@ def main() -> None:
                     )
                 )
 
-            refined_graph, keep_probs, type_predictions, _ = run_refinement_model(
+            refined_graph, keep_probs, _ = run_refinement_model(
                 model=refinement_model,
                 torch=torch,
                 device=device,
                 refinement_sample=refinement_sample,
                 keep_threshold=args.refinement_keep_threshold,
                 coarse_graph=coarse_graph,
+                topology_mode=args.refinement_topology_mode,
             )
-            for edge_desc, keep_prob, type_prediction in zip(edge_descriptions, keep_probs, type_predictions):
+            for edge_desc, keep_prob in zip(edge_descriptions, keep_probs):
                 pair = (
                     str(edge_desc.get("source_event_id", "")),
                     str(edge_desc.get("target_event_id", "")),
                 )
                 gold_label = gold_label_map.get(pair, "none")
                 pred_keep = float(keep_prob) >= args.refinement_keep_threshold
-                pred_relation = normalize_label(ID_TO_RELATION.get(int(type_prediction), "precedes")) if pred_keep else "none"
+                pred_relation = normalize_label(str(edge_desc.get("coarse_relation_type", "precedes"))) if pred_keep else "none"
                 refinement_gold_labels.append(gold_label)
                 refinement_pred_labels.append(pred_relation)
                 refinement_gold_keep.append(gold_label != "none")

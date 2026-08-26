@@ -2,15 +2,12 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import random
 import time
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
-from refinement_dataset import ID_TO_RELATION
-from refinement_dataset import RELATION_TO_ID
 from refinement_dataset import EDGE_FEATURE_DIM
 from refinement_dataset import RefinementSample
 from refinement_dataset import RefinementTensorDataset
@@ -64,19 +61,11 @@ def move_batch_to_device(batch: dict[str, Any], device) -> dict[str, Any]:
 def summarize_samples(samples: list[RefinementSample]) -> dict[str, Any]:
     total_edges = sum(len(sample.edge_labels) for sample in samples)
     positive_edges = sum(sum(1 for label in sample.edge_labels if label > 0.5) for sample in samples)
-    relation_counts = {name: 0 for name in RELATION_TO_ID}
-    for sample in samples:
-        for keep_label, type_label in zip(sample.edge_labels, sample.edge_type_labels):
-            if keep_label > 0.5:
-                relation_counts[ID_TO_RELATION.get(int(type_label), str(type_label))] = (
-                    relation_counts.get(ID_TO_RELATION.get(int(type_label), str(type_label)), 0) + 1
-                )
     return {
         "samples": len(samples),
         "edges": total_edges,
         "positive_edges": positive_edges,
         "positive_ratio": positive_edges / total_edges if total_edges else 0.0,
-        "relation_counts": relation_counts,
     }
 
 
@@ -90,33 +79,6 @@ def compute_keep_pos_weight(samples: list[RefinementSample], max_weight: float, 
     weight = max(1.0, min(float(weight), max_weight))
     return torch.tensor(weight, dtype=torch.float32, device=device)
 
-
-def compute_type_class_weights(samples: list[RefinementSample], max_weight: float, torch, device):
-    counts = [0 for _ in range(len(RELATION_TO_ID))]
-    for sample in samples:
-        for keep_label, type_label in zip(sample.edge_labels, sample.edge_type_labels):
-            if keep_label > 0.5 and 0 <= int(type_label) < len(counts):
-                counts[int(type_label)] += 1
-    observed = [count for count in counts if count > 0]
-    if len(observed) <= 1:
-        return None
-    mean_count = sum(observed) / len(observed)
-    weights = []
-    for count in counts:
-        if count <= 0:
-            weights.append(0.0)
-        else:
-            weights.append(max(1.0 / max_weight, min(math.sqrt(mean_count / count), max_weight)))
-    return torch.tensor(weights, dtype=torch.float32, device=device)
-
-
-def make_type_loss(type_class_weights, label_smoothing: float, torch, nn):
-    try:
-        return nn.CrossEntropyLoss(weight=type_class_weights, label_smoothing=label_smoothing)
-    except TypeError:
-        if label_smoothing > 0:
-            print("warning: installed torch does not support label_smoothing; using plain CrossEntropyLoss")
-        return nn.CrossEntropyLoss(weight=type_class_weights)
 
 
 def make_grad_scaler(torch, enabled: bool):
@@ -156,12 +118,10 @@ def print_metrics(prefix: str, metrics: dict[str, float | int | None], elapsed_s
     ordered_keys = (
         "loss",
         "keep_loss",
-        "type_loss",
         "strength_loss",
         "density_loss",
         "val_loss",
         "val_keep_loss",
-        "val_type_loss",
         "val_strength_loss",
         "val_density_loss",
         "lr",
@@ -184,44 +144,32 @@ def compute_losses(
     outputs: dict[str, Any],
     batch: dict[str, Any],
     keep_loss_fn,
-    type_loss_fn,
     strength_loss_fn,
     loss_weights: dict[str, float],
 ):
     keep_loss = keep_loss_fn(outputs["edge_keep_logits"], batch["edge_labels"])
     keep_probs = outputs["edge_keep_logits"].sigmoid()
-    if keep_probs.numel() > 0:
-        density_loss = (keep_probs.mean() - batch["edge_labels"].mean()).pow(2)
-    else:
-        density_loss = keep_loss.new_zeros(())
+    density_loss = (
+        (keep_probs.mean() - batch["edge_labels"].mean()).pow(2)
+        if keep_probs.numel() > 0 else keep_loss.new_zeros(())
+    )
     positive_mask = batch["edge_labels"] > 0.5
-    if positive_mask.any():
-        type_loss = type_loss_fn(
-            outputs["edge_type_logits"][positive_mask],
-            batch["edge_type_labels"][positive_mask],
-        )
-        strength_loss = strength_loss_fn(
-            outputs["edge_strengths"][positive_mask],
-            batch["edge_strengths"][positive_mask],
-        )
-    else:
-        zero = keep_loss.new_zeros(())
-        type_loss = zero
-        strength_loss = zero
+    strength_loss = (
+        strength_loss_fn(outputs["edge_strengths"][positive_mask], batch["edge_strengths"][positive_mask])
+        if positive_mask.any() else keep_loss.new_zeros(())
+    )
     loss = (
         loss_weights["keep"] * keep_loss
-        + loss_weights["type"] * type_loss
         + loss_weights["strength"] * strength_loss
         + loss_weights["density"] * density_loss
     )
-    return loss, keep_loss, type_loss, strength_loss, density_loss
+    return loss, keep_loss, strength_loss, density_loss
 
 
 def evaluate(
     model,
     dataloader,
     keep_loss_fn,
-    type_loss_fn,
     strength_loss_fn,
     loss_weights: dict[str, float],
     torch,
@@ -231,8 +179,7 @@ def evaluate(
     totals = {
         "val_loss": 0.0,
         "val_keep_loss": 0.0,
-        "val_type_loss": 0.0,
-        "val_strength_loss": 0.0,
+            "val_strength_loss": 0.0,
         "val_density_loss": 0.0,
     }
     batch_count = 0
@@ -243,19 +190,16 @@ def evaluate(
                 node_features=batch["node_features"],
                 edge_index=batch["edge_index"],
                 edge_features=batch["edge_features"],
-                query_features=batch["query_features"],
             )
-            loss, keep_loss, type_loss, strength_loss, density_loss = compute_losses(
+            loss, keep_loss, strength_loss, density_loss = compute_losses(
                 outputs,
                 batch,
                 keep_loss_fn,
-                type_loss_fn,
-                strength_loss_fn,
+                            strength_loss_fn,
                 loss_weights,
             )
             totals["val_loss"] += float(loss.item())
             totals["val_keep_loss"] += float(keep_loss.item())
-            totals["val_type_loss"] += float(type_loss.item())
             totals["val_strength_loss"] += float(strength_loss.item())
             totals["val_density_loss"] += float(density_loss.item())
             batch_count += 1
@@ -276,15 +220,12 @@ def collect_debug_samples(model, samples: list[RefinementSample], debug_samples:
             node_features = torch.tensor(sample.node_features, dtype=torch.float32, device=device)
             edge_index = torch.tensor(sample.edge_index, dtype=torch.long, device=device)
             edge_features = torch.tensor(sample.edge_features, dtype=torch.float32, device=device)
-            query_features = torch.tensor(sample.query_features, dtype=torch.float32, device=device)
             outputs = model(
                 node_features=node_features,
                 edge_index=edge_index,
                 edge_features=edge_features,
-                query_features=query_features,
             )
             keep_probs = torch.sigmoid(outputs["edge_keep_logits"]).detach().cpu().tolist()
-            pred_types = outputs["edge_type_logits"].argmax(dim=-1).detach().cpu().tolist()
             pred_strengths = outputs["edge_strengths"].detach().cpu().tolist()
             edge_descriptions = sample.metadata.get("edge_descriptions", [])
             for idx, edge_desc in enumerate(edge_descriptions[: min(3, len(edge_descriptions))]):
@@ -298,8 +239,6 @@ def collect_debug_samples(model, samples: list[RefinementSample], debug_samples:
                         "gold_relation": edge_desc.get("gold_relation_type", ""),
                         "gold_keep": sample.edge_labels[idx] if idx < len(sample.edge_labels) else None,
                         "pred_keep_prob": keep_probs[idx] if idx < len(keep_probs) else None,
-                        "gold_type": sample.edge_type_labels[idx] if idx < len(sample.edge_type_labels) else None,
-                        "pred_type": pred_types[idx] if idx < len(pred_types) else None,
                         "gold_strength": sample.edge_strengths[idx] if idx < len(sample.edge_strengths) else None,
                         "pred_strength": pred_strengths[idx] if idx < len(pred_strengths) else None,
                     }
@@ -314,26 +253,18 @@ def shorten_text(text: Any, max_chars: int = 120) -> str:
     return compact[: max(0, max_chars - 3)].rstrip() + "..."
 
 
-def relation_name(relation_id: int | None) -> str:
-    if relation_id is None:
-        return "none"
-    return ID_TO_RELATION.get(int(relation_id), str(relation_id))
-
-
 def edge_debug_row(
     idx: int,
     edge_desc: dict[str, Any],
     keep_prob: float,
-    pred_type: int,
     pred_strength: float,
     gold_keep: int | float | None,
-    gold_type: int | None,
     gold_strength: float | None,
     keep_threshold: float,
 ) -> dict[str, Any]:
     candidate_source = str(edge_desc.get("candidate_source", "coarse"))
-    pred_relation = relation_name(pred_type)
-    gold_relation = edge_desc.get("gold_relation_type") or relation_name(gold_type)
+    pred_relation = str(edge_desc.get("coarse_relation_type", "precedes"))
+    gold_relation = str(edge_desc.get("gold_relation_type", "none"))
     action = "KEEP" if keep_prob >= keep_threshold else "DROP"
     if candidate_source == "completion" and keep_prob >= keep_threshold:
         action = "ADD"
@@ -383,7 +314,6 @@ def select_debug_edges(rows: list[dict[str, Any]], max_edges: int) -> list[dict[
 def format_readable_debug_sample(
     sample: RefinementSample,
     keep_probs: list[float],
-    pred_types: list[int],
     pred_strengths: list[float],
     epoch: int,
     keep_threshold: float,
@@ -395,10 +325,8 @@ def format_readable_debug_sample(
             idx=idx,
             edge_desc=edge_desc,
             keep_prob=keep_probs[idx] if idx < len(keep_probs) else 0.0,
-            pred_type=pred_types[idx] if idx < len(pred_types) else 0,
             pred_strength=pred_strengths[idx] if idx < len(pred_strengths) else 0.0,
             gold_keep=sample.edge_labels[idx] if idx < len(sample.edge_labels) else None,
-            gold_type=sample.edge_type_labels[idx] if idx < len(sample.edge_type_labels) else None,
             gold_strength=sample.edge_strengths[idx] if idx < len(sample.edge_strengths) else None,
             keep_threshold=keep_threshold,
         )
@@ -466,21 +394,17 @@ def collect_readable_debug_samples(
             node_features = torch.tensor(sample.node_features, dtype=torch.float32, device=device)
             edge_index = torch.tensor(sample.edge_index, dtype=torch.long, device=device)
             edge_features = torch.tensor(sample.edge_features, dtype=torch.float32, device=device)
-            query_features = torch.tensor(sample.query_features, dtype=torch.float32, device=device)
             outputs = model(
                 node_features=node_features,
                 edge_index=edge_index,
                 edge_features=edge_features,
-                query_features=query_features,
             )
             keep_probs = torch.sigmoid(outputs["edge_keep_logits"]).detach().cpu().tolist()
-            pred_types = outputs["edge_type_logits"].argmax(dim=-1).detach().cpu().tolist()
             pred_strengths = outputs["edge_strengths"].detach().cpu().tolist()
             blocks.append(
                 format_readable_debug_sample(
                     sample=sample,
                     keep_probs=keep_probs,
-                    pred_types=pred_types,
                     pred_strengths=pred_strengths,
                     epoch=epoch,
                     keep_threshold=keep_threshold,
@@ -550,14 +474,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=1e-4, help="AdamW weight decay.")
     parser.add_argument("--grad-clip", type=float, default=1.0, help="Gradient norm clipping. Use 0 to disable.")
     parser.add_argument("--keep-loss-weight", type=float, default=1.0, help="Weight for edge keep BCE loss.")
-    parser.add_argument("--type-loss-weight", type=float, default=0.7, help="Weight for relation type CE loss.")
+    parser.add_argument("--type-loss-weight", type=float, default=0.0, help="Deprecated; relation type is preserved from Qwen and is not trained by refinement.")
+    parser.add_argument("--type-class-weighting", choices=["auto", "none"], default="none", help="Deprecated compatibility option; ignored.")
+    parser.add_argument("--max-type-class-weight", type=float, default=4.0, help="Deprecated compatibility option; ignored.")
+    parser.add_argument("--type-label-smoothing", type=float, default=0.0, help="Deprecated compatibility option; ignored.")
     parser.add_argument("--strength-loss-weight", type=float, default=0.3, help="Weight for strength regression loss.")
     parser.add_argument("--density-loss-weight", type=float, default=0.08, help="Weight for predicted graph density regularization.")
     parser.add_argument("--keep-pos-weight", default="auto", help="BCE positive weight: auto, none, or a float.")
     parser.add_argument("--max-pos-weight", type=float, default=12.0, help="Upper bound for auto keep positive weight.")
-    parser.add_argument("--type-class-weighting", choices=["auto", "none"], default="auto", help="Use inverse-frequency weights for relation type loss.")
-    parser.add_argument("--max-type-class-weight", type=float, default=4.0, help="Upper bound for auto relation type class weights.")
-    parser.add_argument("--type-label-smoothing", type=float, default=0.02, help="Label smoothing for relation type loss.")
 
     parser.add_argument("--device", default="auto", help="Training device: auto, cpu, cuda, or cuda:N.")
     parser.add_argument("--amp", choices=["auto", "on", "off"], default="auto", help="Use CUDA automatic mixed precision.")
@@ -649,18 +573,10 @@ def main() -> None:
         keep_pos_weight = None
     else:
         keep_pos_weight = torch.tensor(float(args.keep_pos_weight), dtype=torch.float32, device=device)
-    type_class_weights = (
-        compute_type_class_weights(train_samples, args.max_type_class_weight, torch, device)
-        if args.type_class_weighting == "auto"
-        else None
-    )
-
     keep_loss_fn = nn.BCEWithLogitsLoss(pos_weight=keep_pos_weight)
-    type_loss_fn = make_type_loss(type_class_weights, args.type_label_smoothing, torch, nn)
     strength_loss_fn = nn.SmoothL1Loss(beta=0.08)
     loss_weights = {
         "keep": args.keep_loss_weight,
-        "type": args.type_loss_weight,
         "strength": args.strength_loss_weight,
         "density": args.density_loss_weight,
     }
@@ -687,10 +603,11 @@ def main() -> None:
         "train_stats": train_stats,
         "validation_stats": validation_stats,
         "keep_pos_weight": float(keep_pos_weight.item()) if keep_pos_weight is not None else None,
-        "type_class_weights": type_class_weights.detach().cpu().tolist() if type_class_weights is not None else None,
         "parameter_count": sum(parameter.numel() for parameter in model.parameters()),
         "edge_feature_dim": EDGE_FEATURE_DIM,
         "task": "coarse_graph_to_refined_graph",
+        "refinement_model_variant": "graph-editor-v3",
+        "relation_policy": "preserve_qwen_candidate_relation",
     }
     save_json(output_dir / "train_config.json", config)
 
@@ -710,7 +627,6 @@ def main() -> None:
         ),
         flush=True,
     )
-    print(f"relation_counts={json.dumps(train_stats['relation_counts'], ensure_ascii=False)}", flush=True)
 
     debug_path = output_dir / "debug_predictions.jsonl"
     readable_debug_path = output_dir / "debug_readable.log"
@@ -727,7 +643,6 @@ def main() -> None:
         totals = {
             "loss": 0.0,
             "keep_loss": 0.0,
-            "type_loss": 0.0,
             "strength_loss": 0.0,
             "density_loss": 0.0,
         }
@@ -743,14 +658,12 @@ def main() -> None:
                     node_features=batch["node_features"],
                     edge_index=batch["edge_index"],
                     edge_features=batch["edge_features"],
-                    query_features=batch["query_features"],
                 )
-                loss, keep_loss, type_loss, strength_loss, density_loss = compute_losses(
+                loss, keep_loss, strength_loss, density_loss = compute_losses(
                     outputs,
                     batch,
                     keep_loss_fn,
-                    type_loss_fn,
-                    strength_loss_fn,
+                                    strength_loss_fn,
                     loss_weights,
                 )
 
@@ -764,7 +677,6 @@ def main() -> None:
             step_metrics = {
                 "loss": float(loss.item()),
                 "keep_loss": float(keep_loss.item()),
-                "type_loss": float(type_loss.item()),
                 "strength_loss": float(strength_loss.item()),
                 "density_loss": float(density_loss.item()),
             }
@@ -789,7 +701,6 @@ def main() -> None:
             "epoch": float(epoch + 1),
             "loss": totals["loss"] / max(batch_count, 1),
             "keep_loss": totals["keep_loss"] / max(batch_count, 1),
-            "type_loss": totals["type_loss"] / max(batch_count, 1),
             "strength_loss": totals["strength_loss"] / max(batch_count, 1),
             "density_loss": totals["density_loss"] / max(batch_count, 1),
             "lr": float(optimizer.param_groups[0]["lr"]),
@@ -798,8 +709,7 @@ def main() -> None:
             model,
             validation_dataloader,
             keep_loss_fn,
-            type_loss_fn,
-            strength_loss_fn,
+                    strength_loss_fn,
             loss_weights,
             torch,
             device,

@@ -104,10 +104,11 @@ def parse_args() -> argparse.Namespace:
         help="Post-process pairwise edges; temporal-dag resolves reverse pairs and removes directed cycles.",
     )
 
-    parser.add_argument("--include-completion-candidates", dest="include_completion_candidates", action="store_true", default=True, help="Add heuristic completion candidates before refinement.")
-    parser.add_argument("--no-completion-candidates", dest="include_completion_candidates", action="store_false", help="Disable refinement completion candidates.")
+    parser.add_argument("--include-completion-candidates", dest="include_completion_candidates", action="store_true", default=False, help="Experimental: add heuristic candidates that were not scored by Qwen.")
+    parser.add_argument("--no-completion-candidates", dest="include_completion_candidates", action="store_false", help="Use only Qwen-scored coarse edges (default).")
     parser.add_argument("--max-completion-edges", type=int, default=64, help="Maximum completion candidates for refinement. Use 0 for no cap.")
     parser.add_argument("--refinement-keep-threshold", type=float, default=0.5, help="Minimum refinement keep probability.")
+    parser.add_argument("--refinement-topology-mode", choices=["none", "temporal-dag"], default="none", help="Optional final global decoder; normally keep none because the coarse temporal-DAG pass already ran.")
     parser.add_argument(
         "--skip-refinement",
         dest="skip_refinement",
@@ -435,24 +436,21 @@ def refine_graph(coarse_graph: CoarseCausalGraph, sample_id: str, temp_dir: Path
     node_features = torch.tensor(sample.node_features, dtype=torch.float32, device=device)
     edge_index = torch.tensor(sample.edge_index, dtype=torch.long, device=device)
     edge_features = torch.tensor(sample.edge_features, dtype=torch.float32, device=device)
-    query_features = torch.tensor(sample.query_features, dtype=torch.float32, device=device)
     with torch.no_grad():
         outputs = refinement_model(
             node_features=node_features,
             edge_index=edge_index,
             edge_features=edge_features,
-            query_features=query_features,
         )
     keep_probs = torch.sigmoid(outputs["edge_keep_logits"]).detach().cpu().tolist()
-    type_predictions = outputs["edge_type_logits"].argmax(dim=-1).detach().cpu().tolist()
     strength_predictions = outputs["edge_strengths"].detach().cpu().tolist()
     return build_refined_graph(
         coarse_graph=coarse_graph,
         edge_descriptions=list(sample.metadata.get("edge_descriptions", [])),
         keep_probs=keep_probs,
-        type_predictions=type_predictions,
         strength_predictions=strength_predictions,
         keep_threshold=args.refinement_keep_threshold,
+        topology_mode=args.refinement_topology_mode,
     )
 
 

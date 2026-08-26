@@ -152,13 +152,34 @@ def split_examples(examples: list[Example], ratio: float, seed: int) -> tuple[li
     )
 
 
+def _as_token_ids(encoded: Any, *, source: str) -> list[int]:
+    # Transformers versions may return a list, tensor, or BatchEncoding here.
+    if isinstance(encoded, dict):
+        encoded = encoded.get("input_ids")
+    elif hasattr(encoded, "input_ids"):
+        encoded = encoded.input_ids
+    if hasattr(encoded, "tolist"):
+        encoded = encoded.tolist()
+    if isinstance(encoded, tuple):
+        encoded = list(encoded)
+    if isinstance(encoded, list) and len(encoded) == 1 and isinstance(encoded[0], (list, tuple)):
+        encoded = list(encoded[0])
+    if not isinstance(encoded, list):
+        raise ValueError(f"{source} did not return a token-id sequence.")
+    try:
+        return [int(token_id) for token_id in encoded]
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{source} returned non-integer token IDs.") from exc
+
+
 def message_ids(tokenizer, messages: list[dict[str, str]], generation: bool) -> list[int]:
     if hasattr(tokenizer, "apply_chat_template"):
-        return list(tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=generation))
+        encoded = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=generation)
+        return _as_token_ids(encoded, source="tokenizer.apply_chat_template")
     text = "\n".join(f"{item['role']}: {item['content']}" for item in messages)
     if generation:
         text += "\nassistant:"
-    return list(tokenizer.encode(text, add_special_tokens=True))
+    return _as_token_ids(tokenizer.encode(text, add_special_tokens=True), source="tokenizer.encode")
 
 
 def encode(tokenizer, item: Example, system: str, max_prompt: int, max_completion: int, max_sequence: int) -> dict[str, Any]:
@@ -171,7 +192,7 @@ def encode(tokenizer, item: Example, system: str, max_prompt: int, max_completio
     if full[: len(prefix)] == prefix:
         answer = full[len(prefix) :]
     else:
-        answer = list(tokenizer.encode(item.completion, add_special_tokens=False))
+        answer = _as_token_ids(tokenizer.encode(item.completion, add_special_tokens=False), source="tokenizer.encode")
         if tokenizer.eos_token_id is not None:
             answer.append(tokenizer.eos_token_id)
     original_length = len(answer)

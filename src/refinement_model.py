@@ -41,16 +41,15 @@ class MLP(nn.Module):
 class TemporalRelationalEdgeRefiner(nn.Module):
     """Graph-level refiner from a coarse causal graph to candidate refined edges.
 
-    The model consumes all candidate edges in one graph, performs query-conditioned
-    relational message passing, updates edge states with the surrounding graph
-    context, then predicts keep/drop, relation type, strength, and frontier nodes.
+    The model consumes a noisy candidate graph, performs relational message
+    passing, then predicts each candidate edge's keep/drop decision, relation type,
+    and strength. The relation string is copied from the Qwen candidate and is never retyped.
     """
 
     def __init__(
         self,
         node_dim: int = 10,
         edge_dim: int = 20,
-        query_dim: int = 6,
         hidden_dim: int = 192,
         num_message_passing_steps: int = 4,
         num_relations: int = 4,
@@ -80,14 +79,6 @@ class TemporalRelationalEdgeRefiner(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim),
         )
-        self.query_encoder = nn.Sequential(
-            nn.LayerNorm(query_dim),
-            nn.Linear(query_dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
-
         self.relation_embedding = nn.Embedding(num_relations, relation_embed_dim)
         self.time_encoder = ContinuousTimeEncoder(
             input_dim=len(self.time_feature_indices),
@@ -110,8 +101,8 @@ class TemporalRelationalEdgeRefiner(nn.Module):
         )
         self.self_loop_linear = nn.Linear(hidden_dim, hidden_dim, bias=False)
 
-        message_input_dim = hidden_dim * 5
-        attention_input_dim = hidden_dim * 6
+        message_input_dim = hidden_dim * 4
+        attention_input_dim = hidden_dim * 5
         self.forward_message_mlp = MLP(message_input_dim, hidden_dim, hidden_dim, dropout=dropout)
         self.reverse_message_mlp = MLP(message_input_dim, hidden_dim, hidden_dim, dropout=dropout)
         self.forward_attention = MLP(attention_input_dim, hidden_dim, 1, dropout=dropout)
@@ -122,25 +113,20 @@ class TemporalRelationalEdgeRefiner(nn.Module):
         self.node_norm = nn.LayerNorm(hidden_dim)
 
         self.graph_context_proj = nn.Sequential(
-            nn.LayerNorm(hidden_dim * 3),
-            nn.Linear(hidden_dim * 3, hidden_dim),
+            nn.LayerNorm(hidden_dim * 2),
+            nn.Linear(hidden_dim * 2, hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim),
         )
         self.edge_update = nn.GRUCell(hidden_dim, hidden_dim)
-        self.edge_update_input = MLP(hidden_dim * 7, hidden_dim, hidden_dim, dropout=dropout)
+        self.edge_update_input = MLP(hidden_dim * 6, hidden_dim, hidden_dim, dropout=dropout)
         self.edge_norm = nn.LayerNorm(hidden_dim)
 
-        edge_head_input_dim = hidden_dim * 8
+        edge_head_input_dim = hidden_dim * 7
         self.keep_head = MLP(edge_head_input_dim, hidden_dim, 1, dropout=dropout)
-        self.type_head = MLP(edge_head_input_dim, hidden_dim, num_relations, dropout=dropout)
         self.strength_head = nn.Sequential(
             MLP(edge_head_input_dim, hidden_dim, 1, dropout=dropout),
-            nn.Sigmoid(),
-        )
-        self.frontier_head = nn.Sequential(
-            MLP(hidden_dim * 4, hidden_dim, 1, dropout=dropout),
             nn.Sigmoid(),
         )
 
@@ -190,33 +176,10 @@ class TemporalRelationalEdgeRefiner(nn.Module):
                 weights[mask] = torch.softmax(logits[mask].float(), dim=0).to(dtype=weights.dtype)
         return weights
 
-    def _graph_context(self, node_states: torch.Tensor, edge_states: torch.Tensor, query_state: torch.Tensor) -> torch.Tensor:
+    def _graph_context(self, node_states: torch.Tensor, edge_states: torch.Tensor) -> torch.Tensor:
         node_mean = node_states.mean(dim=0)
-        if edge_states.numel() == 0:
-            edge_mean = torch.zeros_like(node_mean)
-        else:
-            edge_mean = edge_states.mean(dim=0)
-        return self.graph_context_proj(torch.cat([node_mean, edge_mean, query_state], dim=-1))
-
-    def _frontier_scores(
-        self,
-        node_states: torch.Tensor,
-        query_state: torch.Tensor,
-        graph_state: torch.Tensor,
-    ) -> torch.Tensor:
-        expanded_query = query_state.expand(node_states.size(0), -1)
-        expanded_graph = graph_state.expand(node_states.size(0), -1)
-        return self.frontier_head(
-            torch.cat(
-                [
-                    node_states,
-                    expanded_query,
-                    expanded_graph,
-                    node_states * expanded_query,
-                ],
-                dim=-1,
-            )
-        ).squeeze(-1)
+        edge_mean = torch.zeros_like(node_mean) if edge_states.numel() == 0 else edge_states.mean(dim=0)
+        return self.graph_context_proj(torch.cat([node_mean, edge_mean], dim=-1))
 
     def _message_pass(
         self,
@@ -227,12 +190,10 @@ class TemporalRelationalEdgeRefiner(nn.Module):
         relation_ids: torch.Tensor,
         source_index: torch.Tensor,
         target_index: torch.Tensor,
-        query_state: torch.Tensor,
         graph_state: torch.Tensor,
     ) -> torch.Tensor:
         source_states = node_states[source_index]
         target_states = node_states[target_index]
-        query_states = query_state.expand(edge_states.size(0), -1)
         graph_states = graph_state.expand(edge_states.size(0), -1)
 
         transformed_sources = self._apply_relation_transforms(
@@ -241,10 +202,10 @@ class TemporalRelationalEdgeRefiner(nn.Module):
             self.forward_relation_linears,
         )
         forward_messages = self.forward_message_mlp(
-            torch.cat([transformed_sources, target_states, edge_states, query_states, graph_states], dim=-1)
+            torch.cat([transformed_sources, target_states, edge_states, graph_states], dim=-1)
         )
         forward_attention_logits = self.forward_attention(
-            torch.cat([transformed_sources, target_states, edge_states, time_states, query_states, graph_states], dim=-1)
+            torch.cat([transformed_sources, target_states, edge_states, time_states, graph_states], dim=-1)
         ).squeeze(-1)
         forward_weights = self._segment_softmax(forward_attention_logits, target_index, node_states.size(0))
         forward_messages = forward_messages * forward_weights.unsqueeze(-1)
@@ -255,10 +216,10 @@ class TemporalRelationalEdgeRefiner(nn.Module):
             self.inverse_relation_linears,
         )
         reverse_messages = self.reverse_message_mlp(
-            torch.cat([transformed_targets, source_states, edge_states, query_states, graph_states], dim=-1)
+            torch.cat([transformed_targets, source_states, edge_states, graph_states], dim=-1)
         )
         reverse_attention_logits = self.reverse_attention(
-            torch.cat([transformed_targets, source_states, edge_states, reverse_time_states, query_states, graph_states], dim=-1)
+            torch.cat([transformed_targets, source_states, edge_states, reverse_time_states, graph_states], dim=-1)
         ).squeeze(-1)
         reverse_weights = self._segment_softmax(reverse_attention_logits, source_index, node_states.size(0))
         reverse_messages = reverse_messages * reverse_weights.unsqueeze(-1)
@@ -277,12 +238,10 @@ class TemporalRelationalEdgeRefiner(nn.Module):
         time_states: torch.Tensor,
         source_index: torch.Tensor,
         target_index: torch.Tensor,
-        query_state: torch.Tensor,
         graph_state: torch.Tensor,
     ) -> torch.Tensor:
         source_states = node_states[source_index]
         target_states = node_states[target_index]
-        query_states = query_state.expand(edge_states.size(0), -1)
         graph_states = graph_state.expand(edge_states.size(0), -1)
         update_input = self.edge_update_input(
             torch.cat(
@@ -292,7 +251,6 @@ class TemporalRelationalEdgeRefiner(nn.Module):
                     torch.abs(source_states - target_states),
                     edge_states,
                     time_states,
-                    query_states,
                     graph_states,
                 ],
                 dim=-1,
@@ -308,12 +266,10 @@ class TemporalRelationalEdgeRefiner(nn.Module):
         time_states: torch.Tensor,
         source_index: torch.Tensor,
         target_index: torch.Tensor,
-        query_state: torch.Tensor,
         graph_state: torch.Tensor,
     ) -> torch.Tensor:
         source_states = node_states[source_index]
         target_states = node_states[target_index]
-        query_states = query_state.expand(edge_states.size(0), -1)
         graph_states = graph_state.expand(edge_states.size(0), -1)
         return torch.cat(
             [
@@ -323,7 +279,6 @@ class TemporalRelationalEdgeRefiner(nn.Module):
                 source_states * target_states,
                 edge_states,
                 time_states,
-                query_states,
                 graph_states,
             ],
             dim=-1,
@@ -334,23 +289,21 @@ class TemporalRelationalEdgeRefiner(nn.Module):
         node_features: torch.Tensor,
         edge_index: torch.Tensor,
         edge_features: torch.Tensor,
-        query_features: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
+        # Query-derived legacy feature slots are neutralized so graph editing
+        # transfers independently of the downstream query schema.
+        node_features = node_features.clone()
+        edge_features = edge_features.clone()
+        if node_features.size(-1) > 4:
+            node_features[:, 4] = 0.0
+        if edge_features.size(-1) > 6:
+            edge_features[:, 6] = 0.0
         node_states = self.node_encoder(node_features)
-        query_state = self.query_encoder(query_features.unsqueeze(0)).squeeze(0)
 
         if edge_index.numel() == 0:
-            graph_state = self._graph_context(
-                node_states,
-                torch.empty((0, self.hidden_dim), device=node_features.device),
-                query_state,
-            )
-            frontier_scores = self._frontier_scores(node_states, query_state, graph_state)
             return {
                 "edge_keep_logits": torch.empty(0, device=node_features.device),
-                "edge_type_logits": torch.empty((0, self.num_relations), device=node_features.device),
                 "edge_strengths": torch.empty(0, device=node_features.device),
-                "frontier_scores": frontier_scores,
             }
 
         edge_scalar_features, relation_ids, time_features, reverse_time_features = self._split_edge_features(edge_features)
@@ -363,7 +316,7 @@ class TemporalRelationalEdgeRefiner(nn.Module):
         source_index = edge_index[:, 0]
         target_index = edge_index[:, 1]
         for _ in range(self.num_message_passing_steps):
-            graph_state = self._graph_context(node_states, edge_states, query_state)
+            graph_state = self._graph_context(node_states, edge_states)
             node_states = self._message_pass(
                 node_states=node_states,
                 edge_states=edge_states,
@@ -372,28 +325,25 @@ class TemporalRelationalEdgeRefiner(nn.Module):
                 relation_ids=relation_ids,
                 source_index=source_index,
                 target_index=target_index,
-                query_state=query_state,
                 graph_state=graph_state,
             )
-            graph_state = self._graph_context(node_states, edge_states, query_state)
+            graph_state = self._graph_context(node_states, edge_states)
             edge_states = self._edge_pass(
                 node_states=node_states,
                 edge_states=edge_states,
                 time_states=time_states,
                 source_index=source_index,
                 target_index=target_index,
-                query_state=query_state,
                 graph_state=graph_state,
             )
 
-        graph_state = self._graph_context(node_states, edge_states, query_state)
+        graph_state = self._graph_context(node_states, edge_states)
         edge_context = self._edge_head_context(
             node_states=node_states,
             edge_states=edge_states,
             time_states=time_states,
             source_index=source_index,
             target_index=target_index,
-            query_state=query_state,
             graph_state=graph_state,
         )
 
@@ -404,13 +354,9 @@ class TemporalRelationalEdgeRefiner(nn.Module):
         source_bias = 0.35 * is_coarse_edge - 0.25 * completion_candidate
 
         edge_keep_logits = self.keep_head(edge_context).squeeze(-1) + 0.5 * coarse_prior_logit + source_bias
-        edge_type_logits = self.type_head(edge_context)
         edge_strengths = self.strength_head(edge_context).squeeze(-1)
-        frontier_scores = self._frontier_scores(node_states, query_state, graph_state)
 
         return {
             "edge_keep_logits": edge_keep_logits,
-            "edge_type_logits": edge_type_logits,
             "edge_strengths": edge_strengths,
-            "frontier_scores": frontier_scores,
         }

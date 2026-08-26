@@ -48,9 +48,7 @@ class RefinementSample:
     edge_index: list[list[int]]
     edge_features: list[list[float]]
     edge_labels: list[int]
-    edge_type_labels: list[int]
     edge_strengths: list[float]
-    query_features: list[float]
     metadata: dict[str, Any]
 
     def to_dict(self) -> dict[str, Any]:
@@ -60,9 +58,7 @@ class RefinementSample:
             "edge_index": self.edge_index,
             "edge_features": self.edge_features,
             "edge_labels": self.edge_labels,
-            "edge_type_labels": self.edge_type_labels,
             "edge_strengths": self.edge_strengths,
-            "query_features": self.query_features,
             "metadata": self.metadata,
         }
 
@@ -76,16 +72,14 @@ def refinement_sample_from_dict(data: dict[str, Any]) -> RefinementSample:
         "edge_index",
         "edge_features",
         "edge_labels",
-        "edge_type_labels",
         "edge_strengths",
-        "query_features",
     )
     missing = [name for name in required_fields if name not in data]
     if missing:
         raise ValueError(f"Refinement sample is missing fields: {missing}")
 
     edge_count = len(data["edge_index"])
-    aligned_fields = ("edge_features", "edge_labels", "edge_type_labels", "edge_strengths")
+    aligned_fields = ("edge_features", "edge_labels", "edge_strengths")
     misaligned = [name for name in aligned_fields if len(data[name]) != edge_count]
     if misaligned:
         raise ValueError(
@@ -98,9 +92,7 @@ def refinement_sample_from_dict(data: dict[str, Any]) -> RefinementSample:
         edge_index=[[int(value) for value in row] for row in data["edge_index"]],
         edge_features=[[float(value) for value in row] for row in data["edge_features"]],
         edge_labels=[int(value) for value in data["edge_labels"]],
-        edge_type_labels=[int(value) for value in data["edge_type_labels"]],
         edge_strengths=[float(value) for value in data["edge_strengths"]],
-        query_features=[float(value) for value in data["query_features"]],
         metadata=dict(data.get("metadata", {})),
     )
 
@@ -122,9 +114,7 @@ class RefinementTensorDataset(Dataset):
             "edge_index": torch.tensor(sample.edge_index, dtype=torch.long),
             "edge_features": torch.tensor(sample.edge_features, dtype=torch.float32),
             "edge_labels": torch.tensor(sample.edge_labels, dtype=torch.float32),
-            "edge_type_labels": torch.tensor(sample.edge_type_labels, dtype=torch.long),
             "edge_strengths": torch.tensor(sample.edge_strengths, dtype=torch.float32),
-            "query_features": torch.tensor(sample.query_features, dtype=torch.float32),
             "metadata": sample.metadata,
         }
 
@@ -295,22 +285,6 @@ def _edge_feature(
         same_sentence,
         is_coarse_edge,
         is_completion_candidate,
-    ]
-
-
-def _query_features(
-    graph: CoarseCausalGraph,
-    edge_count: int,
-    cutoff_value: float,
-    cutoff_present: float,
-) -> list[float]:
-    return [
-        float(len(graph.query.focus_entities)),
-        float(len(graph.documents)),
-        float(len(graph.events)),
-        float(edge_count),
-        cutoff_value,
-        cutoff_present,
     ]
 
 
@@ -602,7 +576,6 @@ def gold_and_coarse_graph_to_refinement_sample(
     edge_index: list[list[int]] = []
     edge_features: list[list[float]] = []
     edge_labels: list[int] = []
-    edge_type_labels: list[int] = []
     edge_strengths: list[float] = []
     edge_descriptions: list[dict[str, Any]] = []
 
@@ -627,12 +600,10 @@ def gold_and_coarse_graph_to_refinement_sample(
         gold_edge = gold_edge_map.get(pair)
         if gold_edge is not None:
             edge_labels.append(1)
-            edge_type_labels.append(RELATION_TO_ID.get(gold_edge.relation_type, 0))
             edge_strengths.append(float(gold_edge.score))
             gold_relation = gold_edge.relation_type
         else:
             edge_labels.append(0)
-            edge_type_labels.append(0)
             edge_strengths.append(0.0)
             gold_relation = "none"
         edge_descriptions.append(
@@ -656,14 +627,7 @@ def gold_and_coarse_graph_to_refinement_sample(
         edge_index=edge_index,
         edge_features=edge_features,
         edge_labels=edge_labels,
-        edge_type_labels=edge_type_labels,
         edge_strengths=edge_strengths,
-        query_features=_query_features(
-            graph=gold_graph,
-            edge_count=len(edge_index),
-            cutoff_value=cutoff_value,
-            cutoff_present=cutoff_present,
-        ),
         metadata={
             "query_id": gold_graph.query.query_id,
             "dataset": gold_graph.query.metadata.get("dataset", "unknown"),
@@ -825,7 +789,6 @@ def load_refinement_sample_from_coarse_graph(
     edge_index: list[list[int]] = []
     edge_features: list[list[float]] = []
     edge_labels: list[int] = []
-    edge_type_labels: list[int] = []
     edge_strengths: list[float] = []
     edge_descriptions: list[dict[str, Any]] = []
 
@@ -847,7 +810,6 @@ def load_refinement_sample_from_coarse_graph(
             )
         )
         edge_labels.append(0)
-        edge_type_labels.append(RELATION_TO_ID.get(edge.relation_type, 0))
         edge_strengths.append(float(edge.score))
         edge_descriptions.append(
             {
@@ -876,14 +838,7 @@ def load_refinement_sample_from_coarse_graph(
         edge_index=edge_index,
         edge_features=edge_features,
         edge_labels=edge_labels,
-        edge_type_labels=edge_type_labels,
         edge_strengths=edge_strengths,
-        query_features=_query_features(
-            graph=graph,
-            edge_count=len(edge_index),
-            cutoff_value=cutoff_value,
-            cutoff_present=cutoff_present,
-        ),
         metadata={
             "query_id": graph.query.query_id,
             "dataset": graph.query.metadata.get("dataset", "unknown"),
@@ -926,7 +881,6 @@ def generate_synthetic_refinement_samples(num_samples: int = 32, seed: int = 7) 
         edge_index: list[list[int]] = []
         edge_features: list[list[float]] = []
         edge_labels: list[int] = []
-        edge_type_labels: list[int] = []
         edge_strengths: list[float] = []
         used_pairs: set[tuple[int, int]] = set()
 
@@ -970,7 +924,6 @@ def generate_synthetic_refinement_samples(num_samples: int = 32, seed: int = 7) 
                 ]
             )
             edge_labels.append(int(coarse_score >= 0.62))
-            edge_type_labels.append(relation_id)
             edge_strengths.append(coarse_score)
 
         samples.append(
@@ -980,16 +933,7 @@ def generate_synthetic_refinement_samples(num_samples: int = 32, seed: int = 7) 
                 edge_index=edge_index,
                 edge_features=edge_features,
                 edge_labels=edge_labels,
-                edge_type_labels=edge_type_labels,
-                edge_strengths=edge_strengths,
-                query_features=[
-                    rng.uniform(1, 3),
-                    rng.uniform(2, 6),
-                    float(node_count),
-                    float(edge_count),
-                    rng.uniform(0.0, 8.0),
-                    rng.choice([0.0, 1.0]),
-                ],
+                        edge_strengths=edge_strengths,
                 metadata={
                     "synthetic": True,
                     "query_text": "synthetic query",
