@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import re
 import tempfile
@@ -66,7 +67,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--forecast-adapter-path", default=None, help="Optional LoRA B adapter path for structured forecasting.")
 
     parser.add_argument("--event-source", choices=["precomputed", "qwen"], default="precomputed", help="Event input source. precomputed is the research setting; qwen is an optional frozen-extractor baseline.")
-    parser.add_argument("--precomputed-events", default="datasets/mirai_event_inputs_rule/mirai_event_input_train.jsonl", help="event-input-v1 JSON/JSONL path required when event-source=precomputed.")
+    parser.add_argument("--precomputed-events", nargs="+", default=["datasets/mirai_event_inputs_rule/mirai_event_input_train.jsonl"], help="One or more event-input-v1 JSONL files or glob patterns; all files are merged by query_id when event-source=precomputed.")
     parser.add_argument(
         "--queries-from-precomputed-events",
         dest="queries_from_precomputed_events",
@@ -574,6 +575,7 @@ def format_seconds(seconds: float) -> str:
 
 def main() -> None:
     args = parse_args()
+    print("local qwen pipeline starting | stage={} | split={} | event_source={} | prediction_mode={}".format(args.stage, args.split, args.event_source, args.prediction_mode), flush=True)
     if args.stage == "prepare-grpo-context" and args.prediction_mode != "forecast-trace":
         raise ValueError("--stage prepare-grpo-context requires --prediction-mode forecast-trace")
     output_dir = resolve_repo_path(args.output_dir)
@@ -584,13 +586,30 @@ def main() -> None:
         predictions_path.unlink()
 
     precomputed_event_index = {}
-    precomputed_events_path: Path | None = None
+    precomputed_event_paths: list[Path] = []
     if args.event_source == "precomputed":
         if not args.precomputed_events:
             raise EventInputValidationError("--precomputed-events is required when --event-source=precomputed")
-        precomputed_events_path = resolve_repo_path(args.precomputed_events)
-        precomputed_event_index = load_event_input_index(precomputed_events_path)
+        seen_paths: set[Path] = set()
+        for raw_path in args.precomputed_events:
+            matches = sorted(glob.glob(str(raw_path))) or [str(raw_path)]
+            for match in matches:
+                path = resolve_repo_path(match)
+                if path not in seen_paths:
+                    seen_paths.add(path)
+                    precomputed_event_paths.append(path)
+        for path in precomputed_event_paths:
+            shard_index = load_event_input_index(path)
+            duplicate_query_ids = sorted(set(precomputed_event_index).intersection(shard_index))
+            if duplicate_query_ids:
+                raise EventInputValidationError(
+                    "Duplicate query ids found across precomputed event files; "
+                    f"preview={duplicate_query_ids[:10]}"
+                )
+            precomputed_event_index.update(shard_index)
+        print("loaded precomputed events | files={} | query_ids={}".format(len(precomputed_event_paths), len(precomputed_event_index)), flush=True)
 
+    print("loading MIRAI dataset | path={}".format(args.dataset), flush=True)
     dataset_path = resolve_repo_path(args.dataset)
     all_examples = load_mirai_queries(dataset_path, split=args.split)
     if args.query_id:
@@ -642,6 +661,7 @@ def main() -> None:
         and forecast_base_model_path == coarse_base_model_path
     )
     if args.event_source == "qwen":
+        print("loading native Qwen extractor | path={}".format(native_model_path), flush=True)
         native_qwen = LocalQwenGenerator(
             native_model_path,
             max_new_tokens=max(args.event_extraction_max_new_tokens, args.forecast_max_new_tokens),
@@ -656,6 +676,7 @@ def main() -> None:
             device = native_qwen.device
             coarse_mode = "shared-native"
         else:
+            print("loading coarse Qwen | path={}".format(coarse_base_model_path), flush=True)
             coarse_model, coarse_tokenizer, torch = load_qwen_for_inference(
                 base_model_path=coarse_base_model_path,
                 adapter_path=coarse_adapter_path,
@@ -663,6 +684,7 @@ def main() -> None:
             coarse_model.eval()
             device = next(coarse_model.parameters()).device
             coarse_mode = "frozen" if coarse_adapter_path is None else "lora"
+            print("coarse Qwen ready | device={} | mode={}".format(device, coarse_mode), flush=True)
     except LoraUnavailable as exc:
         raise RuntimeError(str(exc)) from exc
 
@@ -678,12 +700,18 @@ def main() -> None:
     elif forecast_adapter_path is None and forecast_base_model_path == native_model_path and native_qwen is not None:
         forecast_qwen = native_qwen
     else:
+        print("loading forecast Qwen | path={}".format(forecast_base_model_path), flush=True)
         forecast_qwen = LocalQwenGenerator(
             forecast_base_model_path,
             max_new_tokens=args.forecast_max_new_tokens,
             adapter_path=forecast_adapter_path,
         )
-    refinement_model = None if args.skip_refinement else load_refinement_model(args, torch, device)
+    if args.skip_refinement:
+        refinement_model = None
+    else:
+        print("loading refinement model | path={}".format(args.refinement_model_path), flush=True)
+        refinement_model = load_refinement_model(args, torch, device)
+        print("refinement model ready", flush=True)
 
     started = time.time()
     rows: list[dict[str, Any]] = []
@@ -708,6 +736,7 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="local_qwen_pipeline_") as temp_name:
         temp_dir = Path(temp_name)
         for index, example in enumerate(examples, start=1):
+            print("[{}/{}] start query_id={}".format(index, len(examples), example.query_id), flush=True)
             query = example.build_query_spec()
             documents = load_mirai_news_for_docids(dataset_path, example.docids)[: args.max_docs]
             trajectory = PipelineTrajectory(
@@ -737,7 +766,7 @@ def main() -> None:
                 }
                 event_input_action = {
                     "source": "precomputed",
-                    "event_input_path": str(precomputed_events_path),
+                    "event_input_path": [str(path) for path in precomputed_event_paths],
                     "max_events": args.max_events,
                 }
             else:
@@ -787,6 +816,7 @@ def main() -> None:
                 max_sentence_gap=args.max_sentence_gap,
                 max_pairs=args.max_pairs,
             )
+            print("[{}/{}] generating coarse graph | events={} | candidate_pairs={}".format(index, len(examples), len(events), len(pair_samples)), flush=True)
             pair_predictions, pair_raw_generations = generate_coarse_predictions(
                 model=coarse_model,
                 tokenizer=coarse_tokenizer,
@@ -945,6 +975,7 @@ def main() -> None:
                     )
                 continue
             if args.prediction_mode == "forecast-trace":
+                print("[{}/{}] generating forecast trace".format(index, len(examples)), flush=True)
                 prompt_bundle = build_structured_forecast_prompt(
                     query=query,
                     documents=documents,
@@ -1073,7 +1104,7 @@ def main() -> None:
                 "coarse_mode": coarse_mode,
                 "refinement_model_path": None if args.skip_refinement else str(resolve_repo_path(args.refinement_model_path)),
                 "skip_refinement": bool(args.skip_refinement),
-                "precomputed_events": str(precomputed_events_path) if precomputed_events_path is not None else None,
+                "precomputed_events": [str(path) for path in precomputed_event_paths] if precomputed_event_paths else None,
                 "online_forecast_sampling": True,
             },
             "samples": len(rows),
@@ -1121,7 +1152,7 @@ def main() -> None:
             "skip_refinement": bool(args.skip_refinement),
             "forecast_base_model_path": str(forecast_base_model_path),
             "forecast_adapter_path": str(forecast_adapter_path) if forecast_adapter_path is not None else None,
-            "precomputed_events": str(precomputed_events_path) if precomputed_events_path is not None else None,
+            "precomputed_events": [str(path) for path in precomputed_event_paths] if precomputed_event_paths else None,
             "policy": policy.name,
             "choice_count": len(choice_pool),
             "coarse_generation_mode": f"pairwise_candidate_batching:{coarse_mode}",

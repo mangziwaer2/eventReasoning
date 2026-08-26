@@ -54,13 +54,13 @@ PYTHONPATH=src conda run -n toolkit python src/split_event_input_shards.py \
   --output-dir outputs/mirai_event_input_train_shards_25 --shard-size 25
 ```
 
-先运行第一片：
+直接一次处理全部 shard。脚本会在内部合并 query_id；若发生重复 QueryId 会直接报错。`events_*.jsonl` 由 shell 展开为 17 个输入文件。使用 `--no-capture-output` 才能实时看到 Qwen 进度：
 
 ```bash
-PYTHONPATH=src conda run -n toolkit python src/evaluate_local_qwen_pipeline.py \
+PYTHONPATH=src conda run --no-capture-output -n toolkit python src/evaluate_local_qwen_pipeline.py \
   --stage prepare-grpo-context --split test --limit 0 \
   --event-source precomputed \
-  --precomputed-events outputs/mirai_event_input_train_shards_25/events_0000.jsonl \
+  --precomputed-events outputs/mirai_event_input_train_shards_25/events_*.jsonl \
   --queries-from-precomputed-events \
   --model-path models/Qwen3-4B --coarse-base-model-path models/Qwen3-4B \
   --skip-refinement --prediction-mode forecast-trace \
@@ -69,37 +69,13 @@ PYTHONPATH=src conda run -n toolkit python src/evaluate_local_qwen_pipeline.py \
   --forecast-max-event-chars 100 --forecast-max-document-chars 500 \
   --max-events 16 --max-pairs 64 --coarse-batch-size 8 \
   --coarse-max-length 1024 --coarse-max-new-tokens 128 \
-  --output-dir outputs/grpo_context_shards/no_refine_0000
+  --output-dir outputs/grpo_context_mirai_rule_train_no_refine_420 \
+  --log-every 10
 ```
 
-确认第一片成功后，运行全部分片。已完成的分片会跳过：
+脚本已经直接写入正式训练 context，检查唯一 QueryId 数量：
 
 ```bash
-for shard in outputs/mirai_event_input_train_shards_25/events_*.jsonl; do
-  name=$(basename "$shard" .jsonl)
-  out="outputs/grpo_context_shards/no_refine_${name#events_}"
-  test -s "$out/grpo_context.jsonl" && continue
-  PYTHONPATH=src conda run -n toolkit python src/evaluate_local_qwen_pipeline.py \
-    --stage prepare-grpo-context --split test --limit 0 \
-    --event-source precomputed --precomputed-events "$shard" \
-    --queries-from-precomputed-events \
-    --model-path models/Qwen3-4B --coarse-base-model-path models/Qwen3-4B \
-    --skip-refinement --prediction-mode forecast-trace \
-    --coarse-topology-mode temporal-dag --forecast-context-mode events-graph \
-    --max-graph-events-in-prompt 14 --max-graph-edges-in-prompt 24 \
-    --forecast-max-event-chars 100 --forecast-max-document-chars 500 \
-    --max-events 16 --max-pairs 64 --coarse-batch-size 8 \
-    --coarse-max-length 1024 --coarse-max-new-tokens 128 \
-    --output-dir "$out"
-done
-```
-
-合并为正式训练 context：
-
-```bash
-PYTHONPATH=src conda run -n toolkit python src/merge_grpo_context_shards.py \
-  --input outputs/grpo_context_shards/no_refine_*/grpo_context.jsonl \
-  --output outputs/grpo_context_mirai_rule_train_no_refine_420/grpo_context.jsonl
 wc -l outputs/grpo_context_mirai_rule_train_no_refine_420/grpo_context.jsonl
 ```
 
@@ -235,10 +211,10 @@ PYTHONPATH=src conda run -n toolkit python src/evaluate_refinement_v2.py \
 生成带 refinement 的 context。此处直接处理 420 条也可以；若中断，复用第 2 节分片方法，把 `--skip-refinement` 替换为下面的 refinement 参数：
 
 ```bash
-PYTHONPATH=src conda run -n toolkit python src/evaluate_local_qwen_pipeline.py \
+PYTHONPATH=src conda run --no-capture-output -n toolkit python src/evaluate_local_qwen_pipeline.py \
   --stage prepare-grpo-context --split test --limit 0 \
   --event-source precomputed \
-  --precomputed-events datasets/mirai_event_inputs_rule/mirai_event_input_train.jsonl \
+  --precomputed-events outputs/mirai_event_input_train_shards_25/events_*.jsonl \
   --queries-from-precomputed-events \
   --model-path models/Qwen3-4B --coarse-base-model-path models/Qwen3-4B \
   --refinement-model-path outputs/refinement_graph_maven_qwen/refinement_model.pt \
