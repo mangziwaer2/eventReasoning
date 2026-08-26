@@ -30,6 +30,7 @@ This command runs event input, the frozen pairwise coarse graph, optional refine
 python -u src/evaluate_local_qwen_pipeline.py \
   --stage prepare-grpo-context \
   --split test \
+  --limit 0 \
   --event-source precomputed \
   --precomputed-events datasets/mirai_event_inputs_rule/mirai_event_input_train.jsonl \
   --queries-from-precomputed-events \
@@ -43,7 +44,7 @@ python -u src/evaluate_local_qwen_pipeline.py \
   --max-graph-edges-in-prompt 24 \
   --forecast-max-event-chars 100 \
   --max-events 16 \
-  --max-pairs 24 \
+  --max-pairs 64 \
   --coarse-batch-size 8 \
   --coarse-max-length 1024 \
   --coarse-max-new-tokens 128 \
