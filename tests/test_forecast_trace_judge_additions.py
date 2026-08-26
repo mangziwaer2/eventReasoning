@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from forecast_trace_judge_parser import parse_judge_response_robust
+from forecast_trace_judge_runtime import parse_judge_response_robust
 from merge_grpo_context_shards import load_rows
 
 
@@ -24,7 +24,10 @@ class JudgeAdditionTests(unittest.TestCase):
             first = root / "first.jsonl"
             second = root / "second.jsonl"
             first.write_text(json.dumps({"query_id": "a"}) + "\n", encoding="utf-8")
-            second.write_text(json.dumps({"query_id": "a"}) + "\n" + json.dumps({"query_id": "b"}) + "\n", encoding="utf-8")
+            second.write_text(
+                json.dumps({"query_id": "a"}) + "\n" + json.dumps({"query_id": "b"}) + "\n",
+                encoding="utf-8",
+            )
             self.assertEqual([row["query_id"] for row in load_rows([first, second])], ["a", "b"])
 
 
