@@ -317,13 +317,13 @@ frontier_scores [N]
 
 ## 5. Active training objective
 
-`graph-editor-v3` does not predict relation labels. Qwen's pairwise relation string is preserved for every kept edge. Training optimizes only:
+`graph-editor-v4` jointly predicts keep/drop, relation labels, and edge strength. The relation labels are `none`, `precedes`, `causes`, `escalates`, and `mitigates`; `none` is the drop class. Training optimizes:
 
 ```text
-loss = 1.0 * keep_loss + 0.3 * strength_loss + 0.08 * density_loss
+loss = 1.0 * keep_loss + 0.3 * strength_loss + 0.5 * relation_loss + 0.08 * density_loss
 ```
 
-`keep_loss` decides whether a Qwen candidate belongs in the gold graph; `strength_loss` calibrates its score on kept gold edges; `density_loss` prevents the model from retaining every candidate. This avoids treating the highly imbalanced ERE relation taxonomy as a second task.
+`keep_loss` decides whether a candidate belongs in the gold graph; `relation_loss` predicts the primary gold relation only on kept gold edges (with causal relations taking priority when multiple labels share a pair); `strength_loss` calibrates its score on kept gold edges; `density_loss` prevents the model from retaining every candidate. Completion candidates allow the model to add a missing gold edge when the candidate cache includes that pair. Drop decisions remain the responsibility of `keep_loss`, so the `none` relation output is treated as a fallback to the candidate relation at decode time.
 
 ## 6. 默认训练参数及理由
 
@@ -487,11 +487,11 @@ edges:
 
 ---
 
-## Current graph-editor-v3 contract
+## Current graph-editor-v4 contract
 
-The active implementation treats refinement as a graph editor. The only model input is `node_features`, `edge_index`, and `edge_features`; the query feature vector is no longer loaded by the tensor dataloader. The frontier prediction task and `frontier_scores` output were removed because they are unrelated to edge correction. Legacy cache rows containing `query_features` remain readable, but the field is ignored and is not written to new caches. The model outputs only keep logits and strength; it never retypes an edge.
+The active implementation treats refinement as a graph editor. The only model input is `node_features`, `edge_index`, and `edge_features`; the query feature vector is no longer loaded by the tensor dataloader. The frontier prediction task and `frontier_scores` output were removed because they are unrelated to edge correction. Legacy cache rows containing `query_features` remain readable, but the field is ignored and is not written to new caches. The model outputs keep logits, relation logits, and strength.
 
-The refiner keeps the full Qwen relation vocabulary as an input feature, but has no relation-classification head. The relation string in each output edge is copied from the Qwen candidate unchanged. Train configuration writes `refinement_model_variant=graph-editor-v3`; inference rejects retired checkpoints so a shape mismatch cannot silently look like a bad loss.
+The refiner keeps the full Qwen relation vocabulary as an input feature and adds a relation-classification head. Train configuration writes `refinement_model_variant=graph-editor-v4`; inference rejects retired checkpoints so a shape mismatch cannot silently look like a bad loss. A retained edge uses the predicted relation label, while `none` drops the candidate.
 
 Refinement is direct in the following sense: it can receive raw pairwise candidates, including reciprocal directions, when the coarse stage uses `--coarse-topology-mode none`. A single deterministic `temporal-dag` decode is then applied after the model. This is a global constraint decoder, not a second semantic model, and guarantees no reciprocal edge or directed cycle.
 

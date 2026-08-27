@@ -11,8 +11,6 @@ from typing import Any
 from refinement_dataset import EDGE_FEATURE_DIM
 from refinement_dataset import RefinementSample
 from refinement_dataset import RefinementTensorDataset
-from refinement_dataset import ID_TO_RELATION_LABEL
-from refinement_dataset import NUM_RELATION_LABELS
 from refinement_dataset import generate_synthetic_refinement_samples
 from refinement_dataset import load_cached_refinement_samples
 from refinement_dataset import load_maven_refinement_samples
@@ -123,7 +121,6 @@ def print_metrics(prefix: str, metrics: dict[str, float | int | None], elapsed_s
         "strength_loss",
         "relation_loss",
         "density_loss",
-        "relation_loss",
         "val_loss",
         "val_keep_loss",
         "val_strength_loss",
@@ -164,7 +161,15 @@ def compute_losses(
         strength_loss_fn(outputs["edge_strengths"][positive_mask], batch["edge_strengths"][positive_mask])
         if positive_mask.any() else keep_loss.new_zeros(())
     )
-    relation_loss = relation_loss_fn(outputs["edge_relation_logits"], batch["edge_relation_labels"])
+    relation_mask = batch["edge_labels"] > 0.5
+    relation_loss = (
+        relation_loss_fn(
+            outputs["edge_relation_logits"][relation_mask],
+            batch["edge_relation_labels"][relation_mask],
+        )
+        if relation_mask.any()
+        else keep_loss.new_zeros(())
+    )
     loss = (
         loss_weights["keep"] * keep_loss
         + loss_weights["strength"] * strength_loss
@@ -188,7 +193,7 @@ def evaluate(
     totals = {
         "val_loss": 0.0,
         "val_keep_loss": 0.0,
-            "val_strength_loss": 0.0,
+        "val_strength_loss": 0.0,
         "val_density_loss": 0.0,
         "val_relation_loss": 0.0,
     }
@@ -467,7 +472,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split", default="train", help="MAVEN split when dataset-mode=maven.")
     parser.add_argument(
         "--qwen-refinement-cache",
-        default=str(REPO_ROOT / "outputs" / "maven_qwen_refinement_cache" / "samples.jsonl"),
+        default=str(REPO_ROOT / "outputs" / "maven_qwen_refinement_cache_v3" / "samples.jsonl"),
         help="JSONL created by build_maven_qwen_refinement_cache.py when dataset-mode=maven-qwen-cache.",
     )
     parser.add_argument("--epochs", type=int, default=30, help="Number of training epochs.")
@@ -487,7 +492,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grad-clip", type=float, default=1.0, help="Gradient norm clipping. Use 0 to disable.")
     parser.add_argument("--keep-loss-weight", type=float, default=1.0, help="Weight for edge keep BCE loss.")
     parser.add_argument("--relation-loss-weight", dest="relation_loss_weight", type=float, default=0.5, help="Weight for predicted relation cross-entropy.")
-    parser.add_argument("--type-loss-weight", type=float, default=0.0, help="Deprecated; relation type is preserved from Qwen and is not trained by refinement.")
+    parser.add_argument("--type-loss-weight", type=float, default=0.0, help="Deprecated compatibility option; use --relation-loss-weight.")
     parser.add_argument("--type-class-weighting", choices=["auto", "none"], default="none", help="Deprecated compatibility option; ignored.")
     parser.add_argument("--max-type-class-weight", type=float, default=4.0, help="Deprecated compatibility option; ignored.")
     parser.add_argument("--type-label-smoothing", type=float, default=0.0, help="Deprecated compatibility option; ignored.")

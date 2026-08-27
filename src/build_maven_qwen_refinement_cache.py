@@ -48,7 +48,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--overwrite", action="store_true", help="Replace an existing samples.jsonl in output-dir.")
     parser.add_argument(
         "--output-dir",
-        default=str(REPO_ROOT / "outputs" / "maven_qwen_refinement_cache"),
+        default=str(REPO_ROOT / "outputs" / "maven_qwen_refinement_cache_v3"),
         help="Directory containing samples.jsonl and cache_manifest.json.",
     )
     return parser.parse_args()

@@ -142,7 +142,7 @@ python src/train_forecast_trace_grpo_judge.py \
 | Recall | 1.0000 | 0.9726 |
 | F1 | 0.6762 | 0.6961 |
 
-若 `outputs/maven_qwen_refinement_cache/samples.jsonl` 不存在，先用冻结 Qwen 构建完整 cache。MAVEN-ERE 只用于 refinement 监督，不与 `mirai_forecast` 的 train/dev/holdout 混合：
+若 `outputs/maven_qwen_refinement_cache_v3/samples.jsonl` 不存在，先用冻结 Qwen 构建完整 v3 cache。MAVEN-ERE 只用于 refinement 监督，不与 `mirai_forecast` 的 train/dev/holdout 混合：
 
 ```bash
 python src/build_maven_qwen_refinement_cache.py \
@@ -239,8 +239,10 @@ python src/evaluate_local_qwen_pipeline.py \
   --precomputed-events datasets/mirai_event_inputs_rule/mirai_forecast_event_input_dev.jsonl \
   --queries-from-precomputed-events --model-path models/Qwen3-4B \
   --forecast-adapter-path outputs/forecast_trace_grpo_judge_with_refinement/final_adapter \
-  --refinement-model-path outputs/refinement_graph_maven_qwen/refinement_model.pt \
-  --enable-refinement --refinement-keep-threshold 0.30 \
+  --refinement-model-path outputs/refinement_graph_maven_qwen_v4/refinement_model.pt \
+  --enable-refinement --include-completion-candidates \
+  --max-completion-edges 128 --refinement-keep-threshold 0.50 \
+  --refinement-topology-mode temporal-dag \
   --prediction-mode forecast-trace --forecast-context-mode events-graph \
   --output-dir outputs/eval_mirai_forecast_dev_with_refinement
 ```

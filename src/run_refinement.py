@@ -10,7 +10,6 @@ from coarse_graph_dataset import apply_temporal_dag_topology
 from coarse_graph_dataset import load_coarse_graph
 from refinement_dataset import RELATION_TO_ID
 from refinement_dataset import ID_TO_RELATION_LABEL
-from refinement_dataset import NUM_RELATION_LABELS
 from refinement_dataset import EDGE_FEATURE_DIM
 from refinement_dataset import load_refinement_sample_from_coarse_graph
 from path_utils import REPO_ROOT
@@ -99,7 +98,11 @@ def build_refined_graph(
             else str(edge_desc.get("coarse_relation_type", "")).strip().lower()
         )
         if relation_predictions is not None and relation_type == "none":
-            continue
+            relation_type = (
+                edge.relation_type
+                if edge is not None
+                else str(edge_desc.get("coarse_relation_type", "precedes")).strip().lower()
+            )
         if not relation_type and edge is not None:
             relation_type = edge.relation_type
         if relation_type not in RELATION_TO_ID:
@@ -144,11 +147,11 @@ def summarize_edges(
     relation_predictions: list[str] | None = None,
 ) -> list[dict[str, object]]:
     preview: list[dict[str, object]] = []
-    for edge_desc, keep_prob, strength_prediction in zip(
+    for index, (edge_desc, keep_prob, strength_prediction) in enumerate(zip(
         edge_descriptions,
         keep_probs,
         strength_predictions,
-    ):
+    )):
         preview.append(
             {
                 "source_event_id": edge_desc.get("source_event_id", ""),

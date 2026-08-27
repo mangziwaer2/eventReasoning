@@ -8,6 +8,8 @@ from typing import Any
 from evaluate_refinement import load_model
 from evaluate_refinement import metric_counts
 from evaluate_refinement import predict_probabilities
+from evaluate_refinement import predict_relation_labels
+from evaluate_refinement import relation_report
 from path_utils import REPO_ROOT
 from path_utils import resolve_repo_path
 from refinement_dataset import load_cached_refinement_samples
@@ -16,7 +18,7 @@ from train_refinement import split_samples
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate refinement on the exact deterministic training subset split.")
-    parser.add_argument("--cache", default=str(REPO_ROOT / "outputs" / "maven_qwen_refinement_cache" / "samples.jsonl"))
+    parser.add_argument("--cache", default=str(REPO_ROOT / "outputs" / "maven_qwen_refinement_cache_v3" / "samples.jsonl"))
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--limit", type=int, default=0, help="Must match train_refinement --limit; 0 means all cache samples.")
     parser.add_argument("--validation-ratio", type=float, default=0.1)
@@ -40,6 +42,7 @@ def main() -> None:
         raise RuntimeError("No validation samples; increase cache size or validation ratio.")
     model = load_model(resolve_repo_path(args.model_path), torch)
     labels, probabilities, graph_candidate_counts = predict_probabilities(model, validation_samples, torch)
+    relation_gold, relation_predicted = predict_relation_labels(model, validation_samples, torch)
     baseline = metric_counts(labels, [True] * len(labels))
     rows: list[dict[str, Any]] = []
     for threshold in sorted(set(args.thresholds)):
@@ -56,6 +59,7 @@ def main() -> None:
         "validation_candidate_edges": len(labels),
         "mean_candidates_per_graph": round(sum(graph_candidate_counts) / max(1, len(graph_candidate_counts)), 4),
         "baseline_keep_all": baseline,
+        "relation_report": relation_report(relation_gold, relation_predicted),
         "threshold_results": rows,
         "best_f1": best,
         "improvement_over_keep_all": {
