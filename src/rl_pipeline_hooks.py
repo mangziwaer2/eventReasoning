@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import re
+from difflib import SequenceMatcher
+
 from dataclasses import asdict
 from dataclasses import dataclass
 from dataclasses import field
@@ -138,19 +141,12 @@ def _latest_step(trajectory: PipelineTrajectory, name: str) -> PipelineStep | No
     return None
 
 
-def _valid_choice_score(prediction: dict[str, Any], choices: list[dict[str, Any]]) -> float:
-    if not choices:
-        return 1.0
+def _valid_event_code_score(prediction: dict[str, Any]) -> float:
     final_answer = prediction.get("final_answer", {})
     if not isinstance(final_answer, dict):
         final_answer = {}
-    allowed_codes = {str(choice.get("event_code", "")).strip() for choice in choices if str(choice.get("event_code", "")).strip()}
-    allowed_choice_ids = {str(choice.get("choice_id", "")).strip() for choice in choices if str(choice.get("choice_id", "")).strip()}
     event_code = str(final_answer.get("event_code", prediction.get("predicted_event_base_code", ""))).strip()
-    choice_id = str(final_answer.get("choice_id", "")).strip()
-    code_ok = bool(event_code and event_code in allowed_codes)
-    choice_ok = bool(choice_id and choice_id in allowed_choice_ids)
-    return 1.0 if code_ok or choice_ok else 0.0
+    return 1.0 if re.fullmatch(r"\d{3}", event_code) else 0.0
 
 
 def _support_refs(prediction: dict[str, Any]) -> tuple[list[str], list[str]]:
@@ -204,6 +200,89 @@ def _generic_penalty(prediction: dict[str, Any]) -> float:
     return generic / len(events)
 
 
+def _copy_tokens(value: Any) -> list[str]:
+    """Normalize an event mention enough to detect copied historical evidence."""
+    if isinstance(value, dict):
+        value = (
+            value.get("mention")
+            or value.get("event_context")
+            or value.get("text")
+            or value.get("normalized_text")
+            or value.get("event")
+            or ""
+        )
+    text = str(value or "").lower()
+    text = re.sub(r"\b(?:trigger|mention|actors|participants)\s*=\s*", " ", text)
+    return re.findall(r"[^\W_]+", text, flags=re.UNICODE)
+
+
+def _historical_event_candidates(graph: Any) -> list[list[str]]:
+    if isinstance(graph, dict):
+        events = graph.get("events", [])
+    else:
+        events = getattr(graph, "events", [])
+    candidates: list[list[str]] = []
+    for event in events if isinstance(events, list) else []:
+        values: list[Any] = []
+        if isinstance(event, dict):
+            values.extend(
+                event.get(key, "")
+                for key in ("text", "normalized_text", "mention", "event_context", "event_mention")
+            )
+            metadata = event.get("metadata", {})
+            if isinstance(metadata, dict):
+                values.extend(metadata.get(key, "") for key in ("event_context", "event_mention"))
+        else:
+            values.extend(getattr(event, key, "") for key in ("text", "normalized_text"))
+            metadata = getattr(event, "metadata", {})
+            if isinstance(metadata, dict):
+                values.extend(metadata.get(key, "") for key in ("event_context", "event_mention"))
+        for value in values:
+            tokens = _copy_tokens(value)
+            if tokens and tokens not in candidates:
+                candidates.append(tokens)
+    return candidates
+
+
+def _historical_copy_penalty(prediction: dict[str, Any], graph: Any) -> float:
+    """Return the mean strongest exact/near-verbatim copy match in the trace."""
+    if graph is None:
+        return 0.0
+    trace = prediction.get("forecast_trace", {})
+    if not isinstance(trace, dict):
+        return 0.0
+    historical = _historical_event_candidates(graph)
+    if not historical:
+        return 0.0
+    scores: list[float] = []
+    for item in trace.get("intermediate_events", []):
+        if not isinstance(item, dict):
+            continue
+        tokens = _copy_tokens(item.get("event", ""))
+        if not tokens:
+            continue
+        best = 0.0
+        token_set = set(tokens)
+        for candidate in historical:
+            candidate_set = set(candidate)
+            if tokens == candidate:
+                best = 1.0
+                break
+            if len(token_set) < 4:
+                continue
+            if len(candidate_set) < 4:
+                continue
+            overlap = len(token_set & candidate_set) / min(len(token_set), len(candidate_set))
+            length_ratio = min(len(tokens), len(candidate)) / max(len(tokens), len(candidate))
+            sequence = SequenceMatcher(None, tokens, candidate).ratio()
+            if overlap >= 0.8 and length_ratio >= 0.8:
+                best = max(best, min(1.0, max(overlap, sequence)))
+            elif sequence >= 0.92:
+                best = max(best, sequence)
+        scores.append(best)
+    return sum(scores) / len(scores) if scores else 0.0
+
+
 def _density_penalty(prediction: dict[str, Any], max_events: int = 3, max_edges: int = 5) -> float:
     trace = prediction.get("forecast_trace", {})
     if not isinstance(trace, dict):
@@ -214,14 +293,14 @@ def _density_penalty(prediction: dict[str, Any], max_events: int = 3, max_edges:
     return min(float(overflow), 4.0) / 4.0
 
 
-def _format_score(prediction: dict[str, Any], choices: list[dict[str, Any]]) -> float:
+def _format_score(prediction: dict[str, Any]) -> float:
     parsed = 1.0 if prediction.get("parsed_json") else 0.0
     trace = prediction.get("forecast_trace", {})
     final_answer = prediction.get("final_answer", {})
     has_trace = 1.0 if isinstance(trace, dict) and isinstance(trace.get("intermediate_events"), list) and isinstance(trace.get("trace_edges"), list) else 0.0
     has_answer = 1.0 if isinstance(final_answer, dict) and str(final_answer.get("event_code", prediction.get("predicted_event_base_code", ""))).strip() else 0.0
-    valid_choice = _valid_choice_score(prediction, choices)
-    return 0.25 * parsed + 0.25 * has_trace + 0.25 * has_answer + 0.25 * valid_choice
+    valid_event_code = _valid_event_code_score(prediction)
+    return 0.25 * parsed + 0.25 * has_trace + 0.25 * has_answer + 0.25 * valid_event_code
 
 
 class ForecastTraceReward:
@@ -240,6 +319,7 @@ class ForecastTraceReward:
         graph_bridge_weight: float = 0.3,
         generic_penalty_weight: float = 0.15,
         density_penalty_weight: float = 0.15,
+        historical_copy_penalty_weight: float = 0.5,
         wrong_answer_trace_scale: float = 0.2,
     ) -> None:
         self.answer_reward = MiraiCodeReward()
@@ -250,18 +330,18 @@ class ForecastTraceReward:
         self.graph_bridge_weight = graph_bridge_weight
         self.generic_penalty_weight = generic_penalty_weight
         self.density_penalty_weight = density_penalty_weight
+        self.historical_copy_penalty_weight = max(0.0, float(historical_copy_penalty_weight))
         self.wrong_answer_trace_scale = max(0.0, min(float(wrong_answer_trace_scale), 1.0))
 
     def __call__(self, prediction: dict[str, Any], gold: dict[str, Any], trajectory: PipelineTrajectory) -> dict[str, float]:
         forecast_step = _latest_step(trajectory, "forecast")
         metadata = forecast_step.metadata if forecast_step is not None else {}
         refined_graph = metadata.get("refined_graph") or trajectory.metadata.get("refined_graph")
-        choices = metadata.get("choices") or trajectory.metadata.get("choices") or []
         event_ref_to_id = metadata.get("event_ref_to_id") or trajectory.metadata.get("event_ref_to_id") or {}
         edge_ref_to_id = metadata.get("edge_ref_to_id") or trajectory.metadata.get("edge_ref_to_id") or {}
 
         answer = self.answer_reward(prediction, gold)
-        fmt = _format_score(prediction, choices if isinstance(choices, list) else [])
+        fmt = _format_score(prediction)
 
         if refined_graph is None:
             valid_event_ratio = 0.0
@@ -291,6 +371,7 @@ class ForecastTraceReward:
         temporal = _trace_temporal_score(prediction)
         generic_penalty = _generic_penalty(prediction)
         density_penalty = _density_penalty(prediction)
+        historical_copy_penalty = _historical_copy_penalty(prediction, refined_graph)
         trace_unscaled = (
             self.format_weight * fmt
             + self.grounding_weight * grounding
@@ -298,6 +379,7 @@ class ForecastTraceReward:
             + self.graph_bridge_weight * bridge
             - self.generic_penalty_weight * generic_penalty
             - self.density_penalty_weight * density_penalty
+            - self.historical_copy_penalty_weight * historical_copy_penalty
         )
         trace_component = trace_unscaled
         if answer <= 0.0:
@@ -314,6 +396,7 @@ class ForecastTraceReward:
             "graph_bridge": round(bridge, 6),
             "generic_penalty": round(generic_penalty, 6),
             "density_penalty": round(density_penalty, 6),
+            "historical_copy_penalty": round(historical_copy_penalty, 6),
             "trace_unscaled": round(trace_unscaled, 6),
             "trace": round(trace_component, 6),
             "total": round(total, 6),

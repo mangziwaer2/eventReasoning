@@ -8,6 +8,8 @@ JUDGE_SYSTEM_PROMPT = (
     "You are a strict critic of structured future-event traces. "
     "Judge only whether the proposed trace is supported by the supplied historical events and graph, "
     "whether its causal direction and time are coherent, and whether it connects to the proposed answer. "
+    "Historical events are evidence, not forecast steps: exact or near-verbatim restatements of them "
+    "as intermediate trace events are invalid. "
     "Do not use outside knowledge and do not decide correctness from the hidden gold label. Return JSON only."
 )
 
@@ -80,7 +82,8 @@ def build_judge_prompt(
     return (
         "Score the candidate trace on a 0 to 1 scale. A high score requires concrete events, "
         "valid support in the graph, correct edge direction, a pre-target relative time, and a direct "
-        "connection to the proposed answer. Penalize copied placeholders, generic claims, unsupported "
+        "connection to the proposed answer. A trace event must be a distinct future hypothesis even when it cites a historical event. "
+        "Penalize exact or near-verbatim historical copies, copied placeholders, generic claims, unsupported "
         "facts, and answer links that are not explained by the trace.\n\n"
         "Output exactly:\n"
         '{"support":0.0,"causal":0.0,"temporal":0.0,"answer_link":0.0,"hallucination":0.0,"overall":0.0,"reason":"short reason"}\n\n'

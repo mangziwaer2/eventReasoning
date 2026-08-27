@@ -11,6 +11,8 @@ from typing import Any
 from refinement_dataset import EDGE_FEATURE_DIM
 from refinement_dataset import RefinementSample
 from refinement_dataset import RefinementTensorDataset
+from refinement_dataset import ID_TO_RELATION_LABEL
+from refinement_dataset import NUM_RELATION_LABELS
 from refinement_dataset import generate_synthetic_refinement_samples
 from refinement_dataset import load_cached_refinement_samples
 from refinement_dataset import load_maven_refinement_samples
@@ -119,10 +121,13 @@ def print_metrics(prefix: str, metrics: dict[str, float | int | None], elapsed_s
         "loss",
         "keep_loss",
         "strength_loss",
+        "relation_loss",
         "density_loss",
+        "relation_loss",
         "val_loss",
         "val_keep_loss",
         "val_strength_loss",
+        "val_relation_loss",
         "val_density_loss",
         "lr",
     )
@@ -145,6 +150,7 @@ def compute_losses(
     batch: dict[str, Any],
     keep_loss_fn,
     strength_loss_fn,
+    relation_loss_fn,
     loss_weights: dict[str, float],
 ):
     keep_loss = keep_loss_fn(outputs["edge_keep_logits"], batch["edge_labels"])
@@ -158,12 +164,14 @@ def compute_losses(
         strength_loss_fn(outputs["edge_strengths"][positive_mask], batch["edge_strengths"][positive_mask])
         if positive_mask.any() else keep_loss.new_zeros(())
     )
+    relation_loss = relation_loss_fn(outputs["edge_relation_logits"], batch["edge_relation_labels"])
     loss = (
         loss_weights["keep"] * keep_loss
         + loss_weights["strength"] * strength_loss
         + loss_weights["density"] * density_loss
+        + loss_weights["relation"] * relation_loss
     )
-    return loss, keep_loss, strength_loss, density_loss
+    return loss, keep_loss, strength_loss, density_loss, relation_loss
 
 
 def evaluate(
@@ -171,6 +179,7 @@ def evaluate(
     dataloader,
     keep_loss_fn,
     strength_loss_fn,
+    relation_loss_fn,
     loss_weights: dict[str, float],
     torch,
     device,
@@ -181,6 +190,7 @@ def evaluate(
         "val_keep_loss": 0.0,
             "val_strength_loss": 0.0,
         "val_density_loss": 0.0,
+        "val_relation_loss": 0.0,
     }
     batch_count = 0
     with torch.no_grad():
@@ -191,17 +201,19 @@ def evaluate(
                 edge_index=batch["edge_index"],
                 edge_features=batch["edge_features"],
             )
-            loss, keep_loss, strength_loss, density_loss = compute_losses(
+            loss, keep_loss, strength_loss, density_loss, relation_loss = compute_losses(
                 outputs,
                 batch,
                 keep_loss_fn,
-                            strength_loss_fn,
+                strength_loss_fn,
+                relation_loss_fn,
                 loss_weights,
             )
             totals["val_loss"] += float(loss.item())
             totals["val_keep_loss"] += float(keep_loss.item())
             totals["val_strength_loss"] += float(strength_loss.item())
             totals["val_density_loss"] += float(density_loss.item())
+            totals["val_relation_loss"] += float(relation_loss.item())
             batch_count += 1
     if batch_count == 0:
         return None
@@ -474,6 +486,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=1e-4, help="AdamW weight decay.")
     parser.add_argument("--grad-clip", type=float, default=1.0, help="Gradient norm clipping. Use 0 to disable.")
     parser.add_argument("--keep-loss-weight", type=float, default=1.0, help="Weight for edge keep BCE loss.")
+    parser.add_argument("--relation-loss-weight", dest="relation_loss_weight", type=float, default=0.5, help="Weight for predicted relation cross-entropy.")
     parser.add_argument("--type-loss-weight", type=float, default=0.0, help="Deprecated; relation type is preserved from Qwen and is not trained by refinement.")
     parser.add_argument("--type-class-weighting", choices=["auto", "none"], default="none", help="Deprecated compatibility option; ignored.")
     parser.add_argument("--max-type-class-weight", type=float, default=4.0, help="Deprecated compatibility option; ignored.")
@@ -575,10 +588,12 @@ def main() -> None:
         keep_pos_weight = torch.tensor(float(args.keep_pos_weight), dtype=torch.float32, device=device)
     keep_loss_fn = nn.BCEWithLogitsLoss(pos_weight=keep_pos_weight)
     strength_loss_fn = nn.SmoothL1Loss(beta=0.08)
+    relation_loss_fn = nn.CrossEntropyLoss()
     loss_weights = {
         "keep": args.keep_loss_weight,
         "strength": args.strength_loss_weight,
         "density": args.density_loss_weight,
+        "relation": args.relation_loss_weight,
     }
 
     history: list[dict[str, float]] = []
@@ -606,8 +621,8 @@ def main() -> None:
         "parameter_count": sum(parameter.numel() for parameter in model.parameters()),
         "edge_feature_dim": EDGE_FEATURE_DIM,
         "task": "coarse_graph_to_refined_graph",
-        "refinement_model_variant": "graph-editor-v3",
-        "relation_policy": "preserve_qwen_candidate_relation",
+        "refinement_model_variant": "graph-editor-v4",
+        "relation_policy": "predicted_relation_head",
     }
     save_json(output_dir / "train_config.json", config)
 
@@ -645,6 +660,7 @@ def main() -> None:
             "keep_loss": 0.0,
             "strength_loss": 0.0,
             "density_loss": 0.0,
+            "relation_loss": 0.0,
         }
         window_totals = dict(totals)
         batch_count = 0
@@ -659,11 +675,12 @@ def main() -> None:
                     edge_index=batch["edge_index"],
                     edge_features=batch["edge_features"],
                 )
-                loss, keep_loss, strength_loss, density_loss = compute_losses(
+                loss, keep_loss, strength_loss, density_loss, relation_loss = compute_losses(
                     outputs,
                     batch,
                     keep_loss_fn,
-                                    strength_loss_fn,
+                    strength_loss_fn,
+                    relation_loss_fn,
                     loss_weights,
                 )
 
@@ -679,6 +696,7 @@ def main() -> None:
                 "keep_loss": float(keep_loss.item()),
                 "strength_loss": float(strength_loss.item()),
                 "density_loss": float(density_loss.item()),
+                "relation_loss": float(relation_loss.item()),
             }
             for key, value in step_metrics.items():
                 totals[key] += value
@@ -703,13 +721,15 @@ def main() -> None:
             "keep_loss": totals["keep_loss"] / max(batch_count, 1),
             "strength_loss": totals["strength_loss"] / max(batch_count, 1),
             "density_loss": totals["density_loss"] / max(batch_count, 1),
+            "relation_loss": totals["relation_loss"] / max(batch_count, 1),
             "lr": float(optimizer.param_groups[0]["lr"]),
         }
         validation_record = evaluate(
             model,
             validation_dataloader,
             keep_loss_fn,
-                    strength_loss_fn,
+            strength_loss_fn,
+            relation_loss_fn,
             loss_weights,
             torch,
             device,

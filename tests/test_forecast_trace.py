@@ -20,12 +20,52 @@ from forecast_trace_grpo_rewards import ForecastTraceGRPOReward
 from forecast_trace_grpo_rewards import completion_to_text
 from forecast_trace_grpo_rewards import rollout_row_to_grpo_sample
 from forecast_trace_graph import graph_bridge_score
+from evaluate_local_qwen_pipeline import example_from_event_input
+from event_input import parse_event_input_record
 from train_forecast_trace_grpo import filter_rollout_rows_by_edge_count
 from rl_pipeline_hooks import ForecastTraceReward
 from rl_pipeline_hooks import PipelineTrajectory
 
 
 class ForecastTraceTests(unittest.TestCase):
+    def test_mirai_forecast_event_input_supplies_query_and_documents(self) -> None:
+        payload = {
+            "schema_version": "event-input-v1",
+            "sample_id": "mirai_2023-01-01_USA_CAN",
+            "query_id": "2023-01-01_USA_CAN",
+            "query": {
+                "query_id": "2023-01-01_USA_CAN",
+                "text": "As of 2023-01-01, what important event may happen next between United States and Canada?",
+                "cutoff_time": "2023-01-01",
+                "focus_entities": ["United States", "Canada"],
+                "metadata": {"actor1_country_code": "USA", "actor2_country_code": "CAN"},
+            },
+            "documents": [{"document_id": "d1", "title": "Talks", "text": "Officials met."}],
+            "events": [
+                {
+                    "event_id": "e1",
+                    "trigger": "meet",
+                    "mention": "Officials met",
+                    "document_id": "d1",
+                    "sentence_index": 0,
+                    "confidence": 0.8,
+                },
+                {
+                    "event_id": "e2",
+                    "trigger": "announce",
+                    "mention": "Officials announced a plan",
+                    "document_id": "d1",
+                    "sentence_index": 0,
+                    "confidence": 0.8,
+                },
+            ],
+            "metadata": {"answer_list": ["036"]},
+        }
+        example = example_from_event_input(parse_event_input_record(payload))
+        self.assertEqual(example.query_id, "2023-01-01_USA_CAN")
+        self.assertEqual(example.answer_list, ["036"])
+        self.assertEqual(example.docids, ["d1"])
+
     def test_no_refinement_prompt_uses_direct_event_code_without_choices(self) -> None:
         query = QuerySpec(query_id="q1", text="What happens next?", cutoff_time="2024-01-01")
         documents = [NewsDocument(document_id="d1", title="Observed", text="Police warned organizers.")]
@@ -58,13 +98,14 @@ class ForecastTraceTests(unittest.TestCase):
             query=query,
             documents=documents,
             refined_graph=graph,
-            choices=[
-                {"choice_id": "C001", "event_code": "036", "description": "arrest or detain"},
-            ],
         )
 
-        self.assertEqual(bundle.choices, [])
         self.assertNotIn("Choices:\n", bundle.prompt)
+        self.assertNotIn("QueryId:", bundle.prompt)
+        self.assertNotIn("doc=", bundle.prompt)
+        self.assertNotIn("sent=", bundle.prompt)
+        self.assertNotIn("event_id=", bundle.prompt)
+        self.assertNotIn("edge_id=", bundle.prompt)
         self.assertIn('"answers": [{"event_code": "<3-digit-event-code>"', bundle.prompt)
         self.assertIn("Predict every likely closed-set event_code", bundle.prompt)
 
@@ -72,7 +113,6 @@ class ForecastTraceTests(unittest.TestCase):
             query=query,
             documents=documents,
             refined_graph=graph,
-            choices=[],
             context_mode="events-graph",
             max_event_chars=24,
         )
@@ -85,7 +125,7 @@ class ForecastTraceTests(unittest.TestCase):
             '"final_answer": {"event_code": "036", "confidence": 0.8}}'
         )
         self.assertEqual(prediction["predicted_event_base_code"], "036")
-        self.assertEqual(prediction["final_answer"]["choice_id"], "")
+        self.assertNotIn("choice_id", prediction["final_answer"])
 
     def test_structured_forecast_parser_keeps_multi_label_answers(self) -> None:
         prediction = parse_structured_forecast(
@@ -119,7 +159,7 @@ class ForecastTraceTests(unittest.TestCase):
         self.assertEqual(prediction["predicted_event_base_codes"], ["036", "190"])
         self.assertGreater(score, 0.0)
 
-    def test_structured_forecast_parser_accepts_refs_and_choice_id(self) -> None:
+    def test_structured_forecast_parser_accepts_refs_and_event_code(self) -> None:
         raw = """
         {
           "forecast_trace": {
@@ -138,10 +178,10 @@ class ForecastTraceTests(unittest.TestCase):
               {"source_ref": "ft_1", "target_ref": "answer_C001", "relation_type": "raises_likelihood", "confidence": 0.9}
             ]
           },
-          "final_answer": {"choice_id": "C001", "confidence": 0.75}
+          "final_answer": {"event_code": "036", "confidence": 0.75}
         }
         """
-        prediction = parse_structured_forecast(raw, choices=[{"choice_id": "C001", "event_code": "036"}])
+        prediction = parse_structured_forecast(raw)
         self.assertTrue(prediction["parsed_json"])
         self.assertEqual(prediction["predicted_event_base_code"], "036")
         self.assertEqual(prediction["forecast_trace"]["intermediate_events"][0]["supporting_event_ids"], ["H01"])
@@ -166,13 +206,12 @@ class ForecastTraceTests(unittest.TestCase):
                 ],
                 "trace_edges": [
                   {"source_id": "H01", "target_id": "ft_1", "relation_type": "causes", "confidence": 0.8},
-                  {"source_id": "ft_1", "target_id": "answer_C001", "relation_type": "raises_likelihood", "confidence": 0.9}
+                  {"source_id": "ft_1", "target_id": "answer_036", "relation_type": "raises_likelihood", "confidence": 0.9}
                 ]
               },
-              "final_answer": {"choice_id": "C001", "event_code": "036", "confidence": 0.8}
+              "final_answer": {"event_code": "036", "confidence": 0.8}
             }
             """,
-            choices=[{"choice_id": "C001", "event_code": "036"}],
         )
         graph = {
             "events": [{"event_id": "e1", "text": "police warned organizers"}],
@@ -182,7 +221,6 @@ class ForecastTraceTests(unittest.TestCase):
             sample_id="sample_1",
             metadata={
                 "refined_graph": graph,
-                "choices": [{"choice_id": "C001", "event_code": "036"}],
                 "event_ref_to_id": {"H01": "e1"},
                 "edge_ref_to_id": {"R01": "r1"},
             },
@@ -195,7 +233,6 @@ class ForecastTraceTests(unittest.TestCase):
         self.assertGreater(reward["total"], 1.0)
 
     def test_grpo_reward_callable_scores_batch_completion(self) -> None:
-        choices = [{"choice_id": "C001", "event_code": "036"}]
         completion = """
         {
           "forecast_trace": {
@@ -215,7 +252,7 @@ class ForecastTraceTests(unittest.TestCase):
               {"source_id": "H01", "target_id": "ft_1", "relation_type": "causes", "confidence": 0.8}
             ]
           },
-          "final_answer": {"choice_id": "C001", "event_code": "036", "confidence": 0.8}
+          "final_answer": {"event_code": "036", "confidence": 0.8}
         }
         """
         trajectory = PipelineTrajectory(
@@ -235,7 +272,6 @@ class ForecastTraceTests(unittest.TestCase):
             completions=[completion],
             mirai_query=[{"answer_list": ["036"]}],
             trajectory=[trajectory.to_dict()],
-            choices=[choices],
         )
         self.assertEqual(len(rewards), 1)
         self.assertGreater(rewards[0], 1.0)
@@ -243,20 +279,18 @@ class ForecastTraceTests(unittest.TestCase):
         self.assertEqual(reward_fn.last_breakdowns[0]["valid_event_ref_ratio"], 1.0)
 
     def test_grpo_reward_accepts_chat_completion_and_rollout_row_context(self) -> None:
-        choices = [{"choice_id": "C001", "event_code": "036"}]
-        completion = '{"final_answer": {"choice_id": "C001", "event_code": "036", "confidence": 0.8}}'
+        completion = '{"final_answer": {"event_code": "036", "confidence": 0.8}}'
         row = {
             "query_id": "sample_1",
             "forecast_prompt": "Forecast the target event.",
             "forecast_system_prompt": "Return JSON.",
             "mirai_query": {"answer_list": ["036"]},
-            "choices": choices,
             "trajectory": PipelineTrajectory(sample_id="sample_1").to_dict(),
         }
         sample = rollout_row_to_grpo_sample(row)
         self.assertEqual(sample["prompt"][0]["content"], "Return JSON.")
         self.assertEqual(sample["query_id"], "sample_1")
-        self.assertEqual(__import__("json").loads(sample["reward_context"])["choices"], choices)
+        self.assertNotIn("choices", __import__("json").loads(sample["reward_context"]))
 
         reward_fn = ForecastTraceGRPOReward()
         rewards = reward_fn(
@@ -273,7 +307,6 @@ class ForecastTraceTests(unittest.TestCase):
             "forecast_prompt": "Forecast the target event directly.",
             "forecast_system_prompt": "Return forecast_trace and event_code JSON.",
             "mirai_query": {"answer_list": ["036"]},
-            "choices": [],
             "trajectory": PipelineTrajectory(sample_id="sample_no_choices").to_dict(),
         }
         reward_fn = ForecastTraceGRPOReward()
@@ -344,6 +377,32 @@ class ForecastTraceTests(unittest.TestCase):
         self.assertEqual(ungrounded_reward["answer"], 0.0)
         self.assertGreater(grounded_reward["total"], ungrounded_reward["total"])
         self.assertLess(grounded_reward["trace"], grounded_reward["trace_unscaled"])
+
+    def test_reward_penalizes_restatement_of_historical_event(self) -> None:
+        graph = {
+            "events": [{"event_id": "e1", "text": "police warned organizers"}],
+            "edges": [{"edge_id": "r1", "source_event_id": "e1", "target_event_id": "e1", "score": 0.9}],
+        }
+        trajectory = PipelineTrajectory(
+            sample_id="sample_copy",
+            metadata={
+                "refined_graph": graph,
+                "event_ref_to_id": {"H01": "e1"},
+                "edge_ref_to_id": {"R01": "r1"},
+            },
+        )
+        copied = parse_structured_forecast(
+            '{"forecast_trace":{"intermediate_events":[{"event":"police warned organizers","relative_time":"t-1","supporting_event_ids":["H01"],"supporting_edge_ids":["R01"]}],"trace_edges":[{"source_id":"H01","target_id":"ft_1","relation_type":"causes"}]},"final_answer":{"event_code":"036"}}'
+        )
+        distinct = parse_structured_forecast(
+            '{"forecast_trace":{"intermediate_events":[{"event":"police may arrest organizers","relative_time":"t-1","supporting_event_ids":["H01"],"supporting_edge_ids":["R01"]}],"trace_edges":[{"source_id":"H01","target_id":"ft_1","relation_type":"causes"}]},"final_answer":{"event_code":"036"}}'
+        )
+        reward_fn = ForecastTraceReward()
+        copied_reward = reward_fn(copied, {"answer_list": ["036"]}, trajectory)
+        distinct_reward = reward_fn(distinct, {"answer_list": ["036"]}, trajectory)
+        self.assertEqual(copied_reward["historical_copy_penalty"], 1.0)
+        self.assertEqual(distinct_reward["historical_copy_penalty"], 0.0)
+        self.assertLess(copied_reward["total"], distinct_reward["total"])
 
     def test_coarse_pair_parser_prefers_confidence_and_accepts_score(self) -> None:
         parsed = parse_pair_payload('{"relation_type": "none", "confidence": 1.0}')

@@ -127,8 +127,6 @@ def build_trajectory(row: dict[str, Any]) -> PipelineTrajectory:
                 metadata=dict(step.get("metadata", {})) if isinstance(step.get("metadata"), dict) else {},
             )
         )
-    if "choices" in row:
-        trajectory.metadata.setdefault("choices", row["choices"])
     return trajectory
 
 
@@ -186,7 +184,6 @@ def parsed_completion(prediction: dict[str, Any]) -> str:
             ],
         },
         "final_answer": {
-            "choice_id": final_answer.get("choice_id", ""),
             "event_code": final_answer.get("event_code", prediction.get("predicted_event_base_code", "")),
             "event": final_answer.get("event", prediction.get("forecast_event", "")),
             "confidence": final_answer.get("confidence", prediction.get("confidence", 0.0)),

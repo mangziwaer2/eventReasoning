@@ -43,7 +43,7 @@ class TemporalRelationalEdgeRefiner(nn.Module):
 
     The model consumes a noisy candidate graph, performs relational message
     passing, then predicts each candidate edge's keep/drop decision, relation type,
-    and strength. The relation string is copied from the Qwen candidate and is never retyped.
+    and strength.
     """
 
     def __init__(
@@ -53,12 +53,14 @@ class TemporalRelationalEdgeRefiner(nn.Module):
         hidden_dim: int = 192,
         num_message_passing_steps: int = 4,
         num_relations: int = 4,
+        num_relation_labels: int = 5,
         dropout: float = 0.1,
     ) -> None:
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_message_passing_steps = num_message_passing_steps
         self.num_relations = num_relations
+        self.num_relation_labels = num_relation_labels
         self.edge_dim = edge_dim
 
         self.edge_scalar_dim = edge_dim - 1
@@ -129,6 +131,7 @@ class TemporalRelationalEdgeRefiner(nn.Module):
             MLP(edge_head_input_dim, hidden_dim, 1, dropout=dropout),
             nn.Sigmoid(),
         )
+        self.relation_head = MLP(edge_head_input_dim, hidden_dim, num_relation_labels, dropout=dropout)
 
     def _split_edge_features(
         self,
@@ -304,6 +307,7 @@ class TemporalRelationalEdgeRefiner(nn.Module):
             return {
                 "edge_keep_logits": torch.empty(0, device=node_features.device),
                 "edge_strengths": torch.empty(0, device=node_features.device),
+                "edge_relation_logits": torch.empty((0, self.num_relation_labels), device=node_features.device),
             }
 
         edge_scalar_features, relation_ids, time_features, reverse_time_features = self._split_edge_features(edge_features)
@@ -355,8 +359,10 @@ class TemporalRelationalEdgeRefiner(nn.Module):
 
         edge_keep_logits = self.keep_head(edge_context).squeeze(-1) + 0.5 * coarse_prior_logit + source_bias
         edge_strengths = self.strength_head(edge_context).squeeze(-1)
+        edge_relation_logits = self.relation_head(edge_context)
 
         return {
             "edge_keep_logits": edge_keep_logits,
             "edge_strengths": edge_strengths,
+            "edge_relation_logits": edge_relation_logits,
         }

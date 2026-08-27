@@ -9,6 +9,8 @@ from causal_graph import CoarseCausalGraph
 from coarse_graph_dataset import apply_temporal_dag_topology
 from coarse_graph_dataset import load_coarse_graph
 from refinement_dataset import RELATION_TO_ID
+from refinement_dataset import ID_TO_RELATION_LABEL
+from refinement_dataset import NUM_RELATION_LABELS
 from refinement_dataset import EDGE_FEATURE_DIM
 from refinement_dataset import load_refinement_sample_from_coarse_graph
 from path_utils import REPO_ROOT
@@ -42,10 +44,10 @@ def load_model_config(
     config = {}
     if config_path.exists():
         config = json.loads(config_path.read_text(encoding="utf-8"))
-        if config.get("refinement_model_variant") != "graph-editor-v3":
+        if config.get("refinement_model_variant") != "graph-editor-v4":
             raise RuntimeError(
-                "This refinement checkpoint uses the retired query/frontier architecture. "
-                "Retrain with the graph-editor-v3 implementation; old checkpoints are not compatible."
+                "This refinement checkpoint is not relation-head graph-editor-v4. "
+                "Rebuild the cache and retrain; old checkpoints are not compatible."
             )
     resolved_hidden_dim = hidden_dim if hidden_dim is not None else int(config.get("hidden_dim", 192))
     resolved_message_steps = message_steps if message_steps is not None else int(config.get("message_steps", 4))
@@ -68,6 +70,7 @@ def build_refined_graph(
     strength_predictions: list[float],
     keep_threshold: float,
     topology_mode: str = "none",
+    relation_predictions: list[str] | None = None,
 ) -> CoarseCausalGraph:
     refined_edges: list[CoarseCausalEdge] = []
     coarse_lookup = {
@@ -89,7 +92,14 @@ def build_refined_graph(
         target_event = event_lookup.get(target_event_id)
         if source_event is None or target_event is None:
             continue
-        relation_type = str(edge_desc.get("coarse_relation_type", "")).strip().lower()
+        relation_index = edge_index
+        relation_type = (
+            str(relation_predictions[relation_index]).strip().lower()
+            if relation_predictions is not None and relation_index < len(relation_predictions)
+            else str(edge_desc.get("coarse_relation_type", "")).strip().lower()
+        )
+        if relation_predictions is not None and relation_type == "none":
+            continue
         if not relation_type and edge is not None:
             relation_type = edge.relation_type
         if relation_type not in RELATION_TO_ID:
@@ -131,6 +141,7 @@ def summarize_edges(
     edge_descriptions: list[dict[str, object]],
     keep_probs: list[float],
     strength_predictions: list[float],
+    relation_predictions: list[str] | None = None,
 ) -> list[dict[str, object]]:
     preview: list[dict[str, object]] = []
     for edge_desc, keep_prob, strength_prediction in zip(
@@ -146,7 +157,11 @@ def summarize_edges(
                 "target_text": edge_desc.get("target_text", ""),
                 "candidate_source": edge_desc.get("candidate_source", "coarse"),
                 "coarse_relation_type": edge_desc.get("coarse_relation_type", ""),
-                "pred_relation_type": edge_desc.get("coarse_relation_type", "precedes"),
+                "pred_relation_type": (
+                    relation_predictions[index]
+                    if relation_predictions is not None and index < len(relation_predictions)
+                    else edge_desc.get("coarse_relation_type", "precedes")
+                ),
                 "coarse_score": edge_desc.get("coarse_score", 0.0),
                 "pred_strength": round(float(strength_prediction), 4),
                 "keep_probability": round(float(keep_prob), 4),
@@ -200,6 +215,10 @@ def main() -> None:
 
     keep_probs = torch.sigmoid(outputs["edge_keep_logits"]).tolist()
     strength_predictions = outputs["edge_strengths"].tolist()
+    relation_predictions = [
+        ID_TO_RELATION_LABEL.get(int(logits.argmax().item()), "none")
+        for logits in outputs["edge_relation_logits"]
+    ]
 
     coarse_graph = load_coarse_graph(resolve_repo_path(args.coarse_graph))
     edge_descriptions = list(sample.metadata.get("edge_descriptions", []))
@@ -208,6 +227,7 @@ def main() -> None:
         edge_descriptions=edge_descriptions,
         keep_probs=keep_probs,
         strength_predictions=strength_predictions,
+        relation_predictions=relation_predictions,
         keep_threshold=args.keep_threshold,
         topology_mode=args.topology_mode,
     )
@@ -215,6 +235,7 @@ def main() -> None:
         edge_descriptions=edge_descriptions,
         keep_probs=keep_probs,
         strength_predictions=strength_predictions,
+        relation_predictions=relation_predictions,
     )
 
     result = {
@@ -223,6 +244,7 @@ def main() -> None:
         "refinement_output": {
             "edge_keep_probabilities": keep_probs,
             "edge_strengths": strength_predictions,
+            "edge_relation_predictions": relation_predictions,
         },
         "refined_edges_preview": refined_edges_preview,
         "refined_graph": refined_graph.to_dict(),

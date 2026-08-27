@@ -155,7 +155,7 @@ def build_cache_manifest(
     complete: bool,
 ) -> dict[str, Any]:
     return {
-        "schema_version": "maven-ere-qwen-refinement-v2",
+        "schema_version": "maven-ere-qwen-refinement-v3",
         "coarse_input_contract": "events-mentions-v1",
         "complete": complete,
         "config": vars(args),
@@ -317,7 +317,7 @@ def main() -> None:
                 negative_completion_ratio=args.negative_completion_ratio,
                 max_completion_edges=args.max_completion_edges or None,
                 seed=args.seed + row_index,
-                include_missing_gold_pairs=False,
+                include_missing_gold_pairs=True,
             )
 
             pair_rows = []
@@ -333,7 +333,7 @@ def main() -> None:
                     }
                 )
             entry = {
-                "schema_version": "maven-ere-qwen-refinement-v2",
+                "schema_version": "maven-ere-qwen-refinement-v3",
                 "sample_id": document_sample.sample_id,
                 "gold_graph": gold_graph.to_dict(),
                 "coarse_graph": coarse_graph.to_dict(),
@@ -348,7 +348,7 @@ def main() -> None:
                     "coarse_keep_threshold": args.coarse_keep_threshold,
                     "coarse_topology_mode": args.coarse_topology_mode,
                     "coarse_input_contract": "events-mentions-v1",
-                    "gold_completion_candidates_enabled": False,
+                    "gold_completion_candidates_enabled": True,
                 },
             }
             handle.write(json.dumps(entry, ensure_ascii=False) + "\n")

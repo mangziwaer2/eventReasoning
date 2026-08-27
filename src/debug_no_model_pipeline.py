@@ -214,14 +214,13 @@ def main() -> None:
         refined_graph=refined_graph,
     )
     raw_forecast = mock_forecast_json(prompt_bundle, gold=gold)
-    forecast_prediction = parse_structured_forecast(raw_forecast, choices=prompt_bundle.choices)
+    forecast_prediction = parse_structured_forecast(raw_forecast)
 
     trajectory = PipelineTrajectory(
         sample_id=document_sample.sample_id,
         metadata={
             "policy": args.policy,
             "query": document_sample.query.to_dict(),
-            "choices": [],
             "event_ref_to_id": prompt_bundle.event_ref_to_id,
             "edge_ref_to_id": prompt_bundle.edge_ref_to_id,
             "refined_graph": refined_graph.to_dict(),
@@ -257,7 +256,6 @@ def main() -> None:
         reward=reward,
         metadata={
             "prediction_mode": "forecast-trace",
-            "choices": [],
             "event_ref_to_id": prompt_bundle.event_ref_to_id,
             "edge_ref_to_id": prompt_bundle.edge_ref_to_id,
             "refined_graph": refined_graph.to_dict(),
@@ -275,7 +273,6 @@ def main() -> None:
             "query": document_sample.query.to_dict(),
             "documents": [document.to_dict() for document in document_sample.documents],
             "events": [event.to_dict() for event in document_sample.events],
-            "choices": [],
             "gold": gold,
         },
         "coarse": {
@@ -334,7 +331,6 @@ def main() -> None:
         "forecast_prediction": forecast_prediction,
         "reward": reward,
         "reward_breakdown": reward_breakdown,
-        "choices": [],
         "trajectory": trajectory.to_dict(),
     }
     row_text = json.dumps(row, ensure_ascii=False) + "\n"

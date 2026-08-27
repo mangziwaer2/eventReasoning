@@ -44,10 +44,10 @@ def resolve_edge_ref(ref: str, edge_ref_to_id: dict[str, str] | None = None) -> 
 
 def answer_aliases(final_answer: dict[str, Any], answers: list[dict[str, Any]] | None = None) -> set[str]:
     aliases: set[str] = {"answers"} if answers else set()
-    values = [final_answer.get("choice_id", ""), final_answer.get("event_code", "")]
+    values = [final_answer.get("event_code", "")]
     for answer in answers or []:
         if isinstance(answer, dict):
-            values.extend([answer.get("choice_id", ""), answer.get("event_code", "")])
+            values.append(answer.get("event_code", ""))
     for raw_value in values:
         value = str(raw_value).strip()
         if not value:

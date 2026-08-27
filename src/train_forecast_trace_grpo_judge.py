@@ -46,6 +46,7 @@ def main() -> None:
                 sample_audit_path=kwargs.get("sample_audit_path"),
                 sample_audit_every=kwargs.get("sample_audit_every", 1),
                 sample_audit_limit=kwargs.get("sample_audit_limit", 2),
+                sample_human_path=kwargs.get("sample_human_path"),
             )
 
     base_grpo.ForecastTraceGRPOReward = ConfiguredJudgeReward

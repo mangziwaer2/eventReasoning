@@ -19,6 +19,7 @@ from local_qwen_lora import load_qwen_for_inference
 from path_utils import REPO_ROOT
 from path_utils import resolve_repo_path
 from refinement_dataset import EDGE_FEATURE_DIM
+from refinement_dataset import ID_TO_RELATION_LABEL
 from refinement_dataset import load_refinement_sample_from_coarse_graph
 from run_refinement import build_refined_graph
 from run_refinement import load_model_config
@@ -272,11 +273,16 @@ def run_refinement_model(model, torch, device, refinement_sample, keep_threshold
         )
     keep_probs = torch.sigmoid(outputs["edge_keep_logits"]).detach().cpu().tolist()
     strength_predictions = outputs["edge_strengths"].detach().cpu().tolist()
+    relation_predictions = [
+        ID_TO_RELATION_LABEL.get(int(logits.argmax().item()), "none")
+        for logits in outputs["edge_relation_logits"].detach().cpu()
+    ]
     refined_graph = build_refined_graph(
         coarse_graph=coarse_graph,
         edge_descriptions=list(refinement_sample.metadata.get("edge_descriptions", [])),
         keep_probs=keep_probs,
         strength_predictions=strength_predictions,
+        relation_predictions=relation_predictions,
         keep_threshold=keep_threshold,
         topology_mode=topology_mode,
     )

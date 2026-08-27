@@ -4,6 +4,7 @@ import argparse
 import json
 import random
 from dataclasses import dataclass
+from dataclasses import field
 from datetime import datetime
 from datetime import timezone
 from pathlib import Path
@@ -35,6 +36,15 @@ RELATION_TO_ID = {
     "mitigates": 3,
 }
 ID_TO_RELATION = {value: key for key, value in RELATION_TO_ID.items()}
+RELATION_LABEL_TO_ID = {"none": 0, **{name: index + 1 for name, index in RELATION_TO_ID.items()}}
+ID_TO_RELATION_LABEL = {value: key for key, value in RELATION_LABEL_TO_ID.items()}
+NUM_RELATION_LABELS = len(RELATION_LABEL_TO_ID)
+GOLD_RELATION_PRIORITY = {
+    "causes": 4,
+    "escalates": 3,
+    "mitigates": 2,
+    "precedes": 1,
+}
 TIME_NORMALIZATION_DAYS = 30.0
 MAX_RELATIVE_TIME_VALUE = 365.0
 EDGE_FEATURE_DIM = 20
@@ -50,6 +60,7 @@ class RefinementSample:
     edge_labels: list[int]
     edge_strengths: list[float]
     metadata: dict[str, Any]
+    edge_relation_labels: list[int] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -59,6 +70,7 @@ class RefinementSample:
             "edge_features": self.edge_features,
             "edge_labels": self.edge_labels,
             "edge_strengths": self.edge_strengths,
+            "edge_relation_labels": self.edge_relation_labels,
             "metadata": self.metadata,
         }
 
@@ -86,6 +98,18 @@ def refinement_sample_from_dict(data: dict[str, Any]) -> RefinementSample:
             f"Refinement sample {data['sample_id']!r} has {edge_count} edges but misaligned fields: {misaligned}"
         )
 
+    relation_labels = data.get("edge_relation_labels")
+    if relation_labels is None:
+        relation_labels = []
+        for index, edge in enumerate(data.get("metadata", {}).get("edge_descriptions", [])):
+            relation = str(edge.get("gold_relation_type", "")).strip().lower()
+            relation_labels.append(RELATION_LABEL_TO_ID.get(relation, 1 if data["edge_labels"][index] else 0))
+        if len(relation_labels) != edge_count:
+            relation_labels = [1 if label else 0 for label in data["edge_labels"]]
+    if len(relation_labels) != edge_count:
+        raise ValueError(
+            f"Refinement sample {data['sample_id']!r} has misaligned edge_relation_labels."
+        )
     return RefinementSample(
         sample_id=str(data["sample_id"]),
         node_features=[[float(value) for value in row] for row in data["node_features"]],
@@ -93,6 +117,7 @@ def refinement_sample_from_dict(data: dict[str, Any]) -> RefinementSample:
         edge_features=[[float(value) for value in row] for row in data["edge_features"]],
         edge_labels=[int(value) for value in data["edge_labels"]],
         edge_strengths=[float(value) for value in data["edge_strengths"]],
+        edge_relation_labels=[int(value) for value in relation_labels],
         metadata=dict(data.get("metadata", {})),
     )
 
@@ -108,6 +133,9 @@ class RefinementTensorDataset(Dataset):
         if torch is None:
             raise RuntimeError("RefinementTensorDataset requires torch in the active environment.")
         sample = self.samples[index]
+        relation_labels = sample.edge_relation_labels
+        if len(relation_labels) != len(sample.edge_index):
+            relation_labels = [0] * len(sample.edge_index)
         return {
             "sample_id": sample.sample_id,
             "node_features": torch.tensor(sample.node_features, dtype=torch.float32),
@@ -115,6 +143,7 @@ class RefinementTensorDataset(Dataset):
             "edge_features": torch.tensor(sample.edge_features, dtype=torch.float32),
             "edge_labels": torch.tensor(sample.edge_labels, dtype=torch.float32),
             "edge_strengths": torch.tensor(sample.edge_strengths, dtype=torch.float32),
+            "edge_relation_labels": torch.tensor(relation_labels, dtype=torch.long),
             "metadata": sample.metadata,
         }
 
@@ -572,11 +601,17 @@ def gold_and_coarse_graph_to_refinement_sample(
         event_ids=set(node_id_to_index.keys()),
     )
 
-    gold_edge_map = {(edge.source_event_id, edge.target_event_id): edge for edge in gold_graph.edges}
+    gold_edge_map: dict[tuple[str, str], CoarseCausalEdge] = {}
+    for gold_edge in gold_graph.edges:
+        pair = (gold_edge.source_event_id, gold_edge.target_event_id)
+        current = gold_edge_map.get(pair)
+        if current is None or GOLD_RELATION_PRIORITY.get(gold_edge.relation_type, 0) > GOLD_RELATION_PRIORITY.get(current.relation_type, 0):
+            gold_edge_map[pair] = gold_edge
     edge_index: list[list[int]] = []
     edge_features: list[list[float]] = []
     edge_labels: list[int] = []
     edge_strengths: list[float] = []
+    edge_relation_labels: list[int] = []
     edge_descriptions: list[dict[str, Any]] = []
 
     for edge in candidate_edges:
@@ -606,6 +641,7 @@ def gold_and_coarse_graph_to_refinement_sample(
             edge_labels.append(0)
             edge_strengths.append(0.0)
             gold_relation = "none"
+        edge_relation_labels.append(RELATION_LABEL_TO_ID.get(gold_relation, 0))
         edge_descriptions.append(
             {
                 "source_event_id": edge.source_event_id,
@@ -628,6 +664,7 @@ def gold_and_coarse_graph_to_refinement_sample(
         edge_features=edge_features,
         edge_labels=edge_labels,
         edge_strengths=edge_strengths,
+        edge_relation_labels=edge_relation_labels,
         metadata={
             "query_id": gold_graph.query.query_id,
             "dataset": gold_graph.query.metadata.get("dataset", "unknown"),
@@ -709,10 +746,10 @@ def load_cached_refinement_samples(
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         if not isinstance(manifest, dict):
             raise ValueError(f"MAVEN Qwen cache manifest is not a JSON object: {manifest_path}")
-        if manifest.get("schema_version") != "maven-ere-qwen-refinement-v2":
+        if manifest.get("schema_version") != "maven-ere-qwen-refinement-v3":
             raise RuntimeError(
                 "MAVEN Qwen cache uses an unsupported schema. Rebuild it so the "
-                "events-mentions-v1 input contract is recorded."
+                "multi-task relation-head and completion-candidate contract is recorded."
             )
         if manifest.get("coarse_input_contract") != "events-mentions-v1":
             raise RuntimeError(
@@ -790,6 +827,7 @@ def load_refinement_sample_from_coarse_graph(
     edge_features: list[list[float]] = []
     edge_labels: list[int] = []
     edge_strengths: list[float] = []
+    edge_relation_labels: list[int] = []
     edge_descriptions: list[dict[str, Any]] = []
 
     for edge in candidate_edges:
@@ -811,6 +849,7 @@ def load_refinement_sample_from_coarse_graph(
         )
         edge_labels.append(0)
         edge_strengths.append(float(edge.score))
+        edge_relation_labels.append(0)
         edge_descriptions.append(
             {
                 "source_event_id": edge.source_event_id,
@@ -839,6 +878,7 @@ def load_refinement_sample_from_coarse_graph(
         edge_features=edge_features,
         edge_labels=edge_labels,
         edge_strengths=edge_strengths,
+        edge_relation_labels=edge_relation_labels,
         metadata={
             "query_id": graph.query.query_id,
             "dataset": graph.query.metadata.get("dataset", "unknown"),
@@ -882,6 +922,7 @@ def generate_synthetic_refinement_samples(num_samples: int = 32, seed: int = 7) 
         edge_features: list[list[float]] = []
         edge_labels: list[int] = []
         edge_strengths: list[float] = []
+        edge_relation_labels: list[int] = []
         used_pairs: set[tuple[int, int]] = set()
 
         while len(edge_index) < edge_count:
@@ -925,6 +966,7 @@ def generate_synthetic_refinement_samples(num_samples: int = 32, seed: int = 7) 
             )
             edge_labels.append(int(coarse_score >= 0.62))
             edge_strengths.append(coarse_score)
+            edge_relation_labels.append(RELATION_LABEL_TO_ID.get(relation_names[relation_id], 0))
 
         samples.append(
             RefinementSample(
@@ -933,7 +975,8 @@ def generate_synthetic_refinement_samples(num_samples: int = 32, seed: int = 7) 
                 edge_index=edge_index,
                 edge_features=edge_features,
                 edge_labels=edge_labels,
-                        edge_strengths=edge_strengths,
+                edge_strengths=edge_strengths,
+                edge_relation_labels=edge_relation_labels,
                 metadata={
                     "synthetic": True,
                     "query_text": "synthetic query",

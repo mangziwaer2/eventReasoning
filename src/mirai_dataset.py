@@ -130,44 +130,75 @@ def load_mirai_queries(zip_path: Path, split: str = "test", limit: int = 0) -> l
     return examples
 
 
-def load_mirai_event_code_choices(zip_path: Path, max_choices: int = 0) -> list[dict[str, object]]:
-    """Return dataset-level event-code choices without using per-query gold answers."""
+def load_mirai_event_codebook(source_path: Path, max_codes: int = 0) -> list[dict[str, object]]:
+    """Return dataset-level event-code descriptions without using per-query gold answers."""
     code_counts: Counter[str] = Counter()
     code_names: dict[str, Counter[str]] = {}
-    with zipfile.ZipFile(zip_path) as archive:
-        member_name = "MIRAI/data_kg.csv"
-        with archive.open(member_name) as handle:
-            reader = csv.DictReader(
-                io.TextIOWrapper(handle, encoding="utf-8", errors="replace"),
-                delimiter="\t",
-            )
-            for row in reader:
-                code = str(row.get("EventBaseCode", "")).strip()
-                if not code:
-                    continue
-                code_counts[code] += 1
-                relation_name = str(row.get("RelName", "")).strip()
-                if relation_name:
-                    code_names.setdefault(code, Counter())[relation_name] += 1
+    hierarchy: dict[str, object] = {}
+    if source_path.is_dir() or source_path.suffix.lower() == ".jsonl":
+        input_paths = sorted(source_path.glob("*.jsonl")) if source_path.is_dir() else [source_path]
+        for input_path in input_paths:
+            with input_path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    if not line.strip():
+                        continue
+                    row = json.loads(line)
+                    targets = row.get("targets", {}) if isinstance(row, dict) else {}
+                    target_events = targets.get("events", []) if isinstance(targets, dict) else []
+                    for event in target_events:
+                        if not isinstance(event, dict):
+                            continue
+                        code = str(event.get("event_code", "")).strip()
+                        if not code:
+                            continue
+                        code_counts[code] += 1
+                        relation_name = str(event.get("relation_name", "")).strip()
+                        if relation_name:
+                            code_names.setdefault(code, Counter())[relation_name] += 1
+    else:
+        with zipfile.ZipFile(source_path) as archive:
+            try:
+                hierarchy = json.loads(archive.read("info/dict_code2relation.json"))
+            except (KeyError, json.JSONDecodeError):
+                hierarchy = {}
+            member_name = "MIRAI/data_kg.csv"
+            with archive.open(member_name) as handle:
+                reader = csv.DictReader(
+                    io.TextIOWrapper(handle, encoding="utf-8", errors="replace"),
+                    delimiter="\t",
+                )
+                for row in reader:
+                    code = str(row.get("EventBaseCode", "")).strip()
+                    if not code:
+                        continue
+                    code_counts[code] += 1
+                    relation_name = str(row.get("RelName", "")).strip()
+                    if relation_name:
+                        code_names.setdefault(code, Counter())[relation_name] += 1
 
     ranked_codes = sorted(code_counts, key=lambda code: (-code_counts[code], code))
-    if max_choices and max_choices > 0:
-        ranked_codes = ranked_codes[:max_choices]
+    if max_codes and max_codes > 0:
+        ranked_codes = ranked_codes[:max_codes]
     ranked_codes = sorted(ranked_codes)
-    choices: list[dict[str, object]] = []
-    for index, code in enumerate(ranked_codes, start=1):
+    codebook: list[dict[str, object]] = []
+    for code in ranked_codes:
         description = ""
         if code in code_names and code_names[code]:
             description = code_names[code].most_common(1)[0][0]
-        choices.append(
+        codebook.append(
             {
-                "choice_id": f"C{index:03d}",
                 "event_code": code,
                 "description": description,
-                "metadata": {"dataset_frequency": code_counts[code]},
+                "metadata": {
+                    "dataset_frequency": code_counts[code],
+                    "family_code": code[:2],
+                    "subtype_digit": code[2:] if len(code) > 2 else "",
+                    "family_name": str(hierarchy.get(code[:2], {}).get("Name", "")) if isinstance(hierarchy, dict) else "",
+                    "family_description": str(hierarchy.get(code[:2], {}).get("Description", "")) if isinstance(hierarchy, dict) else "",
+                },
             }
         )
-    return choices
+    return codebook
 
 
 def get_mirai_query_by_id(zip_path: Path, query_id: str, split: str = "test") -> MiraiQueryExample:

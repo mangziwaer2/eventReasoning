@@ -52,12 +52,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--input",
         nargs="+",
-        default=[str(REPO_ROOT / "outputs" / "grpo_context_mirai_rule_train_no_refine" / "grpo_context.jsonl")],
+        default=[str(REPO_ROOT / "outputs" / "grpo_context_mirai_forecast_train_no_refine" / "grpo_context.jsonl")],
         help="Prompt-only GRPO context JSONL files from the prepare-grpo-context stage.",
     )
     parser.add_argument("--allow-legacy-rollout-input", action="store_true", help="Allow old predictions.jsonl rows; disabled by default for online-only training.")
     parser.add_argument("--model-path", default=str(REPO_ROOT / "models" / "Qwen3-4B"))
-    parser.add_argument("--adapter-path", default=None, help="Required SFT LoRA adapter from train_forecast_code_sft.py stage forecast.")
+    parser.add_argument("--adapter-path", default=None, help="Required SFT LoRA adapter from the single-stage codebook+forecast SFT.")
     parser.add_argument("--output-dir", default=str(REPO_ROOT / "outputs" / "forecast_trace_grpo"))
     parser.add_argument("--policy", default="forecast_trace_reward")
     parser.add_argument("--reward-key", default="total", help="Reward breakdown key passed to GRPO.")
@@ -203,7 +203,7 @@ def main() -> None:
     if args.min_coarse_edges < 0:
         raise ValueError("--min-coarse-edges must be non-negative.")
     if not args.adapter_path:
-        raise ValueError("--adapter-path is required: start GRPO from the completed stage-forecast SFT adapter.")
+        raise ValueError("--adapter-path is required: start GRPO from the completed codebook+forecast SFT adapter.")
     if args.num_generations < 2:
         raise ValueError("--num-generations must be at least 2 for GRPO group-relative advantages.")
     if args.per_device_train_batch_size < args.num_generations:
@@ -222,7 +222,7 @@ def main() -> None:
     log_path = output_dir / "training.log"
     if log_path.exists():
         log_path.unlink()
-    for audit_name in ("reward_history.jsonl", "rollout_samples.jsonl"):
+    for audit_name in ("reward_history.jsonl", "rollout_samples.jsonl", "sample_generations.txt"):
         audit_path = output_dir / audit_name
         if audit_path.exists():
             audit_path.unlink()
@@ -312,6 +312,7 @@ def main() -> None:
                 sample_audit_path=output_dir / "rollout_samples.jsonl",
                 sample_audit_every=args.sample_log_every,
                 sample_audit_limit=args.sample_log_count,
+                sample_human_path=output_dir / "sample_generations.txt",
             )
             config = build_training_config(GRPOConfig, args)
             trainer = build_trainer(GRPOTrainer, model, tokenizer, config, dataset, reward_fn)

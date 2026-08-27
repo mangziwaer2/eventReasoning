@@ -192,25 +192,13 @@ def normalize_forecast_trace(payload: Any) -> dict[str, Any]:
     }
 
 
-def normalize_final_answer(payload: Any, choices: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+def normalize_final_answer(payload: Any) -> dict[str, Any]:
     if not isinstance(payload, dict):
         payload = {}
-    choice_id = str(payload.get("choice_id", payload.get("answer_choice", ""))).strip()
     event_code = str(payload.get("event_code", payload.get("predicted_event_base_code", ""))).strip()
-    if not event_code and choice_id and choices:
-        for choice in choices:
-            if str(choice.get("choice_id", "")).strip() == choice_id:
-                event_code = str(choice.get("event_code", "")).strip()
-                break
-    if not choice_id and event_code and choices:
-        for choice in choices:
-            if str(choice.get("event_code", "")).strip() == event_code:
-                choice_id = str(choice.get("choice_id", "")).strip()
-                break
     support_event_ids = _support_event_refs(payload)
     support_edge_ids = _support_edge_refs(payload)
     return {
-        "choice_id": choice_id,
         "event_code": event_code,
         "event_description": str(payload.get("event_description", payload.get("description", payload.get("event", payload.get("forecast_event", ""))))).strip(),
         "event": str(payload.get("event", payload.get("forecast_event", payload.get("event_description", payload.get("description", ""))))).strip(),
@@ -221,7 +209,7 @@ def normalize_final_answer(payload: Any, choices: list[dict[str, Any]] | None = 
     }
 
 
-def parse_structured_forecast(raw_response: str, choices: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+def parse_structured_forecast(raw_response: str) -> dict[str, Any]:
     payload = extract_first_json_object(raw_response)
     tagged_trace = extract_tagged_json_object(raw_response, "forecast_trace")
     tagged_answer = extract_tagged_json_object(raw_response, "final_answer")
@@ -236,7 +224,6 @@ def parse_structured_forecast(raw_response: str, choices: list[dict[str, Any]] |
     final_answer_payload: Any = tagged_answer if tagged_answer is not None else payload.get("final_answer")
     if final_answer_payload is None:
         final_answer_payload = {
-            "choice_id": payload.get("choice_id", payload.get("answer_choice", "")),
             "event_code": payload.get("event_code", payload.get("predicted_event_base_code", "")),
             "forecast_event": payload.get("forecast_event", ""),
             "event_description": payload.get("event_description", payload.get("description", "")),
@@ -250,10 +237,10 @@ def parse_structured_forecast(raw_response: str, choices: list[dict[str, Any]] |
         final_answer_payload = {"event_code": code_match.group(0) if code_match else "", "confidence": 0.0}
 
     forecast_trace = normalize_forecast_trace(forecast_trace_payload)
-    final_answer = normalize_final_answer(final_answer_payload, choices=choices)
+    final_answer = normalize_final_answer(final_answer_payload)
     answer_items = payload.get("answers", [])
     normalized_answers = [
-        normalize_final_answer(item, choices=choices)
+        normalize_final_answer(item)
         for item in answer_items
         if isinstance(item, dict)
     ] if isinstance(answer_items, list) else []

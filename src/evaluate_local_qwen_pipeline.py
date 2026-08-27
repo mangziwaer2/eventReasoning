@@ -35,9 +35,11 @@ from local_qwen_lora import load_qwen_for_inference
 from mirai_dataset import export_mirai_query_snapshot
 from mirai_dataset import load_mirai_news_for_docids
 from mirai_dataset import load_mirai_queries
+from mirai_dataset import MiraiQueryExample
 from path_utils import REPO_ROOT
 from path_utils import resolve_repo_path
 from refinement_dataset import EDGE_FEATURE_DIM
+from refinement_dataset import ID_TO_RELATION_LABEL
 from refinement_dataset import load_refinement_sample_from_coarse_graph
 from rl_pipeline_hooks import PipelineTrajectory
 from rl_pipeline_hooks import build_pipeline_policy
@@ -67,7 +69,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--forecast-adapter-path", default=None, help="Optional LoRA B adapter path for structured forecasting.")
 
     parser.add_argument("--event-source", choices=["precomputed", "qwen"], default="precomputed", help="Event input source. precomputed is the research setting; qwen is an optional frozen-extractor baseline.")
-    parser.add_argument("--precomputed-events", nargs="+", default=["datasets/mirai_event_inputs_rule/mirai_event_input_train.jsonl"], help="One or more event-input-v1 JSONL files or glob patterns; all files are merged by query_id when event-source=precomputed.")
+    parser.add_argument("--precomputed-events", nargs="+", default=["datasets/mirai_event_inputs_rule/mirai_forecast_event_input_train.jsonl"], help="One or more event-input-v1 JSONL files or glob patterns; all files are merged by query_id when event-source=precomputed.")
     parser.add_argument(
         "--queries-from-precomputed-events",
         dest="queries_from_precomputed_events",
@@ -138,12 +140,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--forecast-max-document-chars", type=int, default=700, help="Maximum characters per document when documents are included.")
     parser.add_argument("--forecast-context-mode", choices=["events-graph", "documents-events-graph"], default="events-graph", help="Use compact event mentions plus graph by default; documents-events-graph is an ablation.")
     parser.add_argument("--forecast-max-event-chars", type=int, default=100, help="Maximum characters retained for each visible event mention.")
-    parser.add_argument(
-        "--max-choice-codes",
-        type=int,
-        default=0,
-        help="Deprecated compatibility option; no-refinement forecast prompts do not serialize candidate choices.",
-    )
     parser.add_argument("--no-save-forecast-prompts", dest="save_forecast_prompts", action="store_false", default=True, help="Do not store forecast prompts in predictions.jsonl. Disable only when outputs are too large; RL training needs these prompts.")
 
     parser.add_argument("--policy", default="forecast_trace_reward", help="RL hook policy name: noop, mirai_code_reward, or forecast_trace_reward.")
@@ -445,11 +441,16 @@ def refine_graph(coarse_graph: CoarseCausalGraph, sample_id: str, temp_dir: Path
         )
     keep_probs = torch.sigmoid(outputs["edge_keep_logits"]).detach().cpu().tolist()
     strength_predictions = outputs["edge_strengths"].detach().cpu().tolist()
+    relation_predictions = [
+        ID_TO_RELATION_LABEL.get(int(logits.argmax().item()), "none")
+        for logits in outputs["edge_relation_logits"].detach().cpu()
+    ]
     return build_refined_graph(
         coarse_graph=coarse_graph,
         edge_descriptions=list(sample.metadata.get("edge_descriptions", [])),
         keep_probs=keep_probs,
         strength_predictions=strength_predictions,
+        relation_predictions=relation_predictions,
         keep_threshold=args.refinement_keep_threshold,
         topology_mode=args.refinement_topology_mode,
     )
@@ -573,6 +574,46 @@ def format_seconds(seconds: float) -> str:
     return f"{hours}h{minutes:02d}m"
 
 
+def example_from_event_input(record) -> MiraiQueryExample:
+    """Adapt a self-contained event-input record to the MIRAI pipeline API."""
+    if record.query is None or not record.documents:
+        raise EventInputValidationError(
+            f"query_id={record.query_id!r}: precomputed event input must embed query and documents "
+            "when its id is absent from MIRAI relation_query.csv."
+        )
+    query = record.query
+    query_metadata = query.metadata if isinstance(query.metadata, dict) else {}
+    metadata = record.metadata if isinstance(record.metadata, dict) else {}
+    answer_list = [str(item).strip() for item in metadata.get("answer_list", []) if str(item).strip()]
+    if not answer_list:
+        answer_list = [str(item).strip() for item in query_metadata.get("gold_answer_list", []) if str(item).strip()]
+    target_events = metadata.get("target_events", [])
+    answer_dict: dict[str, list[str]] = {}
+    if isinstance(target_events, list):
+        for item in target_events:
+            if not isinstance(item, dict):
+                continue
+            relation = str(item.get("relation_name", "")).strip()
+            code = str(item.get("event_code", "")).strip()
+            if relation and code and code not in answer_dict.setdefault(relation, []):
+                answer_dict[relation].append(code)
+    focus = list(query.focus_entities) + ["", ""]
+    return MiraiQueryExample(
+        query_id=record.query_id,
+        date_str=str(query.cutoff_time or ""),
+        actor1_country_code=str(query_metadata.get("actor1_country_code", "")),
+        actor2_country_code=str(query_metadata.get("actor2_country_code", "")),
+        actor1_country_name=str(focus[0]),
+        actor2_country_name=str(focus[1]),
+        relation_name=next(iter(answer_dict), str(query_metadata.get("relation_name", ""))),
+        event_base_code=str(query_metadata.get("event_base_code", answer_list[0] if answer_list else "")),
+        docids=[document.document_id for document in record.documents],
+        answer_list=answer_list,
+        answer_dict=answer_dict,
+        raw_row={"_embedded_event_input": True},
+    )
+
+
 def main() -> None:
     args = parse_args()
     print("local qwen pipeline starting | stage={} | split={} | event_source={} | prediction_mode={}".format(args.stage, args.split, args.event_source, args.prediction_mode), flush=True)
@@ -609,11 +650,43 @@ def main() -> None:
             precomputed_event_index.update(shard_index)
         print("loaded precomputed events | files={} | query_ids={}".format(len(precomputed_event_paths), len(precomputed_event_index)), flush=True)
 
-    print("loading MIRAI dataset | path={}".format(args.dataset), flush=True)
     dataset_path = resolve_repo_path(args.dataset)
-    all_examples = load_mirai_queries(dataset_path, split=args.split)
+    use_embedded_precomputed_context = (
+        args.event_source == "precomputed"
+        and args.queries_from_precomputed_events
+        and bool(precomputed_event_index)
+        and all(record.query is not None and record.documents for record in precomputed_event_index.values())
+    )
+    if use_embedded_precomputed_context:
+        # mirai_forecast event-input records are self-contained. Avoid opening
+        # the legacy MIRAI ZIP, whose test-only query IDs are unrelated here.
+        all_examples = []
+        print(
+            "using embedded precomputed query/documents | split={} | query_ids={}".format(
+                args.split, len(precomputed_event_index)
+            ),
+            flush=True,
+        )
+    else:
+        print("loading MIRAI dataset | path={}".format(args.dataset), flush=True)
+        if args.event_source == "precomputed" and args.queries_from_precomputed_events:
+            try:
+                all_examples = load_mirai_queries(dataset_path, split=args.split)
+            except (FileNotFoundError, KeyError):
+                # Older event-input files may omit query/documents and require
+                # the matching context from the MIRAI dataset.
+                all_examples = []
+        else:
+            all_examples = load_mirai_queries(dataset_path, split=args.split)
     if args.query_id:
-        examples = [example for example in all_examples if example.query_id == str(args.query_id)]
+        query_id = str(args.query_id)
+        example_by_query_id = {example.query_id: example for example in all_examples}
+        if query_id in example_by_query_id:
+            examples = [example_by_query_id[query_id]]
+        elif args.queries_from_precomputed_events and query_id in precomputed_event_index:
+            examples = [example_from_event_input(precomputed_event_index[query_id])]
+        else:
+            examples = []
     elif args.queries_from_precomputed_events:
         if args.event_source != "precomputed":
             raise EventInputValidationError("--queries-from-precomputed-events requires --event-source precomputed")
@@ -621,21 +694,14 @@ def main() -> None:
         ordered_query_ids = list(precomputed_event_index)
         if args.limit > 0:
             ordered_query_ids = ordered_query_ids[: args.limit]
-        missing_dataset_query_ids = [query_id for query_id in ordered_query_ids if query_id not in example_by_query_id]
-        if missing_dataset_query_ids:
-            raise EventInputValidationError(
-                "Precomputed event input contains query ids not present in the active MIRAI split; "
-                f"preview={missing_dataset_query_ids[:10]}."
-            )
-        examples = [example_by_query_id[query_id] for query_id in ordered_query_ids]
+        examples = [
+            example_by_query_id.get(query_id) or example_from_event_input(precomputed_event_index[query_id])
+            for query_id in ordered_query_ids
+        ]
     else:
         examples = all_examples[: args.limit] if args.limit > 0 else all_examples
     if not examples:
         raise RuntimeError(f"No MIRAI examples found for split={args.split!r}, query_id={args.query_id!r}.")
-    # Event-code supervision is kept in the dataset/reward path. The global
-    # code inventory is intentionally not serialized into the forecast prompt.
-    choice_pool: list[dict[str, Any]] = []
-
     if args.event_source == "precomputed":
         missing_query_ids = [example.query_id for example in examples if example.query_id not in precomputed_event_index]
         if missing_query_ids:
@@ -738,7 +804,11 @@ def main() -> None:
         for index, example in enumerate(examples, start=1):
             print("[{}/{}] start query_id={}".format(index, len(examples), example.query_id), flush=True)
             query = example.build_query_spec()
-            documents = load_mirai_news_for_docids(dataset_path, example.docids)[: args.max_docs]
+            embedded_record = precomputed_event_index.get(example.query_id) if args.event_source == "precomputed" else None
+            if embedded_record is not None and example.raw_row.get("_embedded_event_input"):
+                documents = list(embedded_record.documents)[: args.max_docs]
+            else:
+                documents = load_mirai_news_for_docids(dataset_path, example.docids)[: args.max_docs]
             trajectory = PipelineTrajectory(
                 sample_id=example.query_id,
                 metadata={
@@ -832,6 +902,17 @@ def main() -> None:
                 keep_threshold=args.coarse_keep_threshold,
                 topology_mode=args.coarse_topology_mode,
             )
+            parsed_pair_count = sum(1 for item in pair_predictions if item is not None)
+            print(
+                "[{}/{}] coarse graph ready | parsed_pairs={}/{} | coarse_edges={}".format(
+                    index,
+                    len(examples),
+                    parsed_pair_count,
+                    len(pair_predictions),
+                    len(coarse_graph.edges),
+                ),
+                flush=True,
+            )
             trajectory.add_step(
                 "coarse_graph",
                 observation={"event_count": len(events), "candidate_pairs": len(pair_samples)},
@@ -892,7 +973,6 @@ def main() -> None:
                     query=query,
                     documents=documents,
                     refined_graph=refined_graph,
-                    choices=choice_pool,
                     max_graph_events=args.max_graph_events_in_prompt,
                     max_graph_edges=args.max_graph_edges_in_prompt,
                     max_document_chars=args.forecast_max_document_chars,
@@ -915,7 +995,6 @@ def main() -> None:
                 }
                 forecast_context = {
                     "prediction_mode": "forecast-trace",
-                    "choices": [],
                     "event_ref_to_id": prompt_bundle.event_ref_to_id,
                     "edge_ref_to_id": prompt_bundle.edge_ref_to_id,
                     "refined_graph": compact_graph,
@@ -951,7 +1030,6 @@ def main() -> None:
                         "edge_count": len(refined_graph.edges),
                         "graph_source": "coarse_graph" if args.skip_refinement else "refinement_model",
                     },
-                    "choices": [],
                     "trajectory": trajectory.to_dict(),
                     "forecast_prompt": forecast_prompt,
                     "forecast_system_prompt": FORECAST_TRACE_SYSTEM_PROMPT,
@@ -980,7 +1058,6 @@ def main() -> None:
                     query=query,
                     documents=documents,
                     refined_graph=refined_graph,
-                    choices=choice_pool,
                     max_graph_events=args.max_graph_events_in_prompt,
                     max_graph_edges=args.max_graph_edges_in_prompt,
                     max_document_chars=args.forecast_max_document_chars,
@@ -994,10 +1071,9 @@ def main() -> None:
                     system_prompt=FORECAST_TRACE_SYSTEM_PROMPT,
                     max_new_tokens=args.forecast_max_new_tokens,
                 )
-                forecast_prediction = parse_structured_forecast(raw_forecast, choices=prompt_bundle.choices)
+                forecast_prediction = parse_structured_forecast(raw_forecast)
                 forecast_context = {
                     "prediction_mode": args.prediction_mode,
-                    "choices": [],
                     "event_ref_to_id": prompt_bundle.event_ref_to_id,
                     "edge_ref_to_id": prompt_bundle.edge_ref_to_id,
                     "refined_graph": refined_graph.to_dict(),
@@ -1013,7 +1089,6 @@ def main() -> None:
                 forecast_prediction = parse_forecast_json(raw_forecast)
                 forecast_context = {
                     "prediction_mode": args.prediction_mode,
-                    "choices": [],
                     "event_ref_to_id": {},
                     "edge_ref_to_id": {},
                     "refined_graph": refined_graph.to_dict(),
@@ -1064,7 +1139,6 @@ def main() -> None:
                 "score": score,
                 "reward": reward,
                 "reward_breakdown": reward_breakdown,
-                "choices": [],
                 "trajectory": trajectory.to_dict(),
             }
             if args.save_forecast_prompts:
@@ -1154,7 +1228,6 @@ def main() -> None:
             "forecast_adapter_path": str(forecast_adapter_path) if forecast_adapter_path is not None else None,
             "precomputed_events": [str(path) for path in precomputed_event_paths] if precomputed_event_paths else None,
             "policy": policy.name,
-            "choice_count": len(choice_pool),
             "coarse_generation_mode": f"pairwise_candidate_batching:{coarse_mode}",
         },
         "samples": len(rows),

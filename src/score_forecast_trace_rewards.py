@@ -51,8 +51,6 @@ def build_trajectory(row: dict[str, Any]) -> PipelineTrajectory:
                     metadata=dict(step.get("metadata", {})) if isinstance(step.get("metadata", {}), dict) else {},
                 )
             )
-    if "choices" in row:
-        trajectory.metadata.setdefault("choices", row["choices"])
     return trajectory
 
 

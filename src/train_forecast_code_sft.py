@@ -10,11 +10,14 @@ from pathlib import Path
 from typing import Any
 
 from local_qwen_lora import LoraUnavailable, load_qwen_with_lora
-from mirai_dataset import load_mirai_event_code_choices
+from mirai_dataset import load_mirai_event_codebook
 from path_utils import REPO_ROOT, resolve_repo_path
 
-CODEBOOK_SYSTEM = "Map a CAMEO event base code to its canonical event description. Return JSON only."
-FORECAST_SYSTEM = "Predict future CAMEO event base codes from historical events and a causal graph. Return JSON only."
+FORECAST_SYSTEM = (
+    "Return strict JSON only. For code mapping prompts, map the three-digit CAMEO event base code "
+    "to its canonical event description. For forecast prompts, predict future CAMEO event base codes "
+    "from the historical events and causal graph."
+)
 
 
 @dataclass(slots=True)
@@ -45,10 +48,9 @@ class Tee:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Two-stage MIRAI code and answer-list SFT.")
-    parser.add_argument("--stage", choices=["codebook", "forecast"], required=True)
-    parser.add_argument("--input", nargs="+", default=[str(REPO_ROOT / "outputs" / "grpo_context_mirai_rule_train_no_refine" / "grpo_context.jsonl")])
-    parser.add_argument("--dataset", default=str(REPO_ROOT / "datasets" / "MIRAI_data.zip"))
+    parser = argparse.ArgumentParser(description="Single-stage MIRAI code-mapping plus answer-list forecast SFT.")
+    parser.add_argument("--input", nargs="+", default=[str(REPO_ROOT / "outputs" / "grpo_context_mirai_forecast_train_no_refine" / "grpo_context.jsonl")])
+    parser.add_argument("--dataset", default=str(REPO_ROOT / "datasets" / "MIRAI_data.zip"), help="Full MIRAI codebook source; only code descriptions are read from this ZIP.")
     parser.add_argument("--model-path", default=str(REPO_ROOT / "models" / "Qwen3-4B"))
     parser.add_argument("--adapter-path", default=None)
     parser.add_argument("--output-dir", required=True)
@@ -63,6 +65,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-completion-length", type=int, default=768)
     parser.add_argument("--max-sequence-length", type=int, default=2304, help="Maximum prompt plus target tokens used for SFT.")
     parser.add_argument("--logging-steps", type=int, default=10)
+    parser.add_argument("--sample-log-every", type=int, default=1)
+    parser.add_argument("--sample-log-count", type=int, default=2)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--target-modules", nargs="+", default=["q_proj", "k_proj", "v_proj", "o_proj"])
     parser.add_argument("--lora-r", type=int, default=16)
@@ -86,11 +90,14 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def load_codebook(dataset_path: Path) -> dict[str, str]:
-    choices = load_mirai_event_code_choices(dataset_path)
+def load_codebook(dataset_path: Path) -> dict[str, dict[str, Any]]:
+    codebook_entries = load_mirai_event_codebook(dataset_path)
     codebook = {
-        str(item.get("event_code", "")).strip(): str(item.get("description", "")).strip()
-        for item in choices
+        str(item.get("event_code", "")).strip(): {
+            "description": str(item.get("description", "")).strip(),
+            "metadata": item.get("metadata", {}) if isinstance(item.get("metadata", {}), dict) else {},
+        }
+        for item in codebook_entries
         if str(item.get("event_code", "")).strip() and str(item.get("description", "")).strip()
     }
     if not codebook:
@@ -98,25 +105,45 @@ def load_codebook(dataset_path: Path) -> dict[str, str]:
     return dict(sorted(codebook.items()))
 
 
-def codebook_examples(codebook: dict[str, str]) -> list[Example]:
-    return [
-        Example(
-            f"codebook:{code}",
-            f"Event base code: {code}",
-            json.dumps({"event_code": code, "event_description": description}, ensure_ascii=False, separators=(",", ":")),
+def codebook_examples(codebook: dict[str, dict[str, Any]]) -> list[Example]:
+    examples: list[Example] = []
+    for code, entry in codebook.items():
+        metadata = entry.get("metadata", {})
+        family_code = str(metadata.get("family_code", code[:2])).strip()
+        family_name = str(metadata.get("family_name", "")).strip()
+        family_description = str(metadata.get("family_description", "")).strip()
+        subtype_digit = str(metadata.get("subtype_digit", code[2:])).strip()
+        completion = {
+            "event_code": code,
+            "event_description": entry["description"],
+            "event_family_code": family_code,
+            "event_family": family_name,
+            "event_subtype_digit": subtype_digit,
+        }
+        examples.append(
+            Example(
+                f"codebook:{code}",
+                "Map this CAMEO event base code to its canonical description. "
+                f"The first two digits ({family_code}) identify the event family"
+                + (f" '{family_name}'" if family_name else "")
+                + "; the final digit identifies the subtype"
+                + (f" ({subtype_digit})" if subtype_digit else "")
+                + (f". Family definition: {family_description}" if family_description else ".")
+                + f" Event base code: {code}",
+                json.dumps(completion, ensure_ascii=False, separators=(",", ":")),
+            )
         )
-        for code, description in codebook.items()
-    ]
+    return examples
 
 
-def forecast_examples(rows: list[dict[str, Any]], codebook: dict[str, str]) -> tuple[list[Example], int]:
+def forecast_examples(rows: list[dict[str, Any]], codebook: dict[str, dict[str, Any]]) -> tuple[list[Example], int]:
     examples, skipped = [], 0
     for index, row in enumerate(rows, start=1):
         query = row.get("mirai_query", {})
         codes = query.get("answer_list", []) if isinstance(query, dict) else []
         codes = sorted({str(code).strip() for code in codes if str(code).strip()}) if isinstance(codes, list) else []
         raw_prompt = str(row.get("forecast_prompt", "")).strip()
-        context_start = raw_prompt.find("QueryId:")
+        context_start = raw_prompt.find("Query:")
         context = raw_prompt[context_start:].strip() if context_start >= 0 else raw_prompt
         if not codes or not context:
             continue
@@ -124,7 +151,7 @@ def forecast_examples(rows: list[dict[str, Any]], codebook: dict[str, str]) -> t
             skipped += 1
             continue
         completion = json.dumps(
-            {"answers": [{"event_code": code, "event_description": codebook[code]} for code in codes]},
+            {"answers": [{"event_code": code, "event_description": codebook[code]["description"]} for code in codes]},
             ensure_ascii=False,
             separators=(",", ":"),
         )
@@ -239,11 +266,33 @@ def loss_on(model, items, tokenizer, torch, device, batch_size) -> float | None:
 def save_json(path: Path, value: Any) -> None:
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
 
+def sample_model_outputs(model: Any, tokenizer: Any, torch: Any, device: Any, examples: list[Example], system: str, max_prompt: int, max_completion: int, max_sequence: int, count: int) -> list[dict[str, str]]:
+    model.eval()
+    results: list[dict[str, str]] = []
+    for item in examples[: max(0, count)]:
+        encoded = encode(tokenizer, item, system, max_prompt, max_completion, max_sequence)
+        prompt_len = sum(1 for label in encoded["labels"] if label == -100)
+        if prompt_len <= 0:
+            continue
+        input_ids = torch.tensor([encoded["input_ids"][:prompt_len]], dtype=torch.long, device=device)
+        with torch.no_grad():
+            generated = model.generate(input_ids=input_ids, attention_mask=torch.ones_like(input_ids), max_new_tokens=max_completion, do_sample=False, pad_token_id=tokenizer.eos_token_id, eos_token_id=tokenizer.eos_token_id)
+        output_text = tokenizer.decode(generated[0][input_ids.shape[-1] :], skip_special_tokens=True).strip()
+        results.append({"sample_id": item.sample_id, "prompt": item.prompt, "target": item.completion, "output": output_text})
+    return results
+
+
+def append_human_samples(path: Path, stage: str, epoch: int, samples: list[dict[str, str]]) -> None:
+    if not samples:
+        return
+    with path.open("a", encoding="utf-8") as handle:
+        for index, sample in enumerate(samples, start=1):
+            handle.write(f"=== SFT sample | stage={stage} | epoch={epoch} | index={index} ===\n")
+            handle.write("--- INPUT ---\n" + sample["prompt"].strip() + "\n--- TARGET ---\n" + sample["target"].strip() + "\n--- MODEL OUTPUT ---\n" + sample["output"].strip() + "\n\n")
+
 
 def main() -> None:
     args = parse_args()
-    if args.stage == "forecast" and not args.adapter_path:
-        raise ValueError("--stage forecast requires --adapter-path from codebook SFT.")
     if args.max_prompt_length < 1 or args.max_completion_length < 1 or args.max_sequence_length < 2 or args.num_train_epochs < 1:
         raise ValueError("Token limits and epochs must be positive.")
     if args.max_completion_length >= args.max_sequence_length:
@@ -251,16 +300,16 @@ def main() -> None:
     dataset_path = resolve_repo_path(args.dataset)
     codebook = load_codebook(dataset_path)
     input_paths = [resolve_repo_path(value) for value in args.input]
-    if args.stage == "codebook":
-        examples, system, skipped = codebook_examples(codebook), CODEBOOK_SYSTEM, 0
-    else:
-        rows = [row for path in input_paths for row in load_jsonl(path)]
-        examples, skipped = forecast_examples(rows, codebook)
-        system = FORECAST_SYSTEM
+    rows = [row for path in input_paths for row in load_jsonl(path)]
+    forecast_items, skipped = forecast_examples(rows, codebook)
+    mapping_items = codebook_examples(codebook)
     if args.max_samples > 0:
-        examples = examples[: args.max_samples]
-    validation_ratio = 0.0 if args.stage == "codebook" else args.validation_ratio
-    train, validation = split_examples(examples, validation_ratio, args.seed)
+        forecast_items = forecast_items[: args.max_samples]
+    forecast_train, validation = split_examples(forecast_items, args.validation_ratio, args.seed)
+    train = mapping_items + forecast_train
+    examples = train + validation
+    system = FORECAST_SYSTEM
+    validation_ratio = args.validation_ratio
     if not train:
         raise RuntimeError("No usable SFT examples.")
     output_dir = resolve_repo_path(args.output_dir)
@@ -272,7 +321,10 @@ def main() -> None:
         old_stdout, old_stderr = sys.stdout, sys.stderr
         sys.stdout, sys.stderr = Tee(old_stdout, log_file), Tee(old_stderr, log_file)
         try:
-            print(f"forecast SFT | stage={args.stage} | examples={len(examples)} | train={len(train)} | validation={len(validation)} | codebook={len(codebook)}", flush=True)
+            print(f"forecast SFT | stage=single-stage-codebook+forecast | examples={len(examples)} | forecast_examples={len(forecast_items)} | forecast_train={len(forecast_train)} | codebook_train={len(mapping_items)} | validation={len(validation)} | codebook={len(codebook)}", flush=True)
+            sample_log_path = output_dir / "sample_generations.txt"
+            if sample_log_path.exists():
+                sample_log_path.unlink()
             model, tokenizer, torch = load_qwen_with_lora(
                 resolve_repo_path(args.model_path),
                 resolve_repo_path(args.adapter_path) if args.adapter_path else None,
@@ -323,6 +375,10 @@ def main() -> None:
                 record = {"epoch": epoch, "global_step": global_step, "train_loss": train_loss, "validation_loss": validation_loss, "elapsed_seconds": round(time.time() - started, 3)}
                 history.append(record)
                 print(json.dumps(record), flush=True)
+                if args.sample_log_every > 0 and args.sample_log_count > 0 and epoch % args.sample_log_every == 0:
+                    sampled = sample_model_outputs(model, tokenizer, torch, device, validation if validation else train, system, args.max_prompt_length, args.max_completion_length, args.max_sequence_length, args.sample_log_count)
+                    append_human_samples(sample_log_path, "single-stage-codebook+forecast", epoch, sampled)
+                    print(f"sample audit | epoch={epoch} | samples={len(sampled)} | path={sample_log_path}", flush=True)
                 if selected_loss <= best_loss:
                     best_loss = selected_loss
                     model.save_pretrained(best_adapter)
@@ -346,7 +402,7 @@ def main() -> None:
             }
             save_json(output_dir / "train_config.json", config)
             save_json(output_dir / "train_history.json", history)
-            save_json(output_dir / "metrics.json", {"stage": args.stage, "examples": len(examples), "best_selection_loss": best_loss, "truncated_targets": truncated, "best_adapter": str(best_adapter), "final_adapter": str(final_adapter)})
+            save_json(output_dir / "metrics.json", {"stage": "single-stage-codebook+forecast", "examples": len(examples), "forecast_examples": len(forecast_items), "codebook_examples": len(codebook), "best_selection_loss": best_loss, "truncated_targets": truncated, "best_adapter": str(best_adapter), "final_adapter": str(final_adapter)})
             print(f"SFT complete | best_adapter={best_adapter} | final_adapter={final_adapter}", flush=True)
         finally:
             sys.stdout, sys.stderr = old_stdout, old_stderr

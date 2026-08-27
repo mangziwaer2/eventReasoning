@@ -35,15 +35,6 @@ def _as_dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def _as_choices(value: Any) -> list[dict[str, Any]]:
-    value = _json_loads_if_needed(value)
-    if isinstance(value, dict):
-        return [value]
-    if not isinstance(value, list):
-        return []
-    return [item for item in value if isinstance(item, dict)]
-
-
 def _as_batch(value: Any) -> list[Any]:
     if value is None:
         return []
@@ -178,7 +169,6 @@ def _context_value(
 class ForecastTraceGRPOContext:
     gold: dict[str, Any]
     trajectory: PipelineTrajectory
-    choices: list[dict[str, Any]]
 
 
 def build_grpo_context(kwargs: dict[str, Any], index: int, batch_size: int) -> ForecastTraceGRPOContext:
@@ -200,14 +190,11 @@ def build_grpo_context(kwargs: dict[str, Any], index: int, batch_size: int) -> F
         _context_value(row, kwargs, ("trajectory",), index, batch_size, {}),
         sample_id=sample_id,
     )
-    choices = _as_choices(_context_value(row, kwargs, ("choices", "choice_pool"), index, batch_size, []))
-    if choices:
-        trajectory.metadata.setdefault("choices", choices)
     for key in ("refined_graph", "event_ref_to_id", "edge_ref_to_id"):
         value = _context_value(row, kwargs, (key,), index, batch_size, None)
         if value is not None:
             trajectory.metadata.setdefault(key, _json_loads_if_needed(value))
-    return ForecastTraceGRPOContext(gold=gold, trajectory=trajectory, choices=choices)
+    return ForecastTraceGRPOContext(gold=gold, trajectory=trajectory)
 
 
 class ForecastTraceGRPOReward:
@@ -229,6 +216,7 @@ class ForecastTraceGRPOReward:
         sample_audit_path: Path | str | None = None,
         sample_audit_every: int = 1,
         sample_audit_limit: int = 2,
+        sample_human_path: Path | str | None = None,
     ) -> None:
         self.policy_name = policy_name
         self.reward_key = reward_key
@@ -239,6 +227,7 @@ class ForecastTraceGRPOReward:
         self.sample_audit_path = Path(sample_audit_path) if sample_audit_path else None
         self.sample_audit_every = max(1, int(sample_audit_every))
         self.sample_audit_limit = max(0, int(sample_audit_limit))
+        self.sample_human_path = Path(sample_human_path) if sample_human_path else None
         self.call_count = 0
         self.last_breakdowns: list[dict[str, float]] = []
 
@@ -248,13 +237,9 @@ class ForecastTraceGRPOReward:
         *,
         gold: dict[str, Any] | None = None,
         trajectory: PipelineTrajectory | dict[str, Any] | str | None = None,
-        choices: list[dict[str, Any]] | str | None = None,
     ) -> dict[str, float]:
         trajectory_obj = pipeline_trajectory_from_payload(trajectory or {})
-        normalized_choices = _as_choices(choices or [])
-        if normalized_choices:
-            trajectory_obj.metadata.setdefault("choices", normalized_choices)
-        prediction = parse_structured_forecast(completion_to_text(completion), choices=normalized_choices)
+        prediction = parse_structured_forecast(completion_to_text(completion))
         breakdown = self.policy.compute_reward_breakdown(prediction, gold or {}, trajectory_obj)
         return {str(key): float(value) for key, value in breakdown.items() if isinstance(value, (int, float))}
 
@@ -275,7 +260,6 @@ class ForecastTraceGRPOReward:
                     completion,
                     gold=context.gold,
                     trajectory=context.trajectory,
-                    choices=context.choices,
                 )
                 reward = float(breakdown.get(self.reward_key, breakdown.get("total", self.error_reward)))
                 if not math.isfinite(reward):
@@ -329,10 +313,7 @@ class ForecastTraceGRPOReward:
                     context = contexts[index]
                     prompt_value = _value_at(prompts, index, batch_size) if prompts is not None else ""
                     completion_text = completion_to_text(batch[index])
-                    parsed_prediction = parse_structured_forecast(
-                        completion_text,
-                        choices=context.choices if context is not None else [],
-                    )
+                    parsed_prediction = parse_structured_forecast(completion_text)
                     query_id = context.trajectory.sample_id if context is not None else str(
                         _kw_value(kwargs, ("query_id",), index, batch_size, "")
                     )
@@ -351,6 +332,13 @@ class ForecastTraceGRPOReward:
                                     if key in coarse_step.metadata
                                 },
                             }
+                    if self.sample_human_path is not None:
+                        self.sample_human_path.parent.mkdir(parents=True, exist_ok=True)
+                        with self.sample_human_path.open("a", encoding="utf-8") as human:
+                            human.write(f"=== GRPO sample | reward_call={self.call_count} | batch_index={index} | query_id={query_id} ===\n")
+                            human.write("--- INPUT ---\n" + value_to_log_text(prompt_value).strip() + "\n")
+                            human.write("--- MODEL OUTPUT ---\n" + completion_text.strip() + "\n")
+                            human.write("--- REWARD ---\n" + json.dumps({"reward": rewards[index], "breakdown": breakdowns[index]}, ensure_ascii=False) + "\n\n")
                     handle.write(
                         json.dumps(
                             {
@@ -400,7 +388,6 @@ def rollout_row_to_grpo_sample(row: dict[str, Any], *, chat_prompt: bool = True)
         "query_id": str(row.get("query_id", row.get("sample_id", ""))),
         "mirai_query": row.get("mirai_query", {}),
         "trajectory": row.get("trajectory", {}),
-        "choices": row.get("choices", []),
     }
     return {
         "prompt": prompt,

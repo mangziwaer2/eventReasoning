@@ -15,7 +15,7 @@ from forecast_trace_grpo_rewards import (
 )
 from forecast_trace_judge_runtime import FrozenQwenTraceJudge
 from forecast_trace_schema import parse_structured_forecast
-from mirai_dataset import load_mirai_event_code_choices
+from mirai_dataset import load_mirai_event_codebook
 from path_utils import REPO_ROOT, resolve_repo_path
 
 
@@ -51,6 +51,7 @@ class JudgeGRPOReward:
         sample_audit_path: str | Path | None = None,
         sample_audit_every: int = 1,
         sample_audit_limit: int = 2,
+        sample_human_path: Path | str | None = None,
     ) -> None:
         self.base = ForecastTraceGRPOReward(policy_name=policy_name, reward_key=reward_key, error_reward=error_reward)
         self.judge = FrozenQwenTraceJudge(
@@ -68,20 +69,21 @@ class JudgeGRPOReward:
         self.sample_audit_path = Path(sample_audit_path) if sample_audit_path else None
         self.sample_audit_every = max(1, int(sample_audit_every))
         self.sample_audit_limit = max(0, int(sample_audit_limit))
+        self.sample_human_path = Path(sample_human_path) if sample_human_path else None
         self.codebook_dataset_path = resolve_repo_path(
             str(codebook_dataset_path or (REPO_ROOT / "datasets" / "MIRAI_data.zip"))
         )
         try:
-            choices = load_mirai_event_code_choices(self.codebook_dataset_path)
+            codebook_entries = load_mirai_event_codebook(self.codebook_dataset_path)
         except (OSError, KeyError, ValueError, FileNotFoundError, json.JSONDecodeError) as exc:
-            raise RuntimeError(f"Cannot load MIRAI codebook for semantic reward: {self.codebook_dataset_path}") from exc
+            raise RuntimeError(f"Cannot load event codebook for semantic reward: {self.codebook_dataset_path}") from exc
         self.codebook = {
             str(item.get("event_code", "")).strip(): str(item.get("description", "")).strip()
-            for item in choices
+            for item in codebook_entries
             if str(item.get("event_code", "")).strip() and str(item.get("description", "")).strip()
         }
         if not self.codebook:
-            raise RuntimeError(f"MIRAI codebook is empty: {self.codebook_dataset_path}")
+            raise RuntimeError(f"Event codebook is empty: {self.codebook_dataset_path}")
         self.call_count = 0
         self.last_breakdowns: list[dict[str, float]] = []
 
@@ -128,7 +130,7 @@ class JudgeGRPOReward:
             description_judge: list[dict[str, Any]] = []
             try:
                 context = build_grpo_context(kwargs, index, batch_size)
-                prediction = parse_structured_forecast(completion_text, choices=context.choices)
+                prediction = parse_structured_forecast(completion_text)
                 base = self.base.policy.compute_reward_breakdown(prediction, context.gold, context.trajectory)
                 judge = self.judge.score(
                     prediction,
@@ -214,3 +216,11 @@ class JudgeGRPOReward:
             with self.sample_audit_path.open("a", encoding="utf-8") as handle:
                 for index, row in enumerate(rows[: self.sample_audit_limit]):
                     handle.write(json.dumps({"reward_call": self.call_count, "batch_index": index, **row}, ensure_ascii=False, default=str) + "\n")
+        if self.sample_human_path is not None and self.sample_audit_limit > 0 and self.call_count % self.sample_audit_every == 0:
+            self.sample_human_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.sample_human_path.open("a", encoding="utf-8") as handle:
+                for index, row in enumerate(rows[: self.sample_audit_limit]):
+                    handle.write(f"=== GRPO judge sample | reward_call={self.call_count} | batch_index={index} | query_id={row.get('query_id','')} ===\n")
+                    handle.write("--- INPUT ---\n" + str(row.get("prompt", "")).strip() + "\n")
+                    handle.write("--- MODEL OUTPUT ---\n" + str(row.get("completion", "")).strip() + "\n")
+                    handle.write("--- REWARD ---\n" + json.dumps({"reward": row.get("reward"), "breakdown": row.get("reward_breakdown"), "judge": row.get("judge")}, ensure_ascii=False, default=str) + "\n\n")
