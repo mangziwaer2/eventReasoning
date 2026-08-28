@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import re
+from datetime import date
+from datetime import datetime
+from datetime import timedelta
 from difflib import SequenceMatcher
 
 from dataclasses import asdict
@@ -189,6 +192,180 @@ def _trace_temporal_score(prediction: dict[str, Any]) -> float:
     return sum(scores) / len(scores)
 
 
+def _parse_calendar_time(value: Any) -> date | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    text = text.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(text).date()
+    except ValueError:
+        pass
+    try:
+        return date.fromisoformat(text[:10])
+    except ValueError:
+        return None
+
+
+def _graph_event_time_lookup(graph: Any, mapping: dict[str, str]) -> dict[str, date]:
+    if not graph:
+        return {}
+    events = graph.get("events", []) if isinstance(graph, dict) else getattr(graph, "events", [])
+    result: dict[str, date] = {}
+    for event in events if isinstance(events, list) else []:
+        if isinstance(event, dict):
+            event_id = str(event.get("event_id", "")).strip()
+            metadata = event.get("metadata", {})
+            value = event.get("event_time") or event.get("date") or event.get("publish_time")
+            if not value and isinstance(metadata, dict):
+                value = metadata.get("event_time") or metadata.get("date") or metadata.get("publish_time")
+        else:
+            event_id = str(getattr(event, "event_id", "")).strip()
+            metadata = getattr(event, "metadata", {})
+            value = (metadata.get("event_time") or metadata.get("date") or metadata.get("publish_time")) if isinstance(metadata, dict) else None
+        parsed = _parse_calendar_time(value)
+        if event_id and parsed is not None:
+            result[event_id] = parsed
+    for ref, event_id in (mapping or {}).items():
+        if event_id in result:
+            result[str(ref)] = result[event_id]
+    return result
+
+
+def _trace_temporal_components(
+    prediction: dict[str, Any],
+    gold: dict[str, Any],
+    trajectory: PipelineTrajectory,
+    graph: Any,
+    event_ref_to_id: dict[str, str],
+) -> tuple[float, float, float]:
+    """Return (overall, interval validity, ordering) for forecast trace times.
+
+    Absolute event_time is authoritative. Relative t-k values are converted from
+    the target answer date when that date is available, otherwise from the cutoff.
+    Without calendar metadata this deliberately falls back to the legacy relative-time score.
+    """
+    trace = prediction.get("forecast_trace", {})
+    events = [item for item in trace.get("intermediate_events", []) if isinstance(item, dict)] if isinstance(trace, dict) else []
+    if not events:
+        return 0.0, 0.0, 0.0
+    query = trajectory.metadata.get("query", {}) if isinstance(trajectory.metadata, dict) else {}
+    if not isinstance(query, dict):
+        query = {}
+    graph_query = graph.get("query", {}) if isinstance(graph, dict) else {}
+    if not isinstance(graph_query, dict):
+        graph_query = {}
+    cutoff = _parse_calendar_time(
+        query.get("observation_time") or query.get("cutoff_time") or query.get("date_str")
+        or graph_query.get("observation_time") or graph_query.get("cutoff_time") or graph_query.get("date_str")
+    )
+    target = _parse_calendar_time(query.get("target_time") or query.get("target_date"))
+    target_events = gold.get("target_events", []) if isinstance(gold, dict) else []
+    predicted_codes = prediction.get("predicted_event_base_codes", []) if isinstance(prediction, dict) else []
+    if not isinstance(predicted_codes, list):
+        predicted_codes = []
+    predicted_codes = {str(code).strip() for code in predicted_codes if str(code).strip()}
+    candidate_target_dates: list[date] = []
+    if isinstance(target_events, list):
+        for item in target_events:
+            if not isinstance(item, dict):
+                continue
+            code = str(item.get("event_code", "")).strip()
+            parsed_date = _parse_calendar_time(item.get("date"))
+            if parsed_date is not None and (not predicted_codes or code in predicted_codes):
+                candidate_target_dates.append(parsed_date)
+    if candidate_target_dates:
+        target = min(candidate_target_dates)
+    if target is None:
+        target = _parse_calendar_time(gold.get("target_time") or gold.get("target_date")) if isinstance(gold, dict) else None
+    support_times = _graph_event_time_lookup(graph, event_ref_to_id)
+    observed_times = [value for key, value in support_times.items() if key not in event_ref_to_id]
+    latest_observed = max(observed_times) if observed_times else None
+    predicted_times: list[date | None] = []
+    legacy_scores: list[float] = []
+    future_scores: list[float] = []
+    for item in events:
+        relative = str(item.get("relative_time", "")).strip().lower().replace(" ", "")
+        legacy = parse_relative_time_score(relative)
+        legacy_scores.append(legacy)
+        explicit_value = item.get("event_time") or item.get("date")
+        has_explicit = bool(str(explicit_value or "").strip())
+        explicit = _parse_calendar_time(explicit_value)
+        predicted = explicit
+        relative_anchor = target or cutoff
+        if not has_explicit and predicted is None and relative_anchor is not None:
+            match = re.fullmatch(r"t([+-])(\d+|0)", relative)
+            if match:
+                delta = int(match.group(2)) * (1 if match.group(1) == "+" else -1)
+                predicted = relative_anchor + timedelta(days=delta)
+        predicted_times.append(predicted)
+        # A forecast step must be strictly after observation and before the answer date.
+        if cutoff is None and predicted is None and not has_explicit:
+            future_scores.append(legacy)
+            continue
+        valid = (explicit is not None) if has_explicit else (bool(re.fullmatch(r"t[+-](\d+|0)", relative)) or relative == "t")
+        if predicted is not None and cutoff is not None:
+            valid = valid and predicted > cutoff
+        if predicted is not None and target is not None:
+            valid = valid and predicted < target
+        support_refs = _support_refs_for_trace_item(item)
+        timed_supports = [support_times[ref] for ref in support_refs if ref in support_times]
+        reference_times = timed_supports + ([latest_observed] if latest_observed is not None else [])
+        if predicted is not None and reference_times:
+            valid = valid and predicted > max(reference_times)
+        future_scores.append(1.0 if valid else 0.0)
+    if cutoff is None and all(item is None for item in predicted_times):
+        return sum(legacy_scores) / len(legacy_scores), sum(legacy_scores) / len(legacy_scores), 1.0
+    known_times = [item for item in predicted_times if item is not None]
+    ordering = 1.0
+    if len(known_times) >= 2:
+        ordering = sum(1.0 for left, right in zip(known_times, known_times[1:]) if left < right) / (len(known_times) - 1)
+    validity = sum(future_scores) / len(future_scores)
+    # Ordering is only meaningful for events that are themselves inside the
+    # observation-to-target interval; invalid timestamps must not receive a
+    # positive temporal reward from a correctly ordered list.
+    return validity * (0.7 + 0.3 * ordering), validity, ordering
+
+
+def _support_refs_for_trace_item(item: dict[str, Any]) -> list[str]:
+    refs = item.get("supporting_event_ids", item.get("support_event_ids", []))
+    if not isinstance(refs, list):
+        refs = [refs] if refs else []
+    return [str(ref).strip() for ref in refs if str(ref).strip()]
+
+
+VAGUE_EFFECT_PATTERNS = (
+    "increased likelihood of this event",
+    "increases likelihood of this event",
+    "raises likelihood",
+    "increases likelihood",
+    "makes this more likely",
+    "more likely to happen",
+)
+MECHANISM_TERMS = ("because", "caus", "lead", "trigger", "response", "force", "allow", "enable", "prevent", "constraint", "retaliat", "pressure", "commit", "mobil")
+
+
+def _expected_effect_penalty(prediction: dict[str, Any]) -> float:
+    trace = prediction.get("forecast_trace", {})
+    events = [item for item in trace.get("intermediate_events", []) if isinstance(item, dict)] if isinstance(trace, dict) else []
+    if not events:
+        return 0.0
+    penalties: list[float] = []
+    for item in events:
+        effect = " ".join(str(item.get("expected_effect", "")).lower().split())
+        if not effect:
+            penalties.append(1.0)
+        elif any(pattern in effect for pattern in VAGUE_EFFECT_PATTERNS) and not any(term in effect for term in MECHANISM_TERMS):
+            penalties.append(1.0)
+        else:
+            penalties.append(0.0)
+    return sum(penalties) / len(penalties)
+
+
 def _generic_penalty(prediction: dict[str, Any]) -> float:
     trace = prediction.get("forecast_trace", {})
     if not isinstance(trace, dict):
@@ -320,6 +497,7 @@ class ForecastTraceReward:
         generic_penalty_weight: float = 0.15,
         density_penalty_weight: float = 0.15,
         historical_copy_penalty_weight: float = 0.5,
+        expected_effect_penalty_weight: float = 0.15,
         wrong_answer_trace_scale: float = 0.2,
     ) -> None:
         self.answer_reward = MiraiCodeReward()
@@ -331,6 +509,7 @@ class ForecastTraceReward:
         self.generic_penalty_weight = generic_penalty_weight
         self.density_penalty_weight = density_penalty_weight
         self.historical_copy_penalty_weight = max(0.0, float(historical_copy_penalty_weight))
+        self.expected_effect_penalty_weight = max(0.0, float(expected_effect_penalty_weight))
         self.wrong_answer_trace_scale = max(0.0, min(float(wrong_answer_trace_scale), 1.0))
 
     def __call__(self, prediction: dict[str, Any], gold: dict[str, Any], trajectory: PipelineTrajectory) -> dict[str, float]:
@@ -368,10 +547,17 @@ class ForecastTraceReward:
             )
 
         grounding = 0.65 * valid_event_ratio + 0.35 * valid_edge_ratio
-        temporal = _trace_temporal_score(prediction)
+        temporal, temporal_validity, temporal_order = _trace_temporal_components(
+            prediction,
+            gold,
+            trajectory,
+            refined_graph,
+            event_ref_to_id if isinstance(event_ref_to_id, dict) else {},
+        )
         generic_penalty = _generic_penalty(prediction)
         density_penalty = _density_penalty(prediction)
         historical_copy_penalty = _historical_copy_penalty(prediction, refined_graph)
+        expected_effect_penalty = _expected_effect_penalty(prediction)
         trace_unscaled = (
             self.format_weight * fmt
             + self.grounding_weight * grounding
@@ -380,6 +566,7 @@ class ForecastTraceReward:
             - self.generic_penalty_weight * generic_penalty
             - self.density_penalty_weight * density_penalty
             - self.historical_copy_penalty_weight * historical_copy_penalty
+            - self.expected_effect_penalty_weight * expected_effect_penalty
         )
         trace_component = trace_unscaled
         if answer <= 0.0:
@@ -393,10 +580,13 @@ class ForecastTraceReward:
             "valid_event_ref_ratio": round(valid_event_ratio, 6),
             "valid_edge_ref_ratio": round(valid_edge_ratio, 6),
             "temporal": round(temporal, 6),
+            "temporal_validity": round(temporal_validity, 6),
+            "temporal_order": round(temporal_order, 6),
             "graph_bridge": round(bridge, 6),
             "generic_penalty": round(generic_penalty, 6),
             "density_penalty": round(density_penalty, 6),
             "historical_copy_penalty": round(historical_copy_penalty, 6),
+            "expected_effect_penalty": round(expected_effect_penalty, 6),
             "trace_unscaled": round(trace_unscaled, 6),
             "trace": round(trace_component, 6),
             "total": round(total, 6),

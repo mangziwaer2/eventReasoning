@@ -47,9 +47,9 @@ def graph_from_forecast_context(context: str) -> dict[str, list[dict[str, Any]]]
     events: list[dict[str, Any]] = []
     edges: list[dict[str, Any]] = []
     for line in str(context).splitlines():
-        event = re.match(r"\s*-\s*(H\d+)\s*\|.*?mention=(.*?)\s*\|\s*participants=", line)
+        event = re.match(r"\s*-\s*(H\d+)\s*\|.*?time=([^|]+)\s*\|.*?mention=(.*?)\s*\|\s*participants=", line)
         if event:
-            events.append({"event_id": event.group(1), "text": event.group(2).strip()})
+            events.append({"event_id": event.group(1), "event_time": event.group(2).strip(), "text": event.group(3).strip()})
             continue
         edge = re.match(
             r"\s*-\s*(R\d+)\s*\|.*?\s(H\d+)\s*->\s*([^| ]+)\s*\|\s*relation=([^|]+)\|\s*confidence=([0-9.]+)",

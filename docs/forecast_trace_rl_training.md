@@ -69,7 +69,7 @@
 
 输入：
 
-    query + cutoff-before documents + observed events + coarseGraph
+    query + observation/cutoff date + target answer date + cutoff-before documents + observed events + coarseGraph
 
 输出严格 JSON：
 
@@ -82,11 +82,12 @@
               "trigger": "deploy",
               "mention": "security forces deploy near the capital",
               "actors": ["security forces"],
+              "event_time": "2023-02-20",
               "relative_time": "t-1"
             },
             "supporting_event_ids": ["H01"],
             "supporting_edge_ids": ["R01"],
-            "expected_effect": "raises likelihood of arrests",
+            "expected_effect": "the deployment increases pressure on organizers, making arrests more likely",
             "confidence": 0.71
           }
         ],
@@ -214,7 +215,7 @@ predictions.jsonl 现在默认保存 forecast_prompt 和 forecast_system_prompt�
 - A_i：final answer reward。主答案命中 gold answer list 得 1；alternative 命中得 0.5；否则 0。
 - F_i：格式分。由 parsed JSON、trace 字段完整性和 `final_answer.event_code` 完整性组成。
 - G_i：grounding 分。0.65 * valid_event_ref_ratio + 0.35 * valid_edge_ref_ratio。
-- U_i：时间分。trace 的 relative_time 越符合 t-1/t-2/... 越高。
+- U_i：时间分。MIRAI 中 trace 必须位于 observation/cutoff 与 target answer date 之间；可直接输出绝对 `event_time`，或用 target-relative `t-1/t-2/...` 表示答案日前若干天。
 - B_i：bridge 分。在 G_coarse + forecast_trace 上，从支持历史事件到 `answer_<event_code>` 的最佳路径置信度乘积。
 - P_generic_i：泛化事件惩罚，例如 tensions rise、situation worsens。
 - P_density_i：过密 trace 惩罚，防止输出很多无用中间事件和边。

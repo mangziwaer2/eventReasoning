@@ -404,6 +404,34 @@ class ForecastTraceTests(unittest.TestCase):
         self.assertEqual(distinct_reward["historical_copy_penalty"], 0.0)
         self.assertLess(copied_reward["total"], distinct_reward["total"])
 
+    def test_temporal_reward_uses_observation_to_target_interval(self) -> None:
+        graph = {
+            "events": [{"event_id": "e1", "text": "observed trigger", "event_time": "2023-02-28"}],
+            "edges": [],
+        }
+        trajectory = PipelineTrajectory(
+            sample_id="time_interval",
+            metadata={
+                "query": {"cutoff_time": "2023-02-28"},
+                "refined_graph": graph,
+                "event_ref_to_id": {"H01": "e1"},
+            },
+        )
+        gold = {"answer_list": ["043"], "target_events": [{"date": "2023-03-02", "event_code": "043"}]}
+
+        def score(event_time: str, relative_time: str) -> dict[str, float]:
+            prediction = parse_structured_forecast(
+                '{"forecast_trace":{"intermediate_events":[{"event":"next step",'
+                f'"event_time":"{event_time}","relative_time":"{relative_time}",'
+                '"supporting_event_ids":["H01"],"expected_effect":"because the trigger causes the next step"}]},'
+                '"final_answer":{"event_code":"043"}}'
+            )
+            return ForecastTraceReward()(prediction, gold, trajectory)
+
+        self.assertEqual(score("2023-03-01", "t-1")["temporal"], 1.0)
+        self.assertEqual(score("2023-02-28", "t-2")["temporal"], 0.0)
+        self.assertEqual(score("2023-03-03", "t+1")["temporal"], 0.0)
+
     def test_coarse_pair_parser_prefers_confidence_and_accepts_score(self) -> None:
         parsed = parse_pair_payload('{"relation_type": "none", "confidence": 1.0}')
         self.assertIsNotNone(parsed)

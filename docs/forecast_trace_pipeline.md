@@ -80,7 +80,7 @@ GNN refiner 对完整图执行 keep/drop/add/retype/strength/frontier
   "participants": ["opposition supporters", "capital"],
   "document_id": "doc_001",
   "sentence_index": 3,
-  "event_time": "t-5",
+  "event_time": "2024-05-05",
   "confidence": 1.0,
   "evidence": "Opposition supporters protested in the capital on Monday."
 }
@@ -527,9 +527,9 @@ R_grounding =
 ### 6.4 R_temporal
 
 ```text
-relative_time 必须早于 t
+MIRAI 中 trace 时间必须晚于 observation/cutoff 且早于 target answer date；绝对 `event_time` 优先，relative_time 仅作兼容
 trace 事件顺序必须从更早到更晚
-历史事件不能被写成 cutoff 后已经发生
+trace 事件不能被写成 cutoff 前已经发生
 ```
 
 ### 6.5 R_graph_bridge

@@ -90,7 +90,7 @@ python src/train_forecast_code_sft.py \
   --input outputs/grpo_context_mirai_forecast_train_no_refine/grpo_context.jsonl \
   --dataset datasets/MIRAI_data.zip --model-path models/Qwen3-4B \
   --output-dir outputs/mirai_forecast_sft_train \
-  --num-train-epochs 10 --per-device-train-batch-size 1 \
+  --num-train-epochs 1 --per-device-train-batch-size 1 \
   --gradient-accumulation-steps 4 --learning-rate 2e-5 \
   --max-prompt-length 2048 --max-completion-length 768 \
   --max-sequence-length 2304 --logging-steps 10
@@ -134,7 +134,7 @@ python src/train_forecast_trace_grpo_judge.py \
 
 ## 5. Refinement 训练和带 refinement 的 Judge-GRPO
 
-当前 refinement 只过滤 Qwen 已提出的边，不能补回 Qwen 漏边，也不修改 relation 类型。已有 held-out candidate-edge pilot：
+当前 refinement 使用 graph-editor-v4：对候选边联合预测 keep/drop、关系类型和 strength，并可对 completion candidates 补边。旧的 graph-editor-v3 checkpoint 和 v2 cache 不兼容，必须重建。
 
 | 指标 | 保留全部粗边 | refinement threshold=0.30 |
 | --- | ---: | ---: |
@@ -142,7 +142,7 @@ python src/train_forecast_trace_grpo_judge.py \
 | Recall | 1.0000 | 0.9726 |
 | F1 | 0.6762 | 0.6961 |
 
-若 `outputs/maven_qwen_refinement_cache/samples.jsonl` 不存在，先用冻结 Qwen 构建完整 cache。MAVEN-ERE 只用于 refinement 监督，不与 `mirai_forecast` 的 train/dev/holdout 混合：
+若 `outputs/maven_qwen_refinement_cache_v3/samples.jsonl` 不存在，先用冻结 Qwen 构建完整 v3 cache。MAVEN-ERE 只用于 refinement 监督，不与 `mirai_forecast` 的 train/dev/holdout 混合：
 
 ```bash
 python src/build_maven_qwen_refinement_cache.py \
@@ -150,7 +150,9 @@ python src/build_maven_qwen_refinement_cache.py \
   --base-model-path models/Qwen3-4B --coarse-topology-mode temporal-dag \
   --max-events 16 --max-pairs 64 --coarse-batch-size 8 \
   --coarse-max-length 1024 --coarse-max-new-tokens 128 \
-  --output-dir outputs/maven_qwen_refinement_cache
+  --negative-completion-ratio 0.75 --max-completion-edges 128 \
+  --output-dir outputs/maven_qwen_refinement_cache_v3 \
+  --overwrite
 ```
 
 该命令默认不启用 `--coarse-thinking`，可避免 pair JSON 因思考文本截断；cache 已存在且 `cache_manifest.json` 的 `complete=true` 时不要重复生成。
@@ -160,20 +162,21 @@ python src/build_maven_qwen_refinement_cache.py \
 ```bash
 python src/train_refinement.py \
   --dataset-mode maven-qwen-cache \
-  --qwen-refinement-cache outputs/maven_qwen_refinement_cache/samples.jsonl \
+  --qwen-refinement-cache outputs/maven_qwen_refinement_cache_v3/samples.jsonl \
   --limit 0 --validation-ratio 0.1 --epochs 40 \
   --hidden-dim 192 --message-steps 4 --dropout 0.12 \
   --lr 3e-4 --weight-decay 1e-4 --grad-clip 1.0 \
   --keep-loss-weight 1.0 --strength-loss-weight 0.3 \
-  --density-loss-weight 0.08 --keep-pos-weight auto --amp auto \
+  --relation-loss-weight 0.5 --density-loss-weight 0.08 \
+  --keep-pos-weight auto --amp auto \
   --log-every 25 --debug-samples 2 \
-  --output-dir outputs/refinement_graph_maven_qwen
+  --output-dir outputs/refinement_graph_maven_qwen_v4
 
 python src/evaluate_refinement_v2.py \
-  --cache outputs/maven_qwen_refinement_cache/samples.jsonl \
-  --model-path outputs/refinement_graph_maven_qwen/refinement_model.pt \
+  --cache outputs/maven_qwen_refinement_cache_v3/samples.jsonl \
+  --model-path outputs/refinement_graph_maven_qwen_v4/refinement_model.pt \
   --limit 0 --validation-ratio 0.1 --seed 42 \
-  --output outputs/refinement_graph_maven_qwen/heldout_edge_metrics.json
+  --output outputs/refinement_graph_maven_qwen_v4/heldout_edge_metrics.json
 ```
 
 生成 train 的带 refinement context。此处处理 3563 条 train；若中断，复用第 2 节分片方法，把 `--skip-refinement` 替换为下面的 refinement 参数：
@@ -185,9 +188,10 @@ python src/evaluate_local_qwen_pipeline.py \
   --precomputed-events outputs/mirai_forecast_event_input_train_shards_25/events_*.jsonl \
   --queries-from-precomputed-events \
   --model-path models/Qwen3-4B --coarse-base-model-path models/Qwen3-4B \
-  --refinement-model-path outputs/refinement_graph_maven_qwen/refinement_model.pt \
-  --enable-refinement --no-completion-candidates \
-  --refinement-keep-threshold 0.30 --refinement-topology-mode none \
+  --refinement-model-path outputs/refinement_graph_maven_qwen_v4/refinement_model.pt \
+  --enable-refinement --include-completion-candidates \
+  --max-completion-edges 128 \
+  --refinement-keep-threshold 0.50 --refinement-topology-mode temporal-dag \
   --prediction-mode forecast-trace --coarse-topology-mode temporal-dag \
   --forecast-context-mode events-graph --max-graph-events-in-prompt 14 \
   --max-graph-edges-in-prompt 24 --forecast-max-event-chars 100 \
@@ -235,8 +239,10 @@ python src/evaluate_local_qwen_pipeline.py \
   --precomputed-events datasets/mirai_event_inputs_rule/mirai_forecast_event_input_dev.jsonl \
   --queries-from-precomputed-events --model-path models/Qwen3-4B \
   --forecast-adapter-path outputs/forecast_trace_grpo_judge_with_refinement/final_adapter \
-  --refinement-model-path outputs/refinement_graph_maven_qwen/refinement_model.pt \
-  --enable-refinement --refinement-keep-threshold 0.30 \
+  --refinement-model-path outputs/refinement_graph_maven_qwen_v4/refinement_model.pt \
+  --enable-refinement --include-completion-candidates \
+  --max-completion-edges 128 --refinement-keep-threshold 0.50 \
+  --refinement-topology-mode temporal-dag \
   --prediction-mode forecast-trace --forecast-context-mode events-graph \
   --output-dir outputs/eval_mirai_forecast_dev_with_refinement
 ```

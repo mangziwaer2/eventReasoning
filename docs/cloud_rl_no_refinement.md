@@ -90,7 +90,7 @@ python src/train_forecast_code_sft.py \
   --input outputs/grpo_context_mirai_forecast_train_no_refine/grpo_context.jsonl \
   --dataset datasets/MIRAI_data.zip --model-path models/Qwen3-4B \
   --output-dir outputs/mirai_forecast_sft_train \
-  --num-train-epochs 10 --per-device-train-batch-size 1 \
+  --num-train-epochs 1 --per-device-train-batch-size 1 \
   --gradient-accumulation-steps 4 --learning-rate 2e-5 \
   --max-prompt-length 2048 --max-completion-length 768 \
   --max-sequence-length 2304 --logging-steps 10

@@ -10,6 +10,9 @@ JUDGE_SYSTEM_PROMPT = (
     "whether its causal direction and time are coherent, and whether it connects to the proposed answer. "
     "Historical events are evidence, not forecast steps: exact or near-verbatim restatements of them "
     "as intermediate trace events are invalid. "
+    "The expected_effect field must state a concrete causal mechanism or observable implication. "
+    "Phrases such as 'increased likelihood of this event' or 'raises likelihood' without explaining what changes and why "
+    "are non-explanations and must receive a low causal/answer-link score. "
     "Do not use outside knowledge and do not decide correctness from the hidden gold label. Return JSON only."
 )
 
@@ -32,6 +35,15 @@ def _query_text(query: Any) -> str:
     return str(query or "").strip()
 
 
+def _query_time(query: Any, key: str) -> str:
+    if not isinstance(query, dict):
+        return ""
+    value = query.get(key)
+    if not value and isinstance(query.get("metadata"), dict):
+        value = query["metadata"].get(key)
+    return str(value or "").strip()
+
+
 def _graph_text(graph: Any) -> str:
     if not isinstance(graph, dict):
         return "- graph unavailable"
@@ -46,8 +58,15 @@ def _graph_text(graph: Any) -> str:
             or event.get("mention")
             or event.get("event", "")
         ).strip()
+        metadata = event.get("metadata", {})
+        event_time = str(
+            event.get("event_time") or event.get("date") or event.get("publish_time")
+            or (metadata.get("event_time") if isinstance(metadata, dict) else "")
+            or (metadata.get("publish_time") if isinstance(metadata, dict) else "")
+            or ""
+        ).strip()
         if event_id:
-            lines.append(f"- {event_id}: {text or '(no event text)'}")
+            lines.append(f"- {event_id}: time={event_time or '-'} | {text or '(no event text)'}")
     if not lines:
         lines.append("- no graph events")
     lines.append("Edges:")
@@ -81,13 +100,17 @@ def build_judge_prompt(
     answer = prediction.get("final_answer", {}) if isinstance(prediction, dict) else {}
     return (
         "Score the candidate trace on a 0 to 1 scale. A high score requires concrete events, "
-        "valid support in the graph, correct edge direction, a pre-target relative time, and a direct "
+        "valid support in the graph, correct edge direction, a time after observation and before the target answer, and a direct "
         "connection to the proposed answer. A trace event must be a distinct future hypothesis even when it cites a historical event. "
         "Penalize exact or near-verbatim historical copies, copied placeholders, generic claims, unsupported "
-        "facts, and answer links that are not explained by the trace.\n\n"
+        "facts, vague expected_effect text, and answer links that are not explained by the trace. "
+        "For expected_effect, require a specific mechanism (actor action, constraint, response, or state change) "
+        "and its consequence; do not award causal credit for merely restating that an event is more likely.\n\n"
         "Output exactly:\n"
         '{"support":0.0,"causal":0.0,"temporal":0.0,"answer_link":0.0,"hallucination":0.0,"overall":0.0,"reason":"short reason"}\n\n'
-        f"Query: {_query_text(query)}\n\n"
+        f"Query: {_query_text(query)}\n"
+        f"Observation/cutoff date: {_query_time(query, 'observation_time') or '-'}\n"
+        f"Target answer date: {_query_time(query, 'target_time') or _query_time(query, 'target_date') or '-'}\n\n"
         "Graph:\n"
         f"{_graph_text(graph)}\n\n"
         "Candidate trace:\n"
@@ -107,6 +130,8 @@ def build_description_judge_prompt(
     return (
         "Evaluate semantic equivalence, not exact wording. The generated description may be a "
         "concise paraphrase, but it must describe the same event type as the canonical description. "
+        "Preserve actor direction: code 042 ('Make a visit') means the subject travels to another location, "
+        "whereas code 043 ('Host a visit') means the subject receives/hosts the visitor; these are not interchangeable. "
         "Do not judge whether the code is correct for a query; only compare the two descriptions.\n\n"
         "Output exactly:\n"
         '{"match":0.0,"reason":"short reason"}\n\n'

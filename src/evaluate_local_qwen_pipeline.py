@@ -584,6 +584,19 @@ def example_from_event_input(record) -> MiraiQueryExample:
     query = record.query
     query_metadata = query.metadata if isinstance(query.metadata, dict) else {}
     metadata = record.metadata if isinstance(record.metadata, dict) else {}
+    if metadata.get("target_events"):
+        query.metadata = dict(query_metadata)
+        query.metadata["target_events"] = metadata["target_events"]
+        dates = sorted(
+            str(item.get("date", "")).strip()
+            for item in metadata["target_events"]
+            if isinstance(item, dict) and str(item.get("date", "")).strip()
+        )
+        if dates:
+            query.metadata["target_time"] = dates[0]
+    for key in ("target_label_start", "target_label_end", "target_horizon_days"):
+        if key in metadata:
+            query.metadata[key] = metadata[key]
     answer_list = [str(item).strip() for item in metadata.get("answer_list", []) if str(item).strip()]
     if not answer_list:
         answer_list = [str(item).strip() for item in query_metadata.get("gold_answer_list", []) if str(item).strip()]
@@ -610,7 +623,7 @@ def example_from_event_input(record) -> MiraiQueryExample:
         docids=[document.document_id for document in record.documents],
         answer_list=answer_list,
         answer_dict=answer_dict,
-        raw_row={"_embedded_event_input": True},
+        raw_row={"_embedded_event_input": True, "_event_input_metadata": metadata},
     )
 
 
@@ -981,7 +994,16 @@ def main() -> None:
                 )
                 forecast_prompt = append_no_think(prompt_bundle.prompt)
                 compact_graph = {
-                    "events": [{"event_id": event.event_id} for event in refined_graph.events],
+                    "events": [
+                        {
+                            "event_id": event.event_id,
+                            "text": event.text,
+                            "event_time": event.metadata.get("event_time")
+                            or event.metadata.get("date")
+                            or event.metadata.get("publish_time"),
+                        }
+                        for event in refined_graph.events
+                    ],
                     "edges": [
                         {
                             "edge_id": edge.edge_id,

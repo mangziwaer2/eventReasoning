@@ -29,6 +29,16 @@ def _answer_items(prediction: dict[str, Any]) -> list[dict[str, Any]]:
     return [final_answer] if isinstance(final_answer, dict) else []
 
 
+def _directional_description_compatible(code: str, generated: str) -> bool:
+    """Guard the common 042/043 role reversal that a generic semantic judge may accept."""
+    text = " ".join(str(generated).lower().split())
+    if code == "042" and ("host" in text or "receive" in text):
+        return False
+    if code == "043" and any(token in text for token in ("make a visit", "travel", "go to", "visit another")):
+        return False
+    return True
+
+
 class JudgeGRPOReward:
     """Deterministic forecast reward plus frozen-Qwen trace/semantic judges."""
 
@@ -87,10 +97,11 @@ class JudgeGRPOReward:
         self.call_count = 0
         self.last_breakdowns: list[dict[str, float]] = []
 
-    def _score_descriptions(self, prediction: dict[str, Any]) -> tuple[float, float, list[dict[str, Any]]]:
+    def _score_descriptions(self, prediction: dict[str, Any]) -> tuple[float, float, float, list[dict[str, Any]]]:
         if self.description_weight <= 0.0:
-            return 0.0, 0.0, []
+            return 0.0, 0.0, 0.0, []
         scores: list[float] = []
+        quality_scores: list[float] = []
         parsed: list[float] = []
         audit: list[dict[str, Any]] = []
         for item in _answer_items(prediction):
@@ -100,17 +111,21 @@ class JudgeGRPOReward:
             if not code or not generated or not canonical:
                 continue
             result = self.judge.score_description(code, canonical, generated)
-            scores.append(float(result.get("match", 0.0)))
+            direction_valid = _directional_description_compatible(code, generated)
+            match = max(0.0, min(1.0, float(result.get("match", 0.0))))
+            scores.append(match)
+            quality_scores.append(match if direction_valid else -1.0)
             parsed.append(float(bool(result.get("parsed_json", False))))
             audit.append({
                 "code": code,
                 "canonical_description": canonical,
                 "generated_description": generated,
+                "directional_description_valid": float(direction_valid),
                 **result,
             })
         if not scores:
-            return 0.0, 0.0, audit
-        return sum(scores) / len(scores), sum(parsed) / len(parsed), audit
+            return 0.0, 0.0, 0.0, audit
+        return (sum(scores) / len(scores), sum(parsed) / len(parsed), sum(quality_scores) / len(quality_scores), audit)
 
     def __call__(self, prompts: Any = None, completions: Any = None, **kwargs: Any) -> list[float]:
         if completions is None:
@@ -138,11 +153,11 @@ class JudgeGRPOReward:
                     graph=context.trajectory.metadata.get("refined_graph"),
                     context_prompt=completion_to_text(prompt_value),
                 )
-                description_score, description_parsed, description_judge = self._score_descriptions(prediction)
+                description_score, description_parsed, description_quality, description_judge = self._score_descriptions(prediction)
                 answer = float(base.get("answer", 0.0))
                 gate = 1.0 if answer > 0.0 else 0.2
                 judge_score = float(judge.get("overall", 0.0))
-                description_reward = self.description_weight * gate * description_score
+                description_reward = self.description_weight * gate * description_quality
                 total = answer + gate * float(base.get("trace", 0.0)) + self.judge_weight * gate * judge_score + description_reward
                 if not math.isfinite(total):
                     raise ValueError("non-finite reward")
@@ -158,6 +173,8 @@ class JudgeGRPOReward:
                     "judge_partial": float(bool(judge.get("partial_json", False))),
                     "judge_gate": gate,
                     "description_match": description_score,
+                    "description_quality": description_quality,
+                    "description_direction_mismatch": (sum(1.0 for item in description_judge if not bool(item.get("directional_description_valid", False))) / len(description_judge) if description_judge else 0.0),
                     "description_judge_parsed": description_parsed,
                     "description_gate": gate,
                     "description_reward": description_reward,
@@ -208,6 +225,8 @@ class JudgeGRPOReward:
                     "judge_parse_rate": means.get("judge_parsed", 0.0),
                     "judge_partial_rate": means.get("judge_partial", 0.0),
                     "description_match": means.get("description_match", 0.0),
+                    "description_quality": means.get("description_quality", 0.0),
+                    "description_direction_mismatch": means.get("description_direction_mismatch", 0.0),
                     "description_judge_parse_rate": means.get("description_judge_parsed", 0.0),
                     "error_count": sum(1 for item in breakdowns if item.get("error_reward")),
                 }, ensure_ascii=False) + "\n")

@@ -194,6 +194,27 @@ def build_grpo_context(kwargs: dict[str, Any], index: int, batch_size: int) -> F
         value = _context_value(row, kwargs, (key,), index, batch_size, None)
         if value is not None:
             trajectory.metadata.setdefault(key, _json_loads_if_needed(value))
+    # Keep observation/target anchors available to the reward even when they are
+    # carried only in the MIRAI snapshot rather than the serialized trajectory.
+    query_metadata = trajectory.metadata.get("query", {})
+    if not isinstance(query_metadata, dict):
+        query_metadata = {}
+    target_events = gold.get("target_events", []) if isinstance(gold, dict) else []
+    if isinstance(target_events, list) and target_events:
+        query_metadata = dict(query_metadata)
+        query_metadata["target_events"] = target_events
+        dates = sorted(
+            str(item.get("date", "")).strip()
+            for item in target_events
+            if isinstance(item, dict) and str(item.get("date", "")).strip()
+        )
+        if dates:
+            query_metadata["target_time"] = dates[0]
+        trajectory.metadata["query"] = query_metadata
+    elif isinstance(gold, dict) and gold.get("target_time"):
+        query_metadata = dict(query_metadata)
+        query_metadata["target_time"] = gold["target_time"]
+        trajectory.metadata["query"] = query_metadata
     return ForecastTraceGRPOContext(gold=gold, trajectory=trajectory)
 
 

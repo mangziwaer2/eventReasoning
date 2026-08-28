@@ -146,12 +146,16 @@ def normalize_trace_event(item: Any, index: int) -> dict[str, Any]:
     relative_time = str(item.get("relative_time", "")).strip()
     if not relative_time and isinstance(event_payload, dict):
         relative_time = str(event_payload.get("relative_time", "")).strip()
+    event_time = str(item.get("event_time", item.get("date", ""))).strip()
+    if not event_time and isinstance(event_payload, dict):
+        event_time = str(event_payload.get("event_time", event_payload.get("date", ""))).strip()
     return {
         "trace_event_id": str(item.get("trace_event_id", item.get("id", f"ft_{index + 1}"))).strip() or f"ft_{index + 1}",
         "event": event_text,
         "trigger": str(item.get("trigger", event_payload.get("trigger", "") if isinstance(event_payload, dict) else "")).strip(),
         "actors": _event_actor_list(item),
         "relative_time": relative_time,
+        "event_time": event_time,
         "supporting_event_ids": _support_event_refs(item),
         "supporting_edge_ids": _support_edge_refs(item),
         "expected_effect": str(item.get("expected_effect", item.get("effect", ""))).strip(),

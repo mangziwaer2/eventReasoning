@@ -274,4 +274,19 @@ def export_mirai_query_snapshot(example: MiraiQueryExample) -> str:
         "answer_dict": example.answer_dict,
         "query_text": example.build_query_text(),
     }
+    embedded_metadata = example.raw_row.get("_event_input_metadata", {}) if isinstance(example.raw_row, dict) else {}
+    if isinstance(embedded_metadata, dict):
+        target_events = embedded_metadata.get("target_events", [])
+        if isinstance(target_events, list) and target_events:
+            payload["target_events"] = target_events
+            dates = sorted(
+                str(item.get("date", "")).strip()
+                for item in target_events
+                if isinstance(item, dict) and str(item.get("date", "")).strip()
+            )
+            if dates:
+                payload["target_time"] = dates[0]
+        for key in ("target_label_start", "target_label_end", "target_horizon_days"):
+            if key in embedded_metadata:
+                payload[key] = embedded_metadata[key]
     return json.dumps(payload, ensure_ascii=False, indent=2)

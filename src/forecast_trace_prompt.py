@@ -76,6 +76,7 @@ def _render_events(
             " | ".join(
                 [
                     event_ref,
+                    f"time={str(event.metadata.get('event_time') or event.metadata.get('date') or event.metadata.get('publish_time') or '-').strip()}",
                     f"trigger={_event_trigger(event)}",
                     f"mention={compact_text(mention, max_event_chars)}",
                     f"participants={participants}",
@@ -142,10 +143,13 @@ def build_structured_forecast_prompt(
     instructions = (
         "First output a structured forecast_trace, then output an answers list.\n"
         "Predict every likely closed-set event_code, with its canonical event_description.\n"
+        "The event_code is authoritative; event_description is auxiliary. Preserve the code's actor direction: 042 means the subject travels to visit, while 043 means the subject hosts/receives the visitor. Do not use 'Host a visit' for 042.\n"
         "Use only visible historical events and coarse-graph edges as support. Do not invent historical support.\n"
+        "Each visible historical event includes its observed time. An intermediate forecast event must occur strictly after the observation/cutoff date and strictly before the target answer date.\n"
+        "When a target answer date is available, relative_time is measured from that target date: t-1 means the day before the answer, t-2 means two days before, and t means the answer date. Prefer the unambiguous absolute event_time (YYYY-MM-DD).\n"
         "Historical events are evidence only: never copy or restate a visible historical event as an intermediate trace event.\n"
         "Every intermediate trace event must be a distinct possible future development before the target time; reusing actors or a trigger is allowed only when the predicted action/state is different.\n"
-        "Intermediate trace events may be new future hypotheses before the target time, but their support must point to visible events/edges.\n"
+        "Intermediate trace events must lie strictly between the observation/cutoff date and the target answer date; their support must point to visible events/edges.\n"
         "Keep the trace compact, concrete, and grounded; prefer a few well-supported steps over verbose speculation.\n"
         "The final trace event should explain why the predicted answer set is likely.\n"
         "Return strict JSON only with this schema:\n"
@@ -154,10 +158,10 @@ def build_structured_forecast_prompt(
         '    "intermediate_events": [\n'
         "      {\n"
         '        "trace_event_id": "ft_1",\n'
-        '        "event": {"trigger": "deploy", "mention": "security forces deploy near the capital", "actors": ["security forces"], "relative_time": "t-1"},\n'
+        '        "event": {"trigger": "deploy", "mention": "security forces deploy near the capital", "actors": ["security forces"], "event_time": "YYYY-MM-DD", "relative_time": "t-1"},\n'
         '        "supporting_events": [{"event_ref": "H01", "event": "the visible event that supports this hypothesis"}],\n'
         '        "supporting_edge_refs": ["R01"],\n'
-        '        "expected_effect": "why this raises or lowers a candidate outcome",\n'
+        '        "expected_effect": "specific mechanism: how this event changes the likelihood of the answer",\n'
         '        "confidence": 0.0\n'
         "      }\n"
         "    ],\n"
@@ -168,7 +172,7 @@ def build_structured_forecast_prompt(
         "  },\n"
         '  "answers": [{"event_code": "<3-digit-event-code>", "event_description": "canonical event description"}]\n'
         "}\n\n"
-        "Invalid outputs: copied or near-verbatim historical events in intermediate_events, nonexistent event_ref/edge_ref, placeholder event codes such as <3-digit-event-code>, generic events like 'tensions rise', invalid event_code, or cutoff-after facts as observed history.\n\n"
+        "Invalid outputs: copied or near-verbatim historical events in intermediate_events, nonexistent event_ref/edge_ref, placeholder event codes such as <3-digit-event-code>, generic events like 'tensions rise', invalid event_code, or events at/before the cutoff or at/after the answer date.\n\n"
     )
     prompt = (
         "You are a future event forecasting model.\n"
@@ -177,6 +181,7 @@ def build_structured_forecast_prompt(
         + instructions
         + f"Query: {query.text}\n"
         + f"Target/Cutoff date: {query.cutoff_time or '-'}\n"
+        + f"Target answer date: {str(query.metadata.get('target_time', '')).strip() or '-'}\n"
         + f"Focus actors: {', '.join(query.focus_entities) or '-'}\n\n"
         + document_section
         + "Visible historical events:\n"

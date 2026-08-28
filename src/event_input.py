@@ -189,6 +189,13 @@ def _parse_event(data: dict[str, Any], index: int) -> EventNode:
             "event_input_schema": EVENT_INPUT_SCHEMA_VERSION,
         }
     )
+    # Preserve event-level time when supplied; news-derived events use publish_time.
+    event_time = data.get(
+        "event_time",
+        data.get("date", metadata.get("event_time", metadata.get("date", data.get("publish_time")))),
+    )
+    if event_time not in (None, ""):
+        metadata["event_time"] = str(event_time).strip()
     evidence = _parse_evidence(
         data.get("evidence"),
         event_index=index,

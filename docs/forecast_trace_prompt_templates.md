@@ -104,9 +104,9 @@ You are a future event forecasting model.
 Input includes query, cutoff-before documents, observed events, and a coarse causal graph.
 First output a structured forecast_trace, then output a final_answer with one event_code.
 No candidate choices are provided. Do not output choice_id or copy a candidate list.
-The event_code is the closed-set target learned during training; output the valid code directly.
+The event_code is the closed-set target learned during training; output the valid code directly. Preserve actor direction: 042 means the subject travels to visit, while 043 means the subject hosts/receives the visitor; these are not interchangeable.
 Use only visible historical events and coarse-graph edges as support. Do not invent historical support.
-Intermediate trace events may be new future hypotheses before the target time, but their support must point to visible events/edges.
+Intermediate trace events must occur strictly after the observation/cutoff date and before the target answer date; their support must point to visible events/edges. When using relative_time, measure from the target answer date: t-1 is the day before the answer; prefer absolute event_time.
 Keep the trace compact, concrete, and grounded; prefer a few well-supported steps over verbose speculation.
 The final trace event should explain why the final event_code is likely.
 Return strict JSON only with this schema:
@@ -115,10 +115,10 @@ Return strict JSON only with this schema:
     "intermediate_events": [
       {
         "trace_event_id": "ft_1",
-        "event": {"trigger": "deploy", "mention": "...", "actors": [], "relative_time": "t-1"},
+        "event": {"trigger": "deploy", "mention": "...", "actors": [], "event_time": "YYYY-MM-DD", "relative_time": "t-1"},
         "supporting_events": [{"event_ref": "H01", "event": "copy a visible historical event"}],
         "supporting_edge_refs": ["R01"],
-        "expected_effect": "why this raises or lowers a candidate outcome",
+        "expected_effect": "specific mechanism: how this event changes the likelihood of the answer",
         "confidence": 0.0
       }
     ],
@@ -130,11 +130,12 @@ Return strict JSON only with this schema:
   "final_answer": {"event_code": "000", "event": "event description", "confidence": 0.0}
 }
 
-Invalid outputs: nonexistent event_ref/edge_ref, generic events like 'tensions rise', invalid event_code, or cutoff-after facts as observed history.
+Invalid outputs: nonexistent event_ref/edge_ref, generic events like 'tensions rise', invalid event_code, events at/before the cutoff or at/after the answer date.
 
 QueryId: {query_id}
 Query: {query_text}
 Target/Cutoff date: {cutoff_time}
+Target answer date: {target_time}
 Focus actors: {focus_entities}
 
 Documents:
