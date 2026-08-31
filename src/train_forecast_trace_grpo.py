@@ -69,18 +69,6 @@ class CollapseGuardCallback(TrainerCallback):
         return control
 
 
-class StageStepCapCallback(TrainerCallback):
-    """Stop a pilot without shortening the scheduler horizon."""
-
-    def __init__(self, max_steps: int) -> None:
-        self.max_steps = max(0, int(max_steps))
-
-    def on_step_end(self, args: Any, state: Any, control: Any, **kwargs: Any) -> Any:
-        if self.max_steps > 0 and int(getattr(state, "global_step", 0)) >= self.max_steps:
-            control.should_training_stop = True
-        return control
-
-
 class TeeStream:
     def __init__(self, *streams: Any) -> None:
         self.streams = streams
@@ -140,16 +128,10 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Hard step cap (default: 0, disabled). A positive value takes precedence over epochs.",
     )
-    parser.add_argument(
-        "--stage-stop-after-steps",
-        type=int,
-        default=0,
-        help="Stop a staged pilot after N steps without changing the full-epoch scheduler horizon.",
-    )
     parser.add_argument("--per-device-train-batch-size", type=int, default=4)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=8)
-    parser.add_argument("--learning-rate", type=float, default=5e-6)
-    parser.add_argument("--warmup-ratio", type=float, default=0.05)
+    parser.add_argument("--learning-rate", type=float, default=1e-6)
+    parser.add_argument("--warmup-ratio", type=float, default=0.1)
     parser.add_argument(
         "--beta",
         type=float,
@@ -194,7 +176,7 @@ def parse_args() -> argparse.Namespace:
         default=0.05,
         help="Minimum fraction of reward groups containing at least one gold answer hit.",
     )
-    parser.add_argument("--max-grad-norm", type=float, default=1.0)
+    parser.add_argument("--max-grad-norm", type=float, default=0.5)
     parser.add_argument("--max-prompt-length", type=int, default=2048)
     parser.add_argument("--max-completion-length", type=int, default=512)
     parser.add_argument("--logging-steps", type=int, default=10)
@@ -206,8 +188,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--wrong-answer-trace-scale",
         type=float,
-        default=0.2,
-        help="Trace reward multiplier when no gold event code is hit; 0.2 reproduces the successful main run.",
+        default=0.05,
+        help="Trace reward multiplier when no gold event code is hit; keep small to preserve exploration without format hacking.",
     )
     parser.add_argument(
         "--collapse-patience",
@@ -316,8 +298,11 @@ def build_training_config(config_cls: Any, args: argparse.Namespace) -> Any:
         "max_completion_length": args.max_completion_length,
         "seed": args.seed,
         "beta": getattr(args, "beta", 0.04),
+        "loss_type": "grpo",
         "temperature": 1.0,
         "top_p": 1.0,
+        "repetition_penalty": 1.05,
+        "save_total_limit": 3,
     }
     accepted = inspect.signature(config_cls).parameters
     return config_cls(**{key: value for key, value in values.items() if key in accepted})
@@ -346,7 +331,7 @@ def validate_two_stage_args(args: argparse.Namespace) -> None:
     stage = str(getattr(args, "grpo_stage", "single"))
     beta = float(getattr(args, "beta", 0.0))
     policy = str(getattr(args, "policy", "forecast_trace_reward"))
-    wrong_answer_trace_scale = float(getattr(args, "wrong_answer_trace_scale", 0.2))
+    wrong_answer_trace_scale = float(getattr(args, "wrong_answer_trace_scale", 0.05))
     min_groups = int(getattr(args, "stage_min_reward_groups", 20))
     if min_groups <= 0:
         raise ValueError("--stage-min-reward-groups must be positive.")
@@ -363,10 +348,9 @@ def validate_two_stage_args(args: argparse.Namespace) -> None:
         return
     if policy != "forecast_trace_reward":
         raise ValueError("Two-stage GRPO must preserve main's forecast_trace_reward policy.")
-    if wrong_answer_trace_scale != 0.2:
+    if wrong_answer_trace_scale != 0.05:
         raise ValueError(
-            "Two-stage GRPO must preserve successful main's --wrong-answer-trace-scale 0.2; "
-            "use --grpo-stage single for ablations."
+            "Two-stage GRPO must preserve main's --wrong-answer-trace-scale 0.05; use --grpo-stage single for ablations."
         )
     if stage == "bootstrap":
         if beta != 0.0:
@@ -393,7 +377,7 @@ def validate_two_stage_args(args: argparse.Namespace) -> None:
         raise ValueError(f"Bootstrap manifest has not passed its health gate: {manifest_path}")
     if (
         manifest.get("reward_policy") != "forecast_trace_reward"
-        or float(manifest.get("wrong_answer_trace_scale", -1.0)) != 0.2
+        or float(manifest.get("wrong_answer_trace_scale", -1.0)) != 0.05
     ):
         raise ValueError(
             f"Bootstrap manifest does not preserve the verified main reward configuration: {manifest_path}"
@@ -488,8 +472,6 @@ def main() -> None:
         raise ValueError("--min-coarse-edges must be non-negative.")
     if args.max_steps < 0:
         raise ValueError("--max-steps must be non-negative.")
-    if args.stage_stop_after_steps < 0:
-        raise ValueError("--stage-stop-after-steps must be non-negative.")
     if args.num_train_epochs <= 0:
         raise ValueError("--num-train-epochs must be positive.")
     if args.learning_rate <= 0:
@@ -638,8 +620,6 @@ def main() -> None:
                     max_zero_std_ratio=args.collapse_max_zero_std_ratio,
                 )
                 trainer.add_callback(collapse_guard)
-            if args.stage_stop_after_steps > 0:
-                trainer.add_callback(StageStepCapCallback(args.stage_stop_after_steps))
             train_result = trainer.train()
             if hasattr(trainer, "save_state"):
                 try:
