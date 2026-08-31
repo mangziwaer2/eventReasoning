@@ -113,8 +113,10 @@ src/train_forecast_trace_grpo_judge.py
 
 ### 基于 main 的两阶段 Judge-GRPO
 
-第一阶段严格保留已验证 main 实验的 reward、采样参数和 `wrong-answer-trace-scale=0.05`，只通过
-`--grpo-stage bootstrap --beta 0` 显式标记为 bootstrap。先跑 100 step，不要直接跑完整 epoch：
+第一阶段严格保留成功 main checkpoint 的实际配置：`loss_type=dapo`、`repetition_penalty=1.0`、
+`max_grad_norm=1.0` 和 `wrong-answer-trace-scale=0.2`，只通过 `--grpo-stage bootstrap --beta 0`
+显式标记为 bootstrap。先跑 100 step，不要直接跑完整 epoch。使用 callback 停止 pilot，不能用
+`--max-steps 100`，否则会把学习率调度总长度也缩短到 100，无法复现 main 的前 100 步：
 
 ```bash
 python src/train_forecast_trace_grpo_judge.py \
@@ -132,7 +134,8 @@ python src/train_forecast_trace_grpo_judge.py \
   --max-samples 0 --min-coarse-edges 1 \
   --num-generations 4 --per-device-train-batch-size 4 \
   --gradient-accumulation-steps 1 --learning-rate 5e-6 \
-  --num-train-epochs 1 --max-steps 100 --max-prompt-length 2048 \
+  --num-train-epochs 1 --max-steps 0 --stage-stop-after-steps 100 \
+  --max-prompt-length 2048 \
   --max-completion-length 512 --logging-steps 1 --save-steps 100 \
   --reward-log-every 1 --sample-log-every 5 --sample-log-count 2
 ```
@@ -160,7 +163,8 @@ python src/train_forecast_trace_grpo_judge.py \
   --max-samples 0 --min-coarse-edges 1 \
   --num-generations 4 --per-device-train-batch-size 4 \
   --gradient-accumulation-steps 1 --learning-rate 1e-6 \
-  --num-train-epochs 1 --max-steps 100 --max-prompt-length 2048 \
+  --num-train-epochs 1 --max-steps 0 --stage-stop-after-steps 100 \
+  --max-prompt-length 2048 \
   --max-completion-length 512 --logging-steps 1 --save-steps 100 \
   --reward-log-every 1 --sample-log-every 5 --sample-log-count 2
 ```
@@ -171,7 +175,7 @@ python src/train_forecast_trace_grpo_judge.py \
 
 先用上面的 100-step KL pilot 与第一阶段 checkpoint、旧 main checkpoint 做固定 held-out 对比。确认 answer
 格式率、answer F1 和通用回答能力均未下降后，再从同一个第一阶段 adapter 重新启动第二阶段正式训练，使用
-新的 output/cache，并把 `--max-steps` 改为 `0`。不要从 KL pilot adapter 继续正式训练，否则 reference 会变成
+新的 output/cache，并把 `--stage-stop-after-steps` 改为 `0`。不要从 KL pilot adapter 继续正式训练，否则 reference 会变成
 pilot 结束时的策略，失去与第一阶段固定基线的可比性。
 
 ## 5. Refinement 训练和带 refinement 的 Judge-GRPO

@@ -13,6 +13,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from train_forecast_trace_grpo import CollapseGuardCallback
 from train_forecast_trace_grpo import STAGE_MANIFEST_NAME
+from train_forecast_trace_grpo import StageStepCapCallback
 from train_forecast_trace_grpo import build_training_config
 from train_forecast_trace_grpo import reference_policy_mode
 from train_forecast_trace_grpo import summarize_stage_health
@@ -29,7 +30,7 @@ class _Config:
         max_steps=-1,
         beta=0.0,
         max_grad_norm=0.0,
-        loss_type="",
+        loss_type="dapo",
         repetition_penalty=1.0,
         **kwargs,
     ) -> None:
@@ -59,7 +60,7 @@ class _TokenizerLoader:
 
 
 class GrpoStabilityTests(unittest.TestCase):
-    def test_training_config_has_kl_and_hard_step_cap(self) -> None:
+    def test_training_config_adds_kl_without_changing_main_sampling_defaults(self) -> None:
         args = argparse.Namespace(
             output_dir="outputs/test",
             learning_rate=1e-6,
@@ -68,7 +69,7 @@ class GrpoStabilityTests(unittest.TestCase):
             num_train_epochs=1.0,
             max_steps=120,
             warmup_ratio=0.1,
-            max_grad_norm=0.5,
+            max_grad_norm=1.0,
             logging_steps=10,
             save_steps=100,
             num_generations=4,
@@ -80,9 +81,17 @@ class GrpoStabilityTests(unittest.TestCase):
         config = build_training_config(_Config, args)
         self.assertEqual(config.max_steps, 120)
         self.assertAlmostEqual(config.beta, 0.04)
-        self.assertAlmostEqual(config.max_grad_norm, 0.5)
-        self.assertEqual(config.loss_type, "grpo")
-        self.assertAlmostEqual(config.repetition_penalty, 1.05)
+        self.assertAlmostEqual(config.max_grad_norm, 1.0)
+        self.assertEqual(config.loss_type, "dapo")
+        self.assertAlmostEqual(config.repetition_penalty, 1.0)
+
+    def test_stage_step_cap_does_not_change_trainer_max_steps(self) -> None:
+        callback = StageStepCapCallback(100)
+        control = _Control()
+        callback.on_step_end(None, argparse.Namespace(global_step=99), control)
+        self.assertFalse(control.should_training_stop)
+        callback.on_step_end(None, argparse.Namespace(global_step=100), control)
+        self.assertTrue(control.should_training_stop)
 
     def test_collapse_guard_stops_after_patience(self) -> None:
         guard = CollapseGuardCallback(patience=2, min_entropy=0.03, max_zero_std_ratio=0.95)
@@ -118,8 +127,8 @@ class GrpoStabilityTests(unittest.TestCase):
         validate_two_stage_args(self._stage_args(beta=0.0))
         with self.assertRaisesRegex(ValueError, "requires --beta 0"):
             validate_two_stage_args(self._stage_args(beta=0.04))
-        with self.assertRaisesRegex(ValueError, "preserve main's --wrong-answer-trace-scale 0.05"):
-            validate_two_stage_args(self._stage_args(wrong_answer_trace_scale=0.2))
+        with self.assertRaisesRegex(ValueError, "successful main's --wrong-answer-trace-scale 0.2"):
+            validate_two_stage_args(self._stage_args(wrong_answer_trace_scale=0.05))
 
     def test_kl_stage_requires_passed_bootstrap_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -136,7 +145,7 @@ class GrpoStabilityTests(unittest.TestCase):
                         "stage": "bootstrap",
                         "status": "passed",
                         "reward_policy": "forecast_trace_reward",
-                        "wrong_answer_trace_scale": 0.05,
+                        "wrong_answer_trace_scale": 0.2,
                         "final_adapter": str(adapter),
                     }
                 ),
