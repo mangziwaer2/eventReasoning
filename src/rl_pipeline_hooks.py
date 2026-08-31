@@ -152,6 +152,20 @@ def _valid_event_code_score(prediction: dict[str, Any]) -> float:
     return 1.0 if re.fullmatch(r"\d{3}", event_code) else 0.0
 
 
+def _valid_answer_format_score(prediction: dict[str, Any]) -> float:
+    answers = prediction.get("answers", [])
+    if not isinstance(answers, list) or not answers:
+        return 0.0
+    codes = [
+        str(item.get("event_code", "")).strip()
+        for item in answers
+        if isinstance(item, dict)
+    ]
+    valid = len(codes) == len(answers) and all(
+        re.fullmatch(r"\d{3}", code) for code in codes)
+    return 1.0 if valid else 0.0
+
+
 def _support_refs(prediction: dict[str, Any]) -> tuple[list[str], list[str]]:
     event_refs: list[str] = []
     edge_refs: list[str] = []
@@ -521,6 +535,7 @@ class ForecastTraceReward:
 
         answer = self.answer_reward(prediction, gold)
         fmt = _format_score(prediction)
+        valid_answer_format = _valid_answer_format_score(prediction)
 
         if refined_graph is None:
             valid_event_ratio = 0.0
@@ -576,6 +591,7 @@ class ForecastTraceReward:
         return {
             "answer": round(answer, 6),
             "format": round(fmt, 6),
+            "valid_answer_format": round(valid_answer_format, 6),
             "grounding": round(grounding, 6),
             "valid_event_ref_ratio": round(valid_event_ratio, 6),
             "valid_edge_ref_ratio": round(valid_edge_ratio, 6),

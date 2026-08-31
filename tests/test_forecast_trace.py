@@ -25,9 +25,23 @@ from event_input import parse_event_input_record
 from train_forecast_trace_grpo import filter_rollout_rows_by_edge_count
 from rl_pipeline_hooks import ForecastTraceReward
 from rl_pipeline_hooks import PipelineTrajectory
+from rl_pipeline_hooks import _valid_answer_format_score
 
 
 class ForecastTraceTests(unittest.TestCase):
+    def test_answer_format_audit_requires_every_code_to_be_three_digits(self) -> None:
+        valid = parse_structured_forecast(
+            '{"answers":[{"event_code":"036"},{"event_code":"042"}]}'
+        )
+        invalid = parse_structured_forecast(
+            '{"answers":[{"event_code":"036"},{"event_code":"F21"}]}'
+        )
+        empty = parse_structured_forecast('{"answers":[]}')
+
+        self.assertEqual(_valid_answer_format_score(valid), 1.0)
+        self.assertEqual(_valid_answer_format_score(invalid), 0.0)
+        self.assertEqual(_valid_answer_format_score(empty), 0.0)
+
     def test_mirai_forecast_event_input_supplies_query_and_documents(self) -> None:
         payload = {
             "schema_version": "event-input-v1",

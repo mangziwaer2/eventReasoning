@@ -16,6 +16,9 @@ from local_qwen_lora import load_qwen_with_lora
 from path_utils import REPO_ROOT
 from path_utils import resolve_repo_path
 
+STAGE_MANIFEST_NAME = "grpo_stage_manifest.json"
+
+
 try:
     from transformers.trainer_callback import TrainerCallback
 except ImportError:  # Keep argument parsing/imports usable without Transformers installed.
@@ -123,7 +126,7 @@ def parse_args() -> argparse.Namespace:
         "--max-steps",
         type=int,
         default=0,
-        help="Hard step cap (default: 800). A positive value takes precedence over epochs; use 0 to disable.",
+        help="Hard step cap (default: 0, disabled). A positive value takes precedence over epochs.",
     )
     parser.add_argument("--per-device-train-batch-size", type=int, default=4)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=8)
@@ -134,6 +137,44 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.04,
         help="Reference-policy KL coefficient. Keep positive to prevent LoRA drift.",
+    )
+    parser.add_argument(
+        "--grpo-stage",
+        choices=("single", "bootstrap", "kl"),
+        default="single",
+        help=(
+            "Training stage. bootstrap requires beta=0 and writes a health manifest; "
+            "kl requires beta>0 and a passed bootstrap adapter."
+        ),
+    )
+    parser.add_argument(
+        "--allow-unverified-bootstrap-adapter",
+        action="store_true",
+        help="Allow the KL stage to start without a passed bootstrap manifest (unsafe escape hatch).",
+    )
+    parser.add_argument(
+        "--stage-min-reward-groups",
+        type=int,
+        default=20,
+        help="Minimum audited reward groups required for a staged run to pass.",
+    )
+    parser.add_argument(
+        "--stage-min-valid-answer-rate",
+        type=float,
+        default=0.5,
+        help="Minimum mean rate of non-empty three-digit answers required for staged-run acceptance.",
+    )
+    parser.add_argument(
+        "--stage-min-format-score",
+        type=float,
+        default=0.75,
+        help="Minimum mean structured-output format score required for staged-run acceptance.",
+    )
+    parser.add_argument(
+        "--stage-min-answer-hit-group-rate",
+        type=float,
+        default=0.05,
+        help="Minimum fraction of reward groups containing at least one gold answer hit.",
     )
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
     parser.add_argument("--max-prompt-length", type=int, default=2048)
@@ -282,6 +323,139 @@ def build_trainer(trainer_cls: Any, model: Any, tokenizer: Any, config: Any, dat
     return trainer_cls(**{key: value for key, value in values.items() if key in parameters})
 
 
+def bootstrap_manifest_path(adapter_path: str | Path) -> Path:
+    return resolve_repo_path(str(adapter_path)).parent / STAGE_MANIFEST_NAME
+
+
+def validate_two_stage_args(args: argparse.Namespace) -> None:
+    stage = str(getattr(args, "grpo_stage", "single"))
+    beta = float(getattr(args, "beta", 0.0))
+    policy = str(getattr(args, "policy", "forecast_trace_reward"))
+    wrong_answer_trace_scale = float(getattr(args, "wrong_answer_trace_scale", 0.05))
+    min_groups = int(getattr(args, "stage_min_reward_groups", 20))
+    if min_groups <= 0:
+        raise ValueError("--stage-min-reward-groups must be positive.")
+    for name in (
+        "stage_min_valid_answer_rate",
+        "stage_min_format_score",
+        "stage_min_answer_hit_group_rate",
+    ):
+        value = float(getattr(args, name, 0.0))
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"--{name.replace('_', '-')} must be between 0 and 1.")
+
+    if stage == "single":
+        return
+    if policy != "forecast_trace_reward":
+        raise ValueError("Two-stage GRPO must preserve main's forecast_trace_reward policy.")
+    if wrong_answer_trace_scale != 0.05:
+        raise ValueError(
+            "Two-stage GRPO must preserve main's --wrong-answer-trace-scale 0.05; use --grpo-stage single for ablations."
+        )
+    if stage == "bootstrap":
+        if beta != 0.0:
+            raise ValueError("--grpo-stage bootstrap requires --beta 0.")
+        return
+    if stage != "kl":
+        raise ValueError(f"Unsupported GRPO stage: {stage}")
+    if beta <= 0.0:
+        raise ValueError("--grpo-stage kl requires a positive --beta.")
+    if bool(getattr(args, "allow_unverified_bootstrap_adapter", False)):
+        return
+
+    manifest_path = bootstrap_manifest_path(args.adapter_path)
+    if not manifest_path.is_file():
+        raise ValueError(
+            f"KL stage requires a passed bootstrap manifest at {manifest_path}. "
+            "Run the bootstrap stage first or pass --allow-unverified-bootstrap-adapter deliberately."
+        )
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Cannot read bootstrap manifest: {manifest_path}") from exc
+    if not isinstance(manifest, dict) or manifest.get("stage") != "bootstrap" or manifest.get("status") != "passed":
+        raise ValueError(f"Bootstrap manifest has not passed its health gate: {manifest_path}")
+    if (
+        manifest.get("reward_policy") != "forecast_trace_reward"
+        or float(manifest.get("wrong_answer_trace_scale", -1.0)) != 0.05
+    ):
+        raise ValueError(
+            f"Bootstrap manifest does not preserve the verified main reward configuration: {manifest_path}"
+        )
+
+
+def reference_policy_mode(model: Any, beta: float) -> str:
+    if beta <= 0.0:
+        return "disabled"
+    peft_config = getattr(model, "peft_config", None)
+    if peft_config is None:
+        return "separate_model"
+    try:
+        adapter_names = set(peft_config.keys())
+    except (AttributeError, TypeError):
+        adapter_names = set()
+    return "ref_adapter" if "ref" in adapter_names else "base_disabled"
+
+
+def summarize_stage_health(
+    reward_history_path: Path,
+    args: argparse.Namespace,
+    *,
+    collapse_triggered: bool = False,
+) -> dict[str, Any]:
+    rows = load_jsonl(reward_history_path) if reward_history_path.is_file() else []
+    sample_count = sum(max(1, int(row.get("batch_size", 1))) for row in rows)
+
+    def weighted_mean(key: str) -> float:
+        if sample_count <= 0:
+            return 0.0
+        total = 0.0
+        for row in rows:
+            weight = max(1, int(row.get("batch_size", 1)))
+            breakdown = row.get("breakdown_mean", {})
+            value = breakdown.get(key, 0.0) if isinstance(breakdown, dict) else 0.0
+            total += weight * float(value)
+        return total / sample_count
+
+    answer_hit_groups = 0
+    for row in rows:
+        breakdown = row.get("breakdown_mean", {})
+        if isinstance(breakdown, dict) and float(breakdown.get("answer", 0.0)) > 0.0:
+            answer_hit_groups += 1
+    group_count = len(rows)
+    metrics = {
+        "reward_groups": group_count,
+        "completion_samples": sample_count,
+        "valid_answer_rate": round(weighted_mean("valid_answer_format"), 6),
+        "mean_format_score": round(weighted_mean("format"), 6),
+        "answer_hit_group_rate": round(answer_hit_groups / group_count, 6) if group_count else 0.0,
+        "collapse_triggered": bool(collapse_triggered),
+    }
+    thresholds = {
+        "min_reward_groups": int(args.stage_min_reward_groups),
+        "min_valid_answer_rate": float(args.stage_min_valid_answer_rate),
+        "min_format_score": float(args.stage_min_format_score),
+        "min_answer_hit_group_rate": float(args.stage_min_answer_hit_group_rate),
+    }
+    failures: list[str] = []
+    if metrics["reward_groups"] < thresholds["min_reward_groups"]:
+        failures.append("insufficient_reward_groups")
+    if metrics["valid_answer_rate"] < thresholds["min_valid_answer_rate"]:
+        failures.append("valid_answer_rate")
+    if metrics["mean_format_score"] < thresholds["min_format_score"]:
+        failures.append("format_score")
+    if metrics["answer_hit_group_rate"] < thresholds["min_answer_hit_group_rate"]:
+        failures.append("answer_hit_group_rate")
+    if collapse_triggered:
+        failures.append("collapse_guard")
+    return {
+        "passed": not failures,
+        "metrics": metrics,
+        "thresholds": thresholds,
+        "failures": failures,
+    }
+
+
 def main() -> None:
     args = parse_args()
     if args.min_coarse_edges < 0:
@@ -298,6 +472,7 @@ def main() -> None:
         raise ValueError("--wrong-answer-trace-scale must be between 0 and 1.")
     if not args.adapter_path:
         raise ValueError("--adapter-path is required: start GRPO from the completed codebook+forecast SFT adapter.")
+    validate_two_stage_args(args)
     if args.num_generations < 2:
         raise ValueError("--num-generations must be at least 2 for GRPO group-relative advantages.")
     if args.per_device_train_batch_size < args.num_generations:
@@ -316,7 +491,12 @@ def main() -> None:
     log_path = output_dir / "training.log"
     if log_path.exists():
         log_path.unlink()
-    for audit_name in ("reward_history.jsonl", "rollout_samples.jsonl", "sample_generations.txt"):
+    for audit_name in (
+        "reward_history.jsonl",
+        "rollout_samples.jsonl",
+        "sample_generations.txt",
+        STAGE_MANIFEST_NAME,
+    ):
         audit_path = output_dir / audit_name
         if audit_path.exists():
             audit_path.unlink()
@@ -335,6 +515,10 @@ def main() -> None:
                         "forecast trace GRPO loading model",
                         f"inputs={len(input_paths)}",
                         f"chat_prompt={args.chat_prompt}",
+                        f"grpo_stage={args.grpo_stage}",
+                        f"beta={args.beta}",
+                        f"learning_rate={args.learning_rate}",
+                        f"wrong_answer_trace_scale={args.wrong_answer_trace_scale}",
                         f"num_generations={args.num_generations}",
                         f"batch_size={args.per_device_train_batch_size}",
                         f"min_coarse_edges={args.min_coarse_edges}",
@@ -411,14 +595,21 @@ def main() -> None:
             )
             config = build_training_config(GRPOConfig, args)
             trainer = build_trainer(GRPOTrainer, model, tokenizer, config, dataset, reward_fn)
-            if args.collapse_patience > 0:
-                trainer.add_callback(
-                    CollapseGuardCallback(
-                        patience=args.collapse_patience,
-                        min_entropy=args.collapse_min_entropy,
-                        max_zero_std_ratio=args.collapse_max_zero_std_ratio,
-                    )
+            reference_mode = reference_policy_mode(model, args.beta)
+            log_line(f"GRPO reference policy | stage={args.grpo_stage} | beta={args.beta} | mode={reference_mode}")
+            if args.grpo_stage == "kl" and reference_mode != "ref_adapter":
+                raise RuntimeError(
+                    "KL stage requires a frozen copy of the bootstrap adapter as the reference policy; "
+                    f"detected mode={reference_mode}. Use TRL 1.10 with PEFT >= 0.20."
                 )
+            collapse_guard = None
+            if args.collapse_patience > 0:
+                collapse_guard = CollapseGuardCallback(
+                    patience=args.collapse_patience,
+                    min_entropy=args.collapse_min_entropy,
+                    max_zero_std_ratio=args.collapse_max_zero_std_ratio,
+                )
+                trainer.add_callback(collapse_guard)
             train_result = trainer.train()
             if hasattr(trainer, "save_state"):
                 try:
@@ -457,6 +648,36 @@ def main() -> None:
                     "elapsed_seconds": round(time.time() - started, 3),
                 },
             )
+            if args.grpo_stage != "single":
+                health = summarize_stage_health(
+                    output_dir / "reward_history.jsonl",
+                    args,
+                    collapse_triggered=bool(collapse_guard and collapse_guard.triggered),
+                )
+                status = "passed" if health["passed"] else "failed"
+                manifest_path = output_dir / STAGE_MANIFEST_NAME
+                save_json(
+                    manifest_path,
+                    {
+                        "schema_version": "two-stage-grpo-v1",
+                        "stage": args.grpo_stage,
+                        "status": status,
+                        "source_adapter": str(resolve_repo_path(args.adapter_path)),
+                        "final_adapter": str(final_adapter),
+                        "beta": float(args.beta),
+                        "reference_policy_mode": reference_mode,
+                        "reward_policy": args.policy,
+                        "wrong_answer_trace_scale": float(args.wrong_answer_trace_scale),
+                        "health": health,
+                    },
+                )
+                log_line(f"GRPO stage manifest | stage={args.grpo_stage} | status={status} | path={manifest_path}")
+                if status != "passed":
+                    failures = ", ".join(health.get("failures", [])) if isinstance(health, dict) else "unknown"
+                    raise RuntimeError(
+                        "GRPO stage failed its health gate; do not use this adapter for subsequent training or evaluation. "
+                        f"stage={args.grpo_stage} | failures={failures} | manifest={manifest_path}"
+                    )
             log_line(
                 " | ".join(
                     [

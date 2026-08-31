@@ -111,29 +111,68 @@ src/train_forecast_trace_grpo_judge.py
 该入口包含 frozen Qwen judge、prompt 可见的 `Hxx/Rxx` 引用对齐、code-description 语义一致性 judge、judge cache、截断 JSON 的标量恢复，以及 reward/rollout 审计日志。默认 trace judge 是 `/no_think`，`judge_weight=0.2`；description judge 使用 `description_weight=0.05` 和 96 token 上限，不要求 description exact match。`src/train_forecast_trace_grpo.py` 仅是被该入口复用的内部 GRPO trainer，不作为独立训练命令。
 
 
-无 refinement 的完整 judge-GRPO：
+### 基于 main 的两阶段 Judge-GRPO
+
+第一阶段严格保留已验证 main 实验的 reward、采样参数和 `wrong-answer-trace-scale=0.05`，只通过
+`--grpo-stage bootstrap --beta 0` 显式标记为 bootstrap。先跑 100 step，不要直接跑完整 epoch：
 
 ```bash
 python src/train_forecast_trace_grpo_judge.py \
   --input outputs/grpo_context_mirai_forecast_train_no_refine/grpo_context.jsonl \
   --model-path models/Qwen3-4B \
   --adapter-path outputs/mirai_forecast_sft_train/best_adapter \
+  --grpo-stage bootstrap --beta 0 \
   --judge-model-path models/Qwen3-4B --judge-weight 0.2 \
   --description-weight 0.05 --description-max-new-tokens 96 \
   --codebook-dataset-path datasets/MIRAI_data.zip \
-  --judge-max-new-tokens 256 \
+  --judge-max-new-tokens 384 \
   --judge-max-context-chars 6000 \
-  --judge-cache-path outputs/trace_judge_mirai_forecast_train_no_refine.cache.json \
-  --output-dir outputs/forecast_trace_grpo_judge_mirai_forecast_train_no_refine_safe \
+  --judge-cache-path outputs/trace_judge_mirai_forecast_train_no_refine_bootstrap_main.cache.json \
+  --output-dir outputs/forecast_trace_grpo_judge_mirai_forecast_train_no_refine_bootstrap_main \
   --max-samples 0 --min-coarse-edges 1 \
-  --num-generations 2 --per-device-train-batch-size 2 \
-  --gradient-accumulation-steps 8 --learning-rate 1e-6 --beta 0.04 \
-  --num-train-epochs 1 --max-steps 0 --max-prompt-length 1536 \
-  --max-completion-length 384 --logging-steps 1 --save-steps 100 \
+  --num-generations 4 --per-device-train-batch-size 4 \
+  --gradient-accumulation-steps 1 --learning-rate 5e-6 \
+  --num-train-epochs 1 --max-steps 100 --max-prompt-length 2048 \
+  --max-completion-length 512 --logging-steps 1 --save-steps 100 \
   --reward-log-every 1 --sample-log-every 5 --sample-log-count 2
 ```
 
-GRPO 安全默认是 1 个 epoch、`1e-6` 学习率、`beta=0.04` 参考策略 KL 和 800 步硬上限；错误答案只保留很小的 trace 探索奖励。训练期间如果连续出现低 entropy 或 `frac_reward_zero_std` 接近 1，collapse guard 会自动停止。不要从已经塌缩的后期 GRPO checkpoint 继续，重新从 `outputs/mirai_forecast_sft_train/best_adapter` 开始。
+第一阶段完成后会写入 `grpo_stage_manifest.json`。默认验收条件为：至少 20 个 reward group、合法三位
+answer 比例不低于 0.50、平均 format 不低于 0.75、含 gold answer hit 的 group 比例不低于 0.05，且
+collapse guard 未触发。任一条件失败时 adapter 仍会保存用于审计，但 manifest 为 `failed`，不能进入第二阶段。
+
+第二阶段从通过验收的第一阶段 `final_adapter` 启动。TRL 必须把该 adapter 原样复制为冻结的 `ref`
+adapter，再对可训练的 `default` adapter 施加 KL：
+
+```bash
+python src/train_forecast_trace_grpo_judge.py \
+  --input outputs/grpo_context_mirai_forecast_train_no_refine/grpo_context.jsonl \
+  --model-path models/Qwen3-4B \
+  --adapter-path outputs/forecast_trace_grpo_judge_mirai_forecast_train_no_refine_bootstrap_main/final_adapter \
+  --grpo-stage kl --beta 0.04 \
+  --judge-model-path models/Qwen3-4B --judge-weight 0.2 \
+  --description-weight 0.05 --description-max-new-tokens 96 \
+  --codebook-dataset-path datasets/MIRAI_data.zip \
+  --judge-max-new-tokens 384 \
+  --judge-max-context-chars 6000 \
+  --judge-cache-path outputs/trace_judge_mirai_forecast_train_no_refine_kl_pilot.cache.json \
+  --output-dir outputs/forecast_trace_grpo_judge_mirai_forecast_train_no_refine_kl_pilot \
+  --max-samples 0 --min-coarse-edges 1 \
+  --num-generations 4 --per-device-train-batch-size 4 \
+  --gradient-accumulation-steps 1 --learning-rate 1e-6 \
+  --num-train-epochs 1 --max-steps 100 --max-prompt-length 2048 \
+  --max-completion-length 512 --logging-steps 1 --save-steps 100 \
+  --reward-log-every 1 --sample-log-every 5 --sample-log-count 2
+```
+
+第二阶段启动日志必须包含 `mode=ref_adapter`；若 TRL/PEFT 只能退回 `base_disabled`，程序会在第一次
+训练更新前报错。当前验证环境要求 `trl==1.10.0`、`peft>=0.20.0`。`--allow-unverified-bootstrap-adapter`
+只用于明确的消融实验，不用于正式两阶段训练。
+
+先用上面的 100-step KL pilot 与第一阶段 checkpoint、旧 main checkpoint 做固定 held-out 对比。确认 answer
+格式率、answer F1 和通用回答能力均未下降后，再从同一个第一阶段 adapter 重新启动第二阶段正式训练，使用
+新的 output/cache，并把 `--max-steps` 改为 `0`。不要从 KL pilot adapter 继续正式训练，否则 reference 会变成
+pilot 结束时的策略，失去与第一阶段固定基线的可比性。
 
 ## 5. Refinement 训练和带 refinement 的 Judge-GRPO
 
