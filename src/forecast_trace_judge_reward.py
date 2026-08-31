@@ -49,10 +49,12 @@ class JudgeGRPOReward:
         policy_name: str = "forecast_trace_reward",
         reward_key: str = "total",
         error_reward: float = -0.25,
+        wrong_answer_trace_scale: float | None = None,
         judge_weight: float = 0.2,
         description_weight: float = 0.05,
         judge_max_new_tokens: int = 384,
         description_max_new_tokens: int = 96,
+        judge_max_context_chars: int = 12000,
         judge_thinking: bool = False,
         judge_cache_path: str | Path | None = None,
         codebook_dataset_path: str | Path | None = None,
@@ -63,11 +65,17 @@ class JudgeGRPOReward:
         sample_audit_limit: int = 2,
         sample_human_path: Path | str | None = None,
     ) -> None:
-        self.base = ForecastTraceGRPOReward(policy_name=policy_name, reward_key=reward_key, error_reward=error_reward)
+        self.base = ForecastTraceGRPOReward(
+            policy_name=policy_name,
+            reward_key=reward_key,
+            error_reward=error_reward,
+            wrong_answer_trace_scale=wrong_answer_trace_scale,
+        )
         self.judge = FrozenQwenTraceJudge(
             judge_model_path,
             max_new_tokens=judge_max_new_tokens,
             description_max_new_tokens=description_max_new_tokens,
+            max_context_chars=judge_max_context_chars,
             thinking=judge_thinking,
             cache_path=judge_cache_path,
         )
@@ -155,10 +163,15 @@ class JudgeGRPOReward:
                 )
                 description_score, description_parsed, description_quality, description_judge = self._score_descriptions(prediction)
                 answer = float(base.get("answer", 0.0))
-                gate = 1.0 if answer > 0.0 else 0.2
+                # Do not let a perfectly formatted but incorrect answer earn
+                # judge/description reward. This was a major source of reward
+                # hacking once the policy learned the JSON scaffold. Keep the
+                # small answer-gated base trace signal so groups with no hit
+                # still have a learnable ranking signal.
+                gate = 1.0 if answer > 0.0 else 0.0
                 judge_score = float(judge.get("overall", 0.0))
                 description_reward = self.description_weight * gate * description_quality
-                total = answer + gate * float(base.get("trace", 0.0)) + self.judge_weight * gate * judge_score + description_reward
+                total = float(answer) + float(base.get("trace", 0.0)) + self.judge_weight * gate * judge_score + description_reward
                 if not math.isfinite(total):
                     raise ValueError("non-finite reward")
                 breakdown = {

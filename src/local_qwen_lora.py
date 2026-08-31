@@ -61,6 +61,39 @@ def _require_local_adapter(adapter_path: Path) -> str:
     return str(adapter)
 
 
+def _load_tokenizer_compat(
+    tokenizer_cls: Any,
+    source: Path | str,
+    *,
+    fallback_source: Path | str | None = None,
+) -> Any:
+    """Load a tokenizer, falling back when old adapter metadata is malformed.
+
+    Older Transformers/TRL saves may serialize ``extra_special_tokens`` as a
+    list. Transformers 4.54 expects a mapping and raises ``list has no
+    attribute keys`` while constructing the tokenizer. The adapter does not
+    add vocabulary tokens here, so the base-model tokenizer is equivalent; we
+    retain an adapter chat template when one is present.
+    """
+
+    try:
+        return tokenizer_cls.from_pretrained(source, trust_remote_code=False)
+    except AttributeError as exc:
+        message = str(exc)
+        if fallback_source is None or Path(str(source)) == Path(str(fallback_source)):
+            raise
+        if "extra_special_tokens" not in message and "has no attribute 'keys'" not in message:
+            raise
+        tokenizer = tokenizer_cls.from_pretrained(fallback_source, trust_remote_code=False)
+        template_path = Path(str(source)) / "chat_template.jinja"
+        if template_path.is_file():
+            try:
+                tokenizer.chat_template = template_path.read_text(encoding="utf-8")
+            except OSError:
+                pass
+        return tokenizer
+
+
 def load_qwen_with_lora(
     model_path: Path,
     adapter_path: Path | None = None,
@@ -73,7 +106,11 @@ def load_qwen_with_lora(
 
     adapter_id = _require_local_adapter(adapter_path) if adapter_path is not None else None
     tokenizer_source = adapter_path if adapter_path is not None and (adapter_path / "tokenizer_config.json").exists() else model_path
-    tokenizer = auto_tokenizer_cls.from_pretrained(tokenizer_source, trust_remote_code=False)
+    tokenizer = _load_tokenizer_compat(
+        auto_tokenizer_cls,
+        tokenizer_source,
+        fallback_source=model_path,
+    )
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -108,7 +145,11 @@ def load_trained_qwen_lora(
 
     adapter_id = _require_local_adapter(adapter_path)
     tokenizer_source = adapter_path if (adapter_path / "tokenizer_config.json").exists() else base_model_path
-    tokenizer = auto_tokenizer_cls.from_pretrained(tokenizer_source, trust_remote_code=False)
+    tokenizer = _load_tokenizer_compat(
+        auto_tokenizer_cls,
+        tokenizer_source,
+        fallback_source=base_model_path,
+    )
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -134,7 +175,11 @@ def load_qwen_for_inference(
 
     adapter_id = _require_local_adapter(adapter_path) if adapter_path is not None else None
     tokenizer_source = adapter_path if adapter_path is not None and (adapter_path / "tokenizer_config.json").exists() else base_model_path
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, trust_remote_code=False)
+    tokenizer = _load_tokenizer_compat(
+        AutoTokenizer,
+        tokenizer_source,
+        fallback_source=base_model_path,
+    )
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 

@@ -121,16 +121,19 @@ python src/train_forecast_trace_grpo_judge.py \
   --judge-model-path models/Qwen3-4B --judge-weight 0.2 \
   --description-weight 0.05 --description-max-new-tokens 96 \
   --codebook-dataset-path datasets/MIRAI_data.zip \
-  --judge-max-new-tokens 384 \
+  --judge-max-new-tokens 256 \
+  --judge-max-context-chars 6000 \
   --judge-cache-path outputs/trace_judge_mirai_forecast_train_no_refine.cache.json \
-  --output-dir outputs/forecast_trace_grpo_judge_mirai_forecast_train_no_refine \
+  --output-dir outputs/forecast_trace_grpo_judge_mirai_forecast_train_no_refine_safe \
   --max-samples 0 --min-coarse-edges 1 \
-  --num-generations 4 --per-device-train-batch-size 4 \
-  --gradient-accumulation-steps 1 --learning-rate 5e-6 \
-  --num-train-epochs 1 --max-prompt-length 2048 \
-  --max-completion-length 512 --logging-steps 1 --save-steps 100 \
+  --num-generations 2 --per-device-train-batch-size 2 \
+  --gradient-accumulation-steps 8 --learning-rate 1e-6 --beta 0.04 \
+  --num-train-epochs 1 --max-steps 0 --max-prompt-length 1536 \
+  --max-completion-length 384 --logging-steps 1 --save-steps 100 \
   --reward-log-every 1 --sample-log-every 5 --sample-log-count 2
 ```
+
+GRPO 安全默认是 1 个 epoch、`1e-6` 学习率、`beta=0.04` 参考策略 KL 和 800 步硬上限；错误答案只保留很小的 trace 探索奖励。训练期间如果连续出现低 entropy 或 `frac_reward_zero_std` 接近 1，collapse guard 会自动停止。不要从已经塌缩的后期 GRPO checkpoint 继续，重新从 `outputs/mirai_forecast_sft_train/best_adapter` 开始。
 
 ## 5. Refinement 训练和带 refinement 的 Judge-GRPO
 
@@ -210,14 +213,15 @@ python src/train_forecast_trace_grpo_judge.py \
   --judge-model-path models/Qwen3-4B --judge-weight 0.2 \
   --description-weight 0.05 --description-max-new-tokens 96 \
   --codebook-dataset-path datasets/MIRAI_data.zip \
-  --judge-max-new-tokens 384 \
+  --judge-max-new-tokens 256 \
+  --judge-max-context-chars 6000 \
   --judge-cache-path outputs/trace_judge_with_refinement.cache.json \
   --output-dir outputs/forecast_trace_grpo_judge_with_refinement \
   --max-samples 0 --min-coarse-edges 1 \
-  --num-generations 4 --per-device-train-batch-size 4 \
-  --gradient-accumulation-steps 1 --learning-rate 5e-6 \
-  --num-train-epochs 1 --max-prompt-length 2048 \
-  --max-completion-length 512 --logging-steps 1 --save-steps 100 \
+  --num-generations 2 --per-device-train-batch-size 2 \
+  --gradient-accumulation-steps 8 --learning-rate 1e-6 --beta 0.04 \
+  --num-train-epochs 1 --max-steps 800 --max-prompt-length 1536 \
+  --max-completion-length 384 --logging-steps 1 --save-steps 100 \
   --reward-log-every 1 --sample-log-every 5 --sample-log-count 2
 ```
 
@@ -230,7 +234,7 @@ python src/evaluate_local_qwen_pipeline.py \
   --stage evaluate --split dev --limit 0 --event-source precomputed \
   --precomputed-events datasets/mirai_event_inputs_rule/mirai_forecast_event_input_dev.jsonl \
   --queries-from-precomputed-events --model-path models/Qwen3-4B \
-  --forecast-adapter-path outputs/forecast_trace_grpo_judge_mirai_forecast_train_no_refine/final_adapter \
+  --forecast-adapter-path outputs/forecast_trace_grpo_judge_mirai_forecast_train_no_refine_safe/final_adapter \
   --skip-refinement --prediction-mode forecast-trace \
   --forecast-context-mode events-graph --output-dir outputs/eval_mirai_forecast_dev_no_refine
 
@@ -254,7 +258,7 @@ python src/evaluate_local_qwen_pipeline.py \
   --stage evaluate --split holdout --limit 0 --event-source precomputed \
   --precomputed-events datasets/mirai_event_inputs_rule/mirai_forecast_event_input_holdout.jsonl \
   --queries-from-precomputed-events --model-path models/Qwen3-4B \
-  --forecast-adapter-path outputs/forecast_trace_grpo_judge_mirai_forecast_train_no_refine/final_adapter \
+  --forecast-adapter-path outputs/forecast_trace_grpo_judge_mirai_forecast_train_no_refine_safe/final_adapter \
   --skip-refinement --prediction-mode forecast-trace \
   --forecast-context-mode events-graph --output-dir outputs/eval_mirai_forecast_holdout_no_refine
 ```
@@ -275,9 +279,11 @@ python src/evaluate_local_qwen_pipeline.py \
 | 现象 | 处理 |
 | --- | --- |
 | context 生成慢 | 按 25 条分片续跑，不重跑已完成分片 |
-| judge parse rate 为 0 | 确认使用唯一 judge 入口、`--judge-max-new-tokens 384`、不开 think |
-| completion 大量截断 | 保持 `--max-completion-length 512`，先改善 SFT |
+| judge parse rate 为 0 | 确认使用唯一 judge 入口、`--judge-max-new-tokens 256`、不开 think |
+| tokenizer 报 `extra_special_tokens` 没有 `keys` | 旧 adapter metadata 与新 Transformers 不兼容；加载器会回退到基础 Qwen tokenizer，并保留 adapter chat template |
+| completion 大量截断 | 4090 先保持 `--max-completion-length 384`；显存充足且确认未 OOM 后再提高到 512 |
 | 所有 group reward std 为 0 | 停止完整训练，检查答案多样性和 JSON 格式 |
+| entropy 持续低于 0.03 或 `frac_reward_zero_std` 接近 1 | 由 collapse guard 停止；从 SFT `best_adapter` 重启，不要续训后期 checkpoint |
 | judge 认为 Hxx/Rxx 不存在 | 检查 context 和统一 judge 入口 |
 | trace 复述可见历史事件 | 查看 \`historical_copy_penalty\`；历史事件只能作为 \`Hxx\` 证据，\`intermediate_events\` 必须是不同的未来假设 |
 | refinement 只降低 loss | 必须同时要求 held-out edge F1 和 dev downstream 提升 |

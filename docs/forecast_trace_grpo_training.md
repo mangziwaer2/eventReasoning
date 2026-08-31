@@ -26,15 +26,29 @@ It must not contain a precomputed forecast completion or a precomputed reward. `
 python -u src/train_forecast_trace_grpo.py `
   --input outputs/grpo_context_mirai_rule_train_no_refine/grpo_context.jsonl `
   --model-path models/Qwen3-4B `
+  --adapter-path outputs/mirai_forecast_sft_train/best_adapter `
   --output-dir outputs/forecast_trace_grpo `
   --num-generations 4 `
   --per-device-train-batch-size 4 `
   --gradient-accumulation-steps 8 `
-  --learning-rate 5e-6 `
+  --learning-rate 1e-6 `
+  --beta 0.04 `
   --num-train-epochs 1 `
+  --max-steps 800 `
   --logging-steps 1 `
   --reward-log-every 1
 ```
+
+The entry point defaults to one epoch, a `1e-6` learning rate, positive
+reference-policy KL (`beta=0.04`), an 800-step hard cap, and answer-gated trace shaping (with a small
+`0.05` wrong-answer trace signal to preserve exploration). Use
+`--max-steps` as a hard budget for exploratory runs. The collapse guard stops
+after consecutive low-entropy or zero-variance reward logs; set
+`--collapse-patience 0` only for a deliberate ablation.
+
+After a collapsed run, restart from the SFT `best_adapter`; do not continue
+from its late GRPO checkpoints unless an independent generation check confirms
+that the checkpoint still follows the JSON/schema contract.
 
 The trainer writes `training.log`, `reward_history.jsonl`, `run_config.json`, `sample_summary.json`, `train_history.json`, `metrics.json`, and `final_adapter/`.
 

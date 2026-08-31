@@ -14,7 +14,6 @@ def main() -> None:
     parser.add_argument("--judge-weight", type=float, default=0.2)
     parser.add_argument("--description-weight", type=float, default=0.05)
     parser.add_argument("--description-max-new-tokens", type=int, default=96)
-    parser.add_argument("--judge-max-context-chars", type=int, default=12000)
     parser.add_argument("--codebook-dataset-path", default="datasets/MIRAI_data.zip")
     parser.add_argument("--judge-max-new-tokens", type=int, default=384)
     parser.add_argument("--judge-thinking", action="store_true")
@@ -39,7 +38,6 @@ def main() -> None:
                 judge_weight=judge_args.judge_weight,
                 description_weight=judge_args.description_weight,
                 description_max_new_tokens=judge_args.description_max_new_tokens,
-                judge_max_context_chars=judge_args.judge_max_context_chars,
                 codebook_dataset_path=judge_args.codebook_dataset_path,
                 judge_max_new_tokens=judge_args.judge_max_new_tokens,
                 judge_thinking=judge_args.judge_thinking,

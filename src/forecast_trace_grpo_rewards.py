@@ -232,6 +232,7 @@ class ForecastTraceGRPOReward:
         policy_name: str = "forecast_trace_reward",
         reward_key: str = "total",
         error_reward: float = DEFAULT_ERROR_REWARD,
+        wrong_answer_trace_scale: float | None = None,
         audit_path: Path | str | None = None,
         audit_every: int = 1,
         sample_audit_path: Path | str | None = None,
@@ -243,6 +244,10 @@ class ForecastTraceGRPOReward:
         self.reward_key = reward_key
         self.error_reward = float(error_reward)
         self.policy = build_pipeline_policy(policy_name)
+        if wrong_answer_trace_scale is not None:
+            reward_fn = getattr(self.policy, "reward_fn", None)
+            if reward_fn is not None and hasattr(reward_fn, "wrong_answer_trace_scale"):
+                reward_fn.wrong_answer_trace_scale = max(0.0, min(float(wrong_answer_trace_scale), 1.0))
         self.audit_path = Path(audit_path) if audit_path else None
         self.audit_every = max(1, int(audit_every))
         self.sample_audit_path = Path(sample_audit_path) if sample_audit_path else None
