@@ -123,17 +123,23 @@ def parse_args() -> argparse.Namespace:
         "--max-steps",
         type=int,
         default=0,
-        help="Hard step cap (default: 800). A positive value takes precedence over epochs; use 0 to disable.",
+        help="Hard step cap (default: 0, disabled). A positive value takes precedence over epochs; use 0 to disable.",
     )
     parser.add_argument("--per-device-train-batch-size", type=int, default=4)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=8)
+    parser.add_argument(
+        "--generation-batch-size",
+        type=int,
+        default=None,
+        help="Optional per-device generation batch (completions). Set smaller than gradient accumulation to reduce rollout memory.",
+    )
     parser.add_argument("--learning-rate", type=float, default=1e-6)
     parser.add_argument("--warmup-ratio", type=float, default=0.1)
     parser.add_argument(
         "--beta",
         type=float,
-        default=0.04,
-        help="Reference-policy KL coefficient. Keep positive to prevent LoRA drift.",
+        default=0.0,
+        help="Reference-policy KL coefficient. Default 0 is for the answer-only SFT bootstrap; with an existing trace-aware adapter, TRL/PEFT can copy it as a frozen reference.",
     )
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
     parser.add_argument("--max-prompt-length", type=int, default=2048)
@@ -147,8 +153,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--wrong-answer-trace-scale",
         type=float,
-        default=0.05,
-        help="Trace reward multiplier when no gold event code is hit; keep small to preserve exploration without format hacking.",
+        default=0.2,
+        help="Trace reward multiplier inside the partial wrong-answer gate; 0.2 matches the original reward policy.",
     )
     parser.add_argument(
         "--collapse-patience",
@@ -243,6 +249,7 @@ def build_training_config(config_cls: Any, args: argparse.Namespace) -> Any:
         "learning_rate": args.learning_rate,
         "per_device_train_batch_size": args.per_device_train_batch_size,
         "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "generation_batch_size": getattr(args, "generation_batch_size", None),
         "num_train_epochs": getattr(args, "num_train_epochs", 1.0),
         "max_steps": getattr(args, "max_steps", 0) if getattr(args, "max_steps", 0) > 0 else -1,
         "warmup_ratio": getattr(args, "warmup_ratio", 0.1),
@@ -256,7 +263,7 @@ def build_training_config(config_cls: Any, args: argparse.Namespace) -> Any:
         "max_prompt_length": args.max_prompt_length,
         "max_completion_length": args.max_completion_length,
         "seed": args.seed,
-        "beta": getattr(args, "beta", 0.04),
+        "beta": getattr(args, "beta", 0.0),
         "loss_type": "grpo",
         "temperature": 1.0,
         "top_p": 1.0,
@@ -310,6 +317,16 @@ def main() -> None:
             "--per-device-train-batch-size must be divisible by --num-generations "
             "for a single-process GRPO run."
         )
+    if args.generation_batch_size is not None:
+        if args.generation_batch_size <= 0:
+            raise ValueError("--generation-batch-size must be positive when provided.")
+        if args.generation_batch_size % args.per_device_train_batch_size != 0:
+            raise ValueError(
+                "--generation-batch-size must be divisible by --per-device-train-batch-size "
+                "for a single-process GRPO run."
+            )
+        if args.generation_batch_size % args.num_generations != 0:
+            raise ValueError("--generation-batch-size must be divisible by --num-generations.")
     random.seed(args.seed)
     output_dir = resolve_repo_path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -337,6 +354,10 @@ def main() -> None:
                         f"chat_prompt={args.chat_prompt}",
                         f"num_generations={args.num_generations}",
                         f"batch_size={args.per_device_train_batch_size}",
+                        f"gradient_accumulation_steps={args.gradient_accumulation_steps}",
+                        f"generation_batch_size={args.generation_batch_size or 'auto'}",
+                        f"beta={args.beta}",
+                        f"max_completion_length={args.max_completion_length}",
                         f"min_coarse_edges={args.min_coarse_edges}",
                         f"sample_log_every={args.sample_log_every}",
                         f"sample_log_count={args.sample_log_count}",
@@ -411,6 +432,10 @@ def main() -> None:
             )
             config = build_training_config(GRPOConfig, args)
             trainer = build_trainer(GRPOTrainer, model, tokenizer, config, dataset, reward_fn)
+            if args.beta > 0.0:
+                peft_config = getattr(model, "peft_config", {})
+                reference_mode = "ref_adapter" if isinstance(peft_config, dict) and "ref" in peft_config else "base_disabled"
+                log_line(f"GRPO reference policy | beta={args.beta} | mode={reference_mode}")
             if args.collapse_patience > 0:
                 trainer.add_callback(
                     CollapseGuardCallback(

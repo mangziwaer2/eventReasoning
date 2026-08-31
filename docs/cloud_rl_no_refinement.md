@@ -118,7 +118,7 @@ python src/train_forecast_trace_grpo_judge.py \
   --input outputs/grpo_context_mirai_forecast_train_no_refine/grpo_context.jsonl \
   --model-path models/Qwen3-4B \
   --adapter-path outputs/mirai_forecast_sft_train/best_adapter \
-  --judge-model-path models/Qwen3-4B --judge-weight 0.2 \
+  --judge-model-path models/Qwen3-4B --judge-weight 0.2 --wrong-answer-judge-gate 0.2 \
   --description-weight 0.05 --description-max-new-tokens 96 \
   --codebook-dataset-path datasets/MIRAI_data.zip \
   --judge-max-new-tokens 256 \
@@ -127,13 +127,73 @@ python src/train_forecast_trace_grpo_judge.py \
   --output-dir outputs/forecast_trace_grpo_judge_mirai_forecast_train_no_refine_safe \
   --max-samples 0 --min-coarse-edges 1 \
   --num-generations 2 --per-device-train-batch-size 2 \
-  --gradient-accumulation-steps 8 --learning-rate 1e-6 --beta 0.04 \
+  --gradient-accumulation-steps 8 --generation-batch-size 2 --learning-rate 1e-6 --beta 0 \
   --num-train-epochs 1 --max-steps 0 --max-prompt-length 1536 \
   --max-completion-length 384 --logging-steps 1 --save-steps 100 \
   --reward-log-every 1 --sample-log-every 5 --sample-log-count 2
 ```
 
-GRPO 安全默认是 1 个 epoch、`1e-6` 学习率、`beta=0.04` 参考策略 KL 和 800 步硬上限；错误答案只保留很小的 trace 探索奖励。训练期间如果连续出现低 entropy 或 `frac_reward_zero_std` 接近 1，collapse guard 会自动停止。不要从已经塌缩的后期 GRPO checkpoint 继续，重新从 `outputs/mirai_forecast_sft_train/best_adapter` 开始。
+4090 先使用上面的低显存组合：`generation-batch-size=2` 将一次 rollout 固定为 2 个 completion，
+而 `gradient-accumulation-steps=8` 仍恢复旧实验的有效更新批量。TRL 会在这里每个 micro-step 重新生成，
+速度较慢，但不会因扩大 rollout batch 而抬高显存峰值。
+`max-completion-length` 不要降到 256；本任务的结构化 trace 经常需要超过 256 token，截断会让两条 completion 都得到几乎相同的负 reward，导致 `loss=0` 和 `reward_std=0`。
+启动后先观察前 20 步：`completions/clipped_ratio` 不应持续为 1，且 `frac_reward_zero_std` 不应持续接近 1；否则应立即停止并从 SFT adapter 重启。
+
+### 两阶段 Trace-GRPO
+
+第一阶段从 answer-only SFT adapter 启动，不施加 KL，让策略先学会输出可评分的 trace。下面命令先跑 100 个
+optimizer steps；正式运行前可将 `--max-steps 100` 临时改为 `20` 做预检，确认
+`completions/clipped_ratio` 不持续为 1 且 `frac_reward_zero_std` 不持续接近 1。
+
+```bash
+python src/train_forecast_trace_grpo_judge.py \
+  --input outputs/grpo_context_mirai_forecast_train_no_refine/grpo_context.jsonl \
+  --model-path models/Qwen3-4B \
+  --adapter-path outputs/mirai_forecast_sft_train/best_adapter \
+  --judge-model-path models/Qwen3-4B --judge-weight 0.2 --wrong-answer-judge-gate 0.2 \
+  --description-weight 0.05 --description-max-new-tokens 96 \
+  --codebook-dataset-path datasets/MIRAI_data.zip \
+  --judge-max-new-tokens 256 \
+  --judge-max-context-chars 6000 \
+  --judge-cache-path outputs/trace_judge_mirai_forecast_train_no_refine_trace_bootstrap.cache.json \
+  --output-dir outputs/forecast_trace_grpo_judge_mirai_forecast_train_no_refine_trace_bootstrap \
+  --max-samples 0 --min-coarse-edges 1 \
+  --num-generations 2 --per-device-train-batch-size 2 \
+  --gradient-accumulation-steps 8 --generation-batch-size 2 --learning-rate 1e-6 --beta 0 \
+  --num-train-epochs 1 --max-steps 100 --max-prompt-length 1536 \
+  --max-completion-length 384 --logging-steps 1 --save-steps 100 \
+  --reward-log-every 1 --sample-log-every 5 --sample-log-count 2
+```
+
+第一阶段通过后，从其 `final_adapter` 启动第二阶段并加入 KL。第二阶段使用新的输出目录和 judge cache，避免
+把两个阶段的审计记录混在一起：
+
+```bash
+python src/train_forecast_trace_grpo_judge.py \
+  --input outputs/grpo_context_mirai_forecast_train_no_refine/grpo_context.jsonl \
+  --model-path models/Qwen3-4B \
+  --adapter-path outputs/forecast_trace_grpo_judge_mirai_forecast_train_no_refine_trace_bootstrap/final_adapter \
+  --judge-model-path models/Qwen3-4B --judge-weight 0.2 --wrong-answer-judge-gate 0.2 \
+  --description-weight 0.05 --description-max-new-tokens 96 \
+  --codebook-dataset-path datasets/MIRAI_data.zip \
+  --judge-max-new-tokens 256 \
+  --judge-max-context-chars 6000 \
+  --judge-cache-path outputs/trace_judge_mirai_forecast_train_no_refine_trace_kl.cache.json \
+  --output-dir outputs/forecast_trace_grpo_judge_mirai_forecast_train_no_refine_trace_kl \
+  --max-samples 0 --min-coarse-edges 1 \
+  --num-generations 2 --per-device-train-batch-size 2 \
+  --gradient-accumulation-steps 8 --generation-batch-size 2 --learning-rate 1e-6 --beta 0.04 \
+  --num-train-epochs 1 --max-steps 100 --max-prompt-length 1536 \
+  --max-completion-length 384 --logging-steps 1 --save-steps 100 \
+  --reward-log-every 1 --sample-log-every 5 --sample-log-count 2
+```
+
+第二阶段启动日志必须显示 `reference policy ... mode=ref_adapter`；若显示 `mode=base_disabled`，应立即停止并检查
+TRL/PEFT 版本。TRL 1.10 会在 `peft>=0.20` 下自动把第一阶段的 `default` adapter 复制为冻结的 `ref` adapter，
+不要把第二阶段的 reference 指向原始 SFT adapter。第二阶段 pilot 通过后，再将其 `--max-steps` 改为 `0`
+跑完整 epoch。
+
+GRPO 安全默认是 1 个 epoch、`max_steps=0`（不额外设硬上限）、`1e-6` 学习率和 `beta=0`。第一阶段从 answer-only SFT adapter 启动时不施加 KL，让策略先学习 trace。第二阶段从第一阶段的 trace-aware adapter 启动并设置正 `--beta` 时，TRL 1.10 会在 `peft>=0.20` 下自动复制 `default` adapter 为冻结的 `ref` adapter；这才是与当前策略对齐的 KL reference。错误答案仍保留 `0.2` 的 partial judge/trace gate，让 trace 能在第一次命中 event code 前得到 bootstrap 信号；命中答案后使用完整权重。若需要紧急限时，可传入正数 `--max-steps`，它会覆盖 epoch 长度。训练期间如果连续出现低 entropy 或 `frac_reward_zero_std` 接近 1，collapse guard 会自动停止。不要从已经塌缩的后期 GRPO checkpoint 继续，重新从 `outputs/mirai_forecast_sft_train/best_adapter` 开始。
 
 ## 5. Refinement 训练和带 refinement 的 Judge-GRPO
 
@@ -210,7 +270,7 @@ python src/train_forecast_trace_grpo_judge.py \
   --input outputs/grpo_context_mirai_forecast_train_with_refinement/grpo_context.jsonl \
   --model-path models/Qwen3-4B \
   --adapter-path outputs/mirai_forecast_sft_train/best_adapter \
-  --judge-model-path models/Qwen3-4B --judge-weight 0.2 \
+  --judge-model-path models/Qwen3-4B --judge-weight 0.2 --wrong-answer-judge-gate 0.2 \
   --description-weight 0.05 --description-max-new-tokens 96 \
   --codebook-dataset-path datasets/MIRAI_data.zip \
   --judge-max-new-tokens 256 \
@@ -219,8 +279,8 @@ python src/train_forecast_trace_grpo_judge.py \
   --output-dir outputs/forecast_trace_grpo_judge_with_refinement \
   --max-samples 0 --min-coarse-edges 1 \
   --num-generations 2 --per-device-train-batch-size 2 \
-  --gradient-accumulation-steps 8 --learning-rate 1e-6 --beta 0.04 \
-  --num-train-epochs 1 --max-steps 800 --max-prompt-length 1536 \
+  --gradient-accumulation-steps 8 --generation-batch-size 2 --learning-rate 1e-6 --beta 0 \
+  --num-train-epochs 1 --max-steps 0 --max-prompt-length 1536 \
   --max-completion-length 384 --logging-steps 1 --save-steps 100 \
   --reward-log-every 1 --sample-log-every 5 --sample-log-count 2
 ```

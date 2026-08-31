@@ -12,6 +12,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--judge-model-path", default="models/Qwen3-4B")
     parser.add_argument("--judge-weight", type=float, default=0.2)
+    parser.add_argument(
+        "--wrong-answer-judge-gate",
+        type=float,
+        default=0.2,
+        help="Partial trace/judge weight before an answer-code hit; 0.2 preserves the original bootstrap signal.",
+    )
     parser.add_argument("--description-weight", type=float, default=0.05)
     parser.add_argument("--description-max-new-tokens", type=int, default=96)
     parser.add_argument("--judge-max-context-chars", type=int, default=12000)
@@ -36,6 +42,7 @@ def main() -> None:
                 reward_key=reward_key,
                 error_reward=error_reward,
                 wrong_answer_trace_scale=kwargs.get("wrong_answer_trace_scale"),
+                wrong_answer_judge_gate=judge_args.wrong_answer_judge_gate,
                 judge_weight=judge_args.judge_weight,
                 description_weight=judge_args.description_weight,
                 description_max_new_tokens=judge_args.description_max_new_tokens,

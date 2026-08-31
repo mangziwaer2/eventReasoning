@@ -23,6 +23,7 @@ class _Config:
         max_steps=-1,
         beta=0.0,
         max_grad_norm=0.0,
+        generation_batch_size=None,
         loss_type="",
         repetition_penalty=1.0,
         **kwargs,
@@ -32,6 +33,7 @@ class _Config:
         self.max_steps = max_steps
         self.beta = beta
         self.max_grad_norm = max_grad_norm
+        self.generation_batch_size = generation_batch_size
         self.loss_type = loss_type
         self.repetition_penalty = repetition_penalty
         self.extra = kwargs
@@ -59,6 +61,7 @@ class GrpoStabilityTests(unittest.TestCase):
             learning_rate=1e-6,
             per_device_train_batch_size=4,
             gradient_accumulation_steps=8,
+            generation_batch_size=4,
             num_train_epochs=1.0,
             max_steps=120,
             warmup_ratio=0.1,
@@ -77,6 +80,7 @@ class GrpoStabilityTests(unittest.TestCase):
         self.assertAlmostEqual(config.max_grad_norm, 0.5)
         self.assertEqual(config.loss_type, "grpo")
         self.assertAlmostEqual(config.repetition_penalty, 1.05)
+        self.assertEqual(config.generation_batch_size, 4)
 
     def test_collapse_guard_stops_after_patience(self) -> None:
         guard = CollapseGuardCallback(patience=2, min_entropy=0.03, max_zero_std_ratio=0.95)

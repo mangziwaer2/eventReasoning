@@ -50,6 +50,7 @@ class JudgeGRPOReward:
         reward_key: str = "total",
         error_reward: float = -0.25,
         wrong_answer_trace_scale: float | None = None,
+        wrong_answer_judge_gate: float = 0.2,
         judge_weight: float = 0.2,
         description_weight: float = 0.05,
         judge_max_new_tokens: int = 384,
@@ -80,6 +81,7 @@ class JudgeGRPOReward:
             cache_path=judge_cache_path,
         )
         self.error_reward = float(error_reward)
+        self.wrong_answer_judge_gate = max(0.0, min(float(wrong_answer_judge_gate), 1.0))
         self.judge_weight = max(0.0, float(judge_weight))
         self.description_weight = max(0.0, float(description_weight))
         self.audit_path = Path(audit_path) if audit_path else None
@@ -163,15 +165,13 @@ class JudgeGRPOReward:
                 )
                 description_score, description_parsed, description_quality, description_judge = self._score_descriptions(prediction)
                 answer = float(base.get("answer", 0.0))
-                # Do not let a perfectly formatted but incorrect answer earn
-                # judge/description reward. This was a major source of reward
-                # hacking once the policy learned the JSON scaffold. Keep the
-                # small answer-gated base trace signal so groups with no hit
-                # still have a learnable ranking signal.
-                gate = 1.0 if answer > 0.0 else 0.0
+                # Correct answers receive the full trace/judge signal. Wrong
+                # answers retain a small partial signal so trace learning can
+                # bootstrap before the first event-code hit.
+                gate = 1.0 if answer > 0.0 else self.wrong_answer_judge_gate
                 judge_score = float(judge.get("overall", 0.0))
                 description_reward = self.description_weight * gate * description_quality
-                total = float(answer) + float(base.get("trace", 0.0)) + self.judge_weight * gate * judge_score + description_reward
+                total = float(answer) + gate * float(base.get("trace", 0.0)) + self.judge_weight * gate * judge_score + description_reward
                 if not math.isfinite(total):
                     raise ValueError("non-finite reward")
                 breakdown = {
@@ -185,6 +185,7 @@ class JudgeGRPOReward:
                     "judge_parsed": float(bool(judge.get("parsed_json", False))),
                     "judge_partial": float(bool(judge.get("partial_json", False))),
                     "judge_gate": gate,
+                    "trace_gate": gate,
                     "description_match": description_score,
                     "description_quality": description_quality,
                     "description_direction_mismatch": (sum(1.0 for item in description_judge if not bool(item.get("directional_description_valid", False))) / len(description_judge) if description_judge else 0.0),

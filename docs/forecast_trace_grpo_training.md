@@ -32,16 +32,19 @@ python -u src/train_forecast_trace_grpo.py `
   --per-device-train-batch-size 4 `
   --gradient-accumulation-steps 8 `
   --learning-rate 1e-6 `
-  --beta 0.04 `
+  --beta 0 `
   --num-train-epochs 1 `
   --max-steps 800 `
   --logging-steps 1 `
   --reward-log-every 1
 ```
 
-The entry point defaults to one epoch, a `1e-6` learning rate, positive
-reference-policy KL (`beta=0.04`), an 800-step hard cap, and answer-gated trace shaping (with a small
-`0.05` wrong-answer trace signal to preserve exploration). Use
+The entry point defaults to one epoch, a `1e-6` learning rate, no reference-policy KL
+(`beta=0`), and partial wrong-answer trace/judge shaping (`wrong-answer-judge-gate=0.2`) so trace learning can
+bootstrap before the first answer-code hit.
+The initial SFT adapter is trained on `answers` only, so use `beta=0` for the trace-bootstrap phase. When a later run
+starts from that trace-aware adapter with a positive `--beta`, TRL 1.10 and `peft>=0.20` automatically copy the
+current adapter into a frozen `ref` adapter; that aligned copy is the intended KL reference. Use
 `--max-steps` as a hard budget for exploratory runs. The collapse guard stops
 after consecutive low-entropy or zero-variance reward logs; set
 `--collapse-patience 0` only for a deliberate ablation.
