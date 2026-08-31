@@ -137,11 +137,19 @@ class GrpoStabilityTests(unittest.TestCase):
                         "status": "passed",
                         "reward_policy": "forecast_trace_reward",
                         "wrong_answer_trace_scale": 0.05,
+                        "final_adapter": str(adapter),
                     }
                 ),
                 encoding="utf-8",
             )
             validate_two_stage_args(args)
+
+            other_adapter = output_dir / "other_adapter"
+            other_adapter.mkdir()
+            with self.assertRaisesRegex(ValueError, "does not match the passed bootstrap adapter"):
+                validate_two_stage_args(
+                    self._stage_args(grpo_stage="kl", beta=0.04, adapter_path=str(other_adapter))
+                )
 
             (output_dir / STAGE_MANIFEST_NAME).write_text(
                 json.dumps({"stage": "bootstrap", "status": "failed"}),

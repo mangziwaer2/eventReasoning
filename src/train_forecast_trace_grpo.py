@@ -382,6 +382,16 @@ def validate_two_stage_args(args: argparse.Namespace) -> None:
         raise ValueError(
             f"Bootstrap manifest does not preserve the verified main reward configuration: {manifest_path}"
         )
+    declared_adapter = manifest.get("final_adapter")
+    if not isinstance(declared_adapter, str) or not declared_adapter.strip():
+        raise ValueError(f"Bootstrap manifest does not declare its final adapter: {manifest_path}")
+    requested_adapter = resolve_repo_path(str(args.adapter_path)).resolve()
+    manifest_adapter = resolve_repo_path(declared_adapter).resolve()
+    if requested_adapter != manifest_adapter:
+        raise ValueError(
+            f"KL stage adapter {requested_adapter} does not match the passed bootstrap adapter "
+            f"declared by {manifest_path}: {manifest_adapter}"
+        )
 
 
 def reference_policy_mode(model: Any, beta: float) -> str:
