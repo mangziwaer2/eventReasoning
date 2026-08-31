@@ -1,6 +1,7 @@
 # Cloud Judge-GRPO 训练手册
 
 本文档是当前唯一推荐的训练手册。GRPO 始终使用 frozen Qwen judge；通过生成不同的 context，比较不带 refinement 和带 refinement 的两条路线。
+正式两阶段实现位于 `two-stage-grpo-main` 分支；`main` 保持可回退的单阶段基线，验证通过后再合并。
 
 ```text
 历史事件 -> frozen Qwen3 粗因果图 -> (可选 refinement) -> GRPO context
@@ -111,10 +112,11 @@ src/train_forecast_trace_grpo_judge.py
 该入口包含 frozen Qwen judge、prompt 可见的 `Hxx/Rxx` 引用对齐、code-description 语义一致性 judge、judge cache、截断 JSON 的标量恢复，以及 reward/rollout 审计日志。默认 trace judge 是 `/no_think`，`judge_weight=0.2`；description judge 使用 `description_weight=0.05` 和 96 token 上限，不要求 description exact match。`src/train_forecast_trace_grpo.py` 仅是被该入口复用的内部 GRPO trainer，不作为独立训练命令。
 
 
-### 基于 main 的两阶段 Judge-GRPO
+### 两阶段 Trace-GRPO（推荐）
 
-第一阶段严格保留已验证 main 实验的 reward、采样参数和 `wrong-answer-trace-scale=0.05`，只通过
-`--grpo-stage bootstrap --beta 0` 显式标记为 bootstrap。先跑 100 step，不要直接跑完整 epoch：
+第一阶段从 answer-only SFT adapter 启动，不施加 KL，让策略先学会输出可评分的 trace。保持 `main` 的 reward
+和采样逻辑，只用 `--grpo-stage bootstrap --beta 0` 标记 bootstrap。先用 20 步预检；确认没有 collapse 后，
+将 `--max-steps` 改为 100 或 0。不要把第二阶段的 adapter 直接写回第一阶段目录：
 
 ```bash
 python src/train_forecast_trace_grpo_judge.py \
@@ -127,8 +129,8 @@ python src/train_forecast_trace_grpo_judge.py \
   --codebook-dataset-path datasets/MIRAI_data.zip \
   --judge-max-new-tokens 384 \
   --judge-max-context-chars 6000 \
-  --judge-cache-path outputs/trace_judge_mirai_forecast_train_no_refine_bootstrap_main.cache.json \
-  --output-dir outputs/forecast_trace_grpo_judge_mirai_forecast_train_no_refine_bootstrap_main \
+  --judge-cache-path outputs/trace_judge_mirai_forecast_train_no_refine_bootstrap.cache.json \
+  --output-dir outputs/forecast_trace_grpo_judge_mirai_forecast_train_no_refine_bootstrap \
   --max-samples 0 --min-coarse-edges 1 \
   --num-generations 4 --per-device-train-batch-size 4 \
   --gradient-accumulation-steps 1 --learning-rate 5e-6 \
@@ -148,15 +150,15 @@ adapter，再对可训练的 `default` adapter 施加 KL：
 python src/train_forecast_trace_grpo_judge.py \
   --input outputs/grpo_context_mirai_forecast_train_no_refine/grpo_context.jsonl \
   --model-path models/Qwen3-4B \
-  --adapter-path outputs/forecast_trace_grpo_judge_mirai_forecast_train_no_refine_bootstrap_main/final_adapter \
+  --adapter-path outputs/forecast_trace_grpo_judge_mirai_forecast_train_no_refine_bootstrap/final_adapter \
   --grpo-stage kl --beta 0.04 \
   --judge-model-path models/Qwen3-4B --judge-weight 0.2 \
   --description-weight 0.05 --description-max-new-tokens 96 \
   --codebook-dataset-path datasets/MIRAI_data.zip \
   --judge-max-new-tokens 384 \
   --judge-max-context-chars 6000 \
-  --judge-cache-path outputs/trace_judge_mirai_forecast_train_no_refine_kl_pilot.cache.json \
-  --output-dir outputs/forecast_trace_grpo_judge_mirai_forecast_train_no_refine_kl_pilot \
+  --judge-cache-path outputs/trace_judge_mirai_forecast_train_no_refine_kl.cache.json \
+  --output-dir outputs/forecast_trace_grpo_judge_mirai_forecast_train_no_refine_kl \
   --max-samples 0 --min-coarse-edges 1 \
   --num-generations 4 --per-device-train-batch-size 4 \
   --gradient-accumulation-steps 1 --learning-rate 1e-6 \
@@ -165,18 +167,21 @@ python src/train_forecast_trace_grpo_judge.py \
   --reward-log-every 1 --sample-log-every 5 --sample-log-count 2
 ```
 
-第二阶段启动日志必须包含 `mode=ref_adapter`；若 TRL/PEFT 只能退回 `base_disabled`，程序会在第一次
-训练更新前报错。当前验证环境要求 `trl==1.10.0`、`peft>=0.20.0`。`--allow-unverified-bootstrap-adapter`
-只用于明确的消融实验，不用于正式两阶段训练。
+第二阶段启动日志必须包含 `mode=ref_adapter`；若显示 `mode=base_disabled`，应立即停止并检查
+TRL/PEFT 版本。当前验证环境要求 `trl==1.10.0`、`peft>=0.20.0`。不要使用
+`--allow-unverified-bootstrap-adapter` 做正式训练。
 
-先用上面的 100-step KL pilot 与第一阶段 checkpoint、旧 main checkpoint 做固定 held-out 对比。确认 answer
-格式率、answer F1 和通用回答能力均未下降后，再从同一个第一阶段 adapter 重新启动第二阶段正式训练，使用
-新的 output/cache，并把 `--max-steps` 改为 `0`。不要从 KL pilot adapter 继续正式训练，否则 reference 会变成
-pilot 结束时的策略，失去与第一阶段固定基线的可比性。
+本分支已完成一次 20-step KL 验证：`mode=ref_adapter`，80 个 completion 的合法 answer 格式率为 `0.925`，
+平均 format 为 `0.975`，answer 命中 group 比例为 `0.75`，collapse guard 未触发。产物保留在
+`outputs/forecast_trace_grpo_judge_kl_from_main_checkpoint100_253e179/`，用于机制审计，不替代正式 bootstrap。
+pilot 通过后，将 `--max-steps` 改为 `0` 跑完整 epoch，并从同一个第一阶段 adapter 重新启动正式训练；不要从
+pilot adapter 继续，否则 reference 会变成 pilot 结束时的策略。
 
 ## 5. Refinement 训练和带 refinement 的 Judge-GRPO
 
 当前 refinement 使用 graph-editor-v4：对候选边联合预测 keep/drop、关系类型和 strength，并可对 completion candidates 补边。旧的 graph-editor-v3 checkpoint 和 v2 cache 不兼容，必须重建。
+
+refinement 是独立对照路线，不改变前述无 refinement 两阶段流程；两条路线必须使用独立 context、output-dir、cache 和 adapter。
 
 | 指标 | 保留全部粗边 | refinement threshold=0.30 |
 | --- | ---: | ---: |
